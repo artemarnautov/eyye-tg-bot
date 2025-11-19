@@ -1,6 +1,6 @@
 python-telegram-bot
 python-dotenv
 openai
-supabase-py
+supabase
 redis
 sentry-sdk
