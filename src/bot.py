@@ -5,12 +5,16 @@ import logging
 
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    ApplicationBuilder,
+)
 
 import sentry_sdk
 
 
-# Включаем базовый логгер, чтобы видеть сообщения в journald / консоли
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -20,8 +24,7 @@ logger = logging.getLogger(__name__)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Обработчик команды /start.
-    Просто здоровается с пользователем и объясняет, что это MVP.
+    /start — приветствие и базовое описание бота.
     """
     user = update.effective_user
     first_name = user.first_name if user is not None else "друг"
@@ -29,7 +32,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         f"Привет, {first_name}! 👋\n\n"
         "Это MVP бота EYYE.\n"
-        "Сейчас я умею только отвечать на команду /start.\n"
+        "Сейчас я умею только отвечать на команды:\n"
+        "/start — приветствие\n"
+        "/help — список команд\n"
+        "/ping — проверка, что бот жив\n\n"
         "Дальше будем добавлять персонализированную новостную ленту. 📰"
     )
 
@@ -37,6 +43,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(text)
     else:
         logger.warning("Получено событие /start без message")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /help — показывает список доступных команд.
+    """
+    text = (
+        "Доступные команды:\n"
+        "/start — приветствие и описание бота\n"
+        "/help — список команд\n"
+        "/ping — проверка, что бот жив\n"
+    )
+    if update.message:
+        await update.message.reply_text(text)
+
+
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /ping — простой healthcheck. Удобно проверить, что бот отвечает.
+    """
+    logger.info("Получена команда /ping от user_id=%s", update.effective_user.id if update.effective_user else "unknown")
+    if update.message:
+        await update.message.reply_text("pong 🏓")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Глобальный обработчик ошибок.
+    Логируем всё, чтобы понимать, что пошло не так.
+    """
+    logger.error("Произошла ошибка при обработке апдейта", exc_info=context.error)
+
+    # Отправим минимум информации пользователю, если это было сообщение
+    if isinstance(update, Update) and update.message:
+        await update.message.reply_text(
+            "Упс, произошла внутренняя ошибка. Мы уже смотрим, что случилось. 😔"
+        )
 
 
 def init_sentry_if_needed() -> None:
@@ -71,29 +114,36 @@ def get_bot_token() -> str:
     return token
 
 
+def build_application() -> Application:
+    """
+    Создаём и настраиваем экземпляр Application.
+    Отдельная функция, чтобы дальше было проще расширять конфиг.
+    """
+    bot_token = get_bot_token()
+
+    application = ApplicationBuilder().token(bot_token).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("ping", ping))
+
+    application.add_error_handler(error_handler)
+
+    return application
+
+
 def main() -> None:
     """
     Точка входа в приложение.
     Вызывается, когда запускаем: python -m src.bot
     """
-    # Загружаем переменные из .env
     load_dotenv()
-
-    # Инициализируем Sentry (если есть DSN)
     init_sentry_if_needed()
-
-    # Получаем токен бота
-    bot_token = get_bot_token()
 
     logger.info("Запускаем EYYE Telegram Bot")
 
-    # Создаем приложение python-telegram-bot
-    application = Application.builder().token(bot_token).build()
+    application = build_application()
 
-    # Регистрируем команды
-    application.add_handler(CommandHandler("start", start))
-
-    # Запускаем polling (бот будет получать апдейты)
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=True,
@@ -102,3 +152,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
