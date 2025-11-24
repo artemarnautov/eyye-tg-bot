@@ -1,9 +1,10 @@
 # file: src/bot.py
-
-import os
 import logging
+import os
+from typing import Optional
 
 from dotenv import load_dotenv
+from supabase import Client, create_client
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -12,9 +13,26 @@ from telegram.ext import (
     ContextTypes,
 )
 
-import sentry_sdk
-from supabase import create_client, Client
+# ==========================
+# Инициализация окружения
+# ==========================
 
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set in environment variables")
+
+supabase: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# ==========================
+# Логирование
+# ==========================
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -23,171 +41,193 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Глобальный клиент Supabase (инициализируем в init_supabase_if_needed)
-supabase: Client | None = None
+# ==========================
+# Работа с Supabase
+# ==========================
 
+async def save_user_to_supabase(telegram_id: int, username: Optional[str]) -> None:
+    """
+    Сохраняем / обновляем пользователя в таблице telegram_users.
+    Если Supabase не настроен, просто пишем в лог и выходим.
+    """
+    if not supabase:
+        logger.warning("Supabase client is not configured, skip save_user_to_supabase")
+        return
+
+    data = {
+        "id": telegram_id,
+        "username": username,
+    }
+
+    try:
+        response = supabase.table("telegram_users").upsert(
+            data,
+            on_conflict="id",
+        ).execute()
+        logger.info("Upsert telegram user %s: %s", telegram_id, response)
+    except Exception as e:
+        logger.exception("Error saving user to Supabase: %s", e)
+
+
+async def load_user_from_supabase(telegram_id: int) -> Optional[dict]:
+    """
+    Читаем пользователя из таблицы telegram_users по id.
+    Возвращаем dict или None.
+    """
+    if not supabase:
+        logger.warning("Supabase client is not configured, skip load_user_from_supabase")
+        return None
+
+    try:
+        result = (
+            supabase.table("telegram_users")
+            .select("*")
+            .eq("id", telegram_id)
+            .single()
+            .execute()
+        )
+        # В разных версиях supabase-py result.data может быть dict или list
+        data = getattr(result, "data", None)
+        if isinstance(data, list):
+            return data[0] if data else None
+        return data
+    except Exception as e:
+        logger.exception("Error loading user from Supabase: %s", e)
+        return None
+
+
+# ==========================
+# Хендлеры команд
+# ==========================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /start — приветствие и базовое описание бота.
-    Параллельно сохраняем/обновляем пользователя в Supabase.
+    /start — сохраняем пользователя в Supabase и показываем приветствие.
     """
     user = update.effective_user
-    first_name = user.first_name if user is not None else "друг"
+    if user:
+        await save_user_to_supabase(user.id, user.username)
 
-    # Пытаемся сохранить пользователя в Supabase
-    try:
-        await save_user_to_supabase(update)
-    except Exception as e:
-        logger.error("Не удалось сохранить пользователя в Supabase", exc_info=e)
-
-    text = (
-        f"Привет, {first_name}! 👋\n\n"
-        "Это MVP бота EYYE.\n"
-        "Сейчас я умею только отвечать на команды:\n"
-        "/start — приветствие\n"
-        "/help — список команд\n"
-        "/ping — проверка, что бот жив\n\n"
-        "Дальше будем добавлять персонализированную новостную ленту. 📰"
-    )
+    text_lines = [
+        "Привет! Это EYYE — твой персональный новостной ассистент.",
+        "",
+        "Пока что бот умеет немногое:",
+        "/ping — проверить, что бот жив",
+        "/me — показать, что бот знает о твоём аккаунте",
+        "/help — показать справку",
+    ]
 
     if update.message:
-        await update.message.reply_text(text)
-    else:
-        logger.warning("Получено событие /start без message")
+        await update.message.reply_text("\n".join(text_lines))
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /help — показывает список доступных команд.
+    /help — список команд.
     """
-    text = (
-        "Доступные команды:\n"
-        "/start — приветствие и описание бота\n"
-        "/help — список команд\n"
-        "/ping — проверка, что бот жив\n"
-    )
+    text_lines = [
+        "Доступные команды:",
+        "/start — перезапустить бота",
+        "/ping — проверить, что бот жив",
+        "/me — показать, что бот знает о тебе в базе",
+        "/help — эта справка",
+    ]
+
     if update.message:
-        await update.message.reply_text(text)
+        await update.message.reply_text("\n".join(text_lines))
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /ping — простой healthcheck. Удобно проверить, что бот отвечает.
+    /ping — простая проверка, что бот жив.
     """
-    user_id = update.effective_user.id if update.effective_user else "unknown"
-    logger.info("Получена команда /ping от user_id=%s", user_id)
+    if update.message:
+        await update.message.reply_text("pong")
+
+
+async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /me — показать, что мы знаем о пользователе:
+    - данные из Telegram,
+    - запись в Supabase (telegram_users).
+    """
+    user = update.effective_user
+    if not user:
+        if update.message:
+            await update.message.reply_text("Не получилось определить твой Telegram-профиль.")
+        return
+
+    # На всякий случай ещё раз сохраняем пользователя
+    await save_user_to_supabase(user.id, user.username)
+
+    # Если Supabase не настроен — показываем только данные из Telegram
+    if not supabase:
+        text_lines = [
+            "Supabase сейчас не настроен, показываю только данные из Telegram:",
+            "",
+            f"id: {user.id}",
+            f"username: {user.username}",
+            f"first_name: {user.first_name}",
+            f"last_name: {user.last_name}",
+        ]
+        if update.message:
+            await update.message.reply_text("\n".join(text_lines))
+        return
+
+    # Пытаемся прочитать запись из таблицы telegram_users
+    row = await load_user_from_supabase(user.id)
+
+    if not row:
+        if update.message:
+            await update.message.reply_text(
+                "В Supabase пока нет записи о тебе. "
+                "Я попробовал её создать, попробуй ещё раз через несколько секунд."
+            )
+        return
+
+    text_lines = [
+        "Информация о тебе в базе EYYE:",
+        f"id: {row.get('id')}",
+        f"username: {row.get('username')}",
+        f"created_at: {row.get('created_at')}",
+    ]
 
     if update.message:
-        await update.message.reply_text("pong 🏓")
+        await update.message.reply_text("\n".join(text_lines))
 
+
+# ==========================
+# Глобальный обработчик ошибок
+# ==========================
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Глобальный обработчик ошибок.
-    Логируем всё, чтобы понимать, что пошло не так.
+    Логируем любые необработанные исключения и стараемся аккуратно ответить пользователю.
     """
-    logger.error("Произошла ошибка при обработке апдейта", exc_info=context.error)
+    logger.exception("Exception while handling update: %s", context.error)
 
-    if isinstance(update, Update) and update.message:
-        await update.message.reply_text(
-            "Упс, произошла внутренняя ошибка. Мы уже смотрим, что случилось. 😔"
-        )
-
-
-async def save_user_to_supabase(update: Update) -> None:
-    """
-    Сохраняем информацию о пользователе в таблицу telegram_users в Supabase.
-    Храним только id и username.
-    Если Supabase не настроен — просто выходим.
-    """
-    global supabase
-
-    if supabase is None:
-        logger.info("Supabase не настроен, пропускаем сохранение пользователя")
-        return
-
-    user = update.effective_user
-    if user is None:
-        logger.warning("Нет effective_user в апдейте, не можем сохранить пользователя")
-        return
-
-    data = {
-        "id": user.id,
-        "username": user.username,  # username может быть None — в БД тогда будет NULL
-    }
-
-    logger.info("Сохраняем/обновляем пользователя в Supabase: %s", data)
-
-    # upsert — вставит новую запись или обновит существующую по первичному ключу (id)
-    response = supabase.table("telegram_users").upsert(data).execute()
-    logger.info("Ответ Supabase при сохранении пользователя: %s", response)
+    # Пытаемся отправить пользователю сообщение об ошибке
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Что-то пошло не так, но мы уже смотрим в логи.",
+            )
+    except Exception:
+        logger.exception("Failed to send error message to user")
 
 
-def init_sentry_if_needed() -> None:
-    """
-    Подключаем Sentry, если задан SENTRY_DSN в .env.
-    Если переменная не задана — просто ничего не делаем.
-    """
-    dsn = os.getenv("SENTRY_DSN")
-    if dsn:
-        sentry_sdk.init(
-            dsn=dsn,
-            traces_sample_rate=1.0,
-        )
-        logger.info("Sentry инициализирован")
-    else:
-        logger.info("Sentry не настроен (SENTRY_DSN не задан)")
-
-
-def init_supabase_if_needed() -> None:
-    """
-    Инициализируем клиент Supabase, если заданы SUPABASE_URL и SUPABASE_KEY.
-    Если чего-то не хватает — просто логируем и работаем без Supabase.
-    """
-    global supabase
-
-    url = os.getenv("SUPABASE_URL")
-    key = os.getenv("SUPABASE_KEY")
-
-    if not url or not key:
-        logger.info("SUPABASE_URL или SUPABASE_KEY не заданы — Supabase отключен")
-        supabase = None
-        return
-
-    supabase_client = create_client(url, key)
-    supabase = supabase_client
-    logger.info("Supabase клиент инициализирован")
-
-
-def get_bot_token() -> str:
-    """
-    Читаем BOT_TOKEN из окружения.
-    Если токен не найден — выводим понятную ошибку и выходим.
-    """
-    token = os.getenv("BOT_TOKEN")
-    if not token:
-        print(
-            "Ошибка: переменная окружения BOT_TOKEN не установлена.\n"
-            "Убедись, что в корне проекта есть файл .env с строкой:\n"
-            "BOT_TOKEN=твой_телеграм_токен"
-        )
-        raise SystemExit(1)
-    return token
-
+# ==========================
+# Сборка и запуск приложения
+# ==========================
 
 def build_application() -> Application:
-    """
-    Создаём и настраиваем экземпляр Application.
-    Отдельная функция, чтобы дальше было проще расширять конфиг.
-    """
-    bot_token = get_bot_token()
-
-    application = ApplicationBuilder().token(bot_token).build()
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("ping", ping))
+    application.add_handler(CommandHandler("me", me))
 
     application.add_error_handler(error_handler)
 
@@ -195,25 +235,9 @@ def build_application() -> Application:
 
 
 def main() -> None:
-    """
-    Точка входа в приложение.
-    Вызывается, когда запускаем: python -m src.bot
-    """
-    load_dotenv()
-
-    init_sentry_if_needed()
-    init_supabase_if_needed()
-
-    logger.info("Запускаем EYYE Telegram Bot")
-
-    application = build_application()
-
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
+    app = build_application()
+    app.run_polling()
 
 
 if __name__ == "__main__":
     main()
-
