@@ -66,6 +66,7 @@ async def save_user_to_supabase(telegram_id: int, username: Optional[str]) -> No
         ).execute()
         logger.info("Upsert telegram user %s: %s", telegram_id, response)
     except Exception as e:
+        # Логируем, но не падаем
         logger.exception("Error saving user to Supabase: %s", e)
 
 
@@ -86,12 +87,12 @@ async def load_user_from_supabase(telegram_id: int) -> Optional[dict]:
             .single()
             .execute()
         )
-        # В разных версиях supabase-py result.data может быть dict или list
         data = getattr(result, "data", None)
         if isinstance(data, list):
             return data[0] if data else None
         return data
     except Exception as e:
+        # Логируем и возвращаем None — наверху покажем только данные из Telegram
         logger.exception("Error loading user from Supabase: %s", e)
         return None
 
@@ -129,7 +130,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Доступные команды:",
         "/start — перезапустить бота",
         "/ping — проверить, что бот жив",
-        "/me — показать, что бот знает о тебе в базе",
+        "/me — показать, что бот знает о тебе в базе и в Telegram",
         "/help — эта справка",
     ]
 
@@ -147,9 +148,9 @@ async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /me — показать, что мы знаем о пользователе:
+    /me — показать:
     - данные из Telegram,
-    - запись в Supabase (telegram_users).
+    - если получится, данные из Supabase.
     """
     user = update.effective_user
     if not user:
@@ -160,40 +161,47 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # На всякий случай ещё раз сохраняем пользователя
     await save_user_to_supabase(user.id, user.username)
 
-    # Если Supabase не настроен — показываем только данные из Telegram
+    # Базовая информация из Telegram
+    tg_lines = [
+        "Данные из Telegram:",
+        f"id: {user.id}",
+        f"username: {user.username}",
+        f"first_name: {user.first_name}",
+        f"last_name: {user.last_name}",
+        "",
+    ]
+
+    # Если Supabase не настроен — просто говорим об этом
     if not supabase:
-        text_lines = [
-            "Supabase сейчас не настроен, показываю только данные из Telegram:",
-            "",
-            f"id: {user.id}",
-            f"username: {user.username}",
-            f"first_name: {user.first_name}",
-            f"last_name: {user.last_name}",
-        ]
+        tg_lines.append("Supabase сейчас не настроен, поэтому показываю только данные из Telegram.")
         if update.message:
-            await update.message.reply_text("\n".join(text_lines))
+            await update.message.reply_text("\n".join(tg_lines))
         return
 
-    # Пытаемся прочитать запись из таблицы telegram_users
+    # Пытаемся прочитать запись из Supabase
     row = await load_user_from_supabase(user.id)
 
     if not row:
+        tg_lines.append(
+            "Supabase сейчас отвечает с ошибкой или запись ещё не создана.\n"
+            "Показываю только данные из Telegram."
+        )
         if update.message:
-            await update.message.reply_text(
-                "В Supabase пока нет записи о тебе. "
-                "Я попробовал её создать, попробуй ещё раз через несколько секунд."
-            )
+            await update.message.reply_text("\n".join(tg_lines))
         return
 
-    text_lines = [
-        "Информация о тебе в базе EYYE:",
+    # Если запись есть, добавляем её в вывод
+    sb_lines = [
+        "Информация о тебе в базе EYYE (Supabase):",
         f"id: {row.get('id')}",
         f"username: {row.get('username')}",
         f"created_at: {row.get('created_at')}",
     ]
 
+    all_lines = tg_lines + sb_lines
+
     if update.message:
-        await update.message.reply_text("\n".join(text_lines))
+        await update.message.reply_text("\n".join(all_lines))
 
 
 # ==========================
@@ -206,7 +214,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     """
     logger.exception("Exception while handling update: %s", context.error)
 
-    # Пытаемся отправить пользователю сообщение об ошибке
     try:
         if isinstance(update, Update) and update.effective_chat:
             await context.bot.send_message(
