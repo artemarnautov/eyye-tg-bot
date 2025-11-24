@@ -5,7 +5,11 @@ from typing import Optional, Any, Dict, List
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
-from telegram import Update
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -41,6 +45,86 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+# ==========================
+# Константы для тем
+# ==========================
+
+TOPIC_CHOOSE_BUTTON_TEXT = "Выбрать темы"
+EXIT_TOPICS_BUTTON_TEXT = "⬅️ Выйти"
+BACK_TO_MAIN_TOPICS_BUTTON_TEXT = "⬅️ Назад к общим темам"
+
+MAIN_TOPICS: List[str] = [
+    "Бизнес и экономика",
+    "Финансы и крипто",
+    "Технологии и гаджеты",
+    "Наука",
+    "История",
+    "Политика",
+    "Общество и культура",
+    "Шоу-бизнес и музыка",
+    "Кино и сериалы",
+    "Игры и киберспорт",
+    "Спорт",
+    "Жизнь и лайфстайл (путешествия, еда, мода)",
+    "Здоровье и саморазвитие",
+    "Образование и карьера (универы, стажировки, студенческая жизнь)",
+    "Город и локальные новости",
+]
+
+SPORT_SUBTOPICS: List[str] = [
+    "Футбол",
+    "Баскетбол",
+    "Теннис",
+    "Хоккей",
+    "Бег и марафоны",
+    "Боевые виды спорта",
+    "Формула-1 и автоспорт",
+]
+
+
+def build_choose_topics_entry_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Клавиатура, которая появляется сразу после /start:
+    показывает только одну кнопку "Выбрать темы".
+    """
+    return ReplyKeyboardMarkup(
+        [[TOPIC_CHOOSE_BUTTON_TEXT]],
+        resize_keyboard=True,
+    )
+
+
+def build_main_topics_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Клавиатура с основными темами.
+    """
+    keyboard: List[List[str]] = [
+        [MAIN_TOPICS[0], MAIN_TOPICS[1]],
+        [MAIN_TOPICS[2], MAIN_TOPICS[3]],
+        [MAIN_TOPICS[4], MAIN_TOPICS[5]],
+        [MAIN_TOPICS[6], MAIN_TOPICS[7]],
+        [MAIN_TOPICS[8], MAIN_TOPICS[9]],
+        [MAIN_TOPICS[10], MAIN_TOPICS[11]],
+        [MAIN_TOPICS[12], MAIN_TOPICS[13]],
+        [MAIN_TOPICS[14]],
+        [EXIT_TOPICS_BUTTON_TEXT],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+
+def build_sport_topics_keyboard() -> ReplyKeyboardMarkup:
+    """
+    Клавиатура с подкатегориями спорта.
+    """
+    keyboard: List[List[str]] = [
+        [SPORT_SUBTOPICS[0], SPORT_SUBTOPICS[1]],
+        [SPORT_SUBTOPICS[2], SPORT_SUBTOPICS[3]],
+        [SPORT_SUBTOPICS[4], SPORT_SUBTOPICS[5]],
+        [SPORT_SUBTOPICS[6]],
+        [BACK_TO_MAIN_TOPICS_BUTTON_TEXT],
+        [EXIT_TOPICS_BUTTON_TEXT],
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
 
 # ==========================
@@ -180,11 +264,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if user:
         await save_user_to_supabase(user.id, user.username)
 
-    # Если нет сообщения (стрёмный апдейт) — просто выходим
     if not update.message:
         return
 
-    # Если Supabase не настроен — ведём себя как раньше, без онбординга
+    # Если Supabase не настроен — ведём себя как раньше, без онбординга по профилю
     if not supabase or not user:
         text_lines = [
             "Привет! Это EYYE — твой персональный новостной ассистент.",
@@ -204,6 +287,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         # Профиль уже есть — приветствуем и даём подсказки
         context.user_data["awaiting_profile"] = False
         context.user_data["profile_buffer"] = []
+        context.user_data["selected_topics"] = []
+        context.user_data["topics_mode"] = None
 
         text_lines = [
             "Снова привет 👋",
@@ -215,29 +300,38 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/help — показать справку",
             "/ping — проверить, что бот жив",
         ]
-        await update.message.reply_text("\n".join(text_lines))
+        await update.message.reply_text(
+            "\n".join(text_lines),
+            reply_markup=ReplyKeyboardRemove(),
+        )
         return
 
-    # Профиля ещё нет — запускаем онбординг по свободному тексту
+    # Профиля ещё нет — запускаем онбординг по свободному тексту + кнопкам тем
     context.user_data["awaiting_profile"] = True
     context.user_data["profile_buffer"] = []
+    context.user_data["selected_topics"] = []
+    context.user_data["topics_mode"] = None
 
     text_lines = [
         "Привет 👋",
         "",
         "Я — EYYE, твой персональный новостной ассистент.",
-        "Чтобы настроить ленту под тебя, расскажи в свободной форме:",
+        "Чтобы настроить ленту под тебя, можно сделать так:",
         "",
-        "• что тебе интересно читать (темы, форматы, люди);",
-        "• в каком городе/стране ты живёшь или учишься;",
-        "• что точно не хочется видеть (например, политика, военные новости).",
+        "1) Написать в свободной форме, что тебе интересно читать,",
+        "   где ты живёшь/учишься и что не хочется видеть.",
         "",
-        "Можешь написать одним или несколькими сообщениями.",
+        "2) Или нажать кнопку «Выбрать темы» ниже и выбрать из списка общих тем.",
+        "",
+        "Можешь комбинировать оба подхода: и выбирать темы, и дописывать детали текстом.",
         "Когда всё опишешь — просто отправь команду /done.",
         "",
         "— Жду твоё первое сообщение 🙂",
     ]
-    await update.message.reply_text("\n".join(text_lines))
+    await update.message.reply_text(
+        "\n".join(text_lines),
+        reply_markup=build_choose_topics_entry_keyboard(),
+    )
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -350,14 +444,14 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ==========================
-# Онбординг: обработка текста и /done
+# Онбординг: обработка текста и кнопок тем
 # ==========================
 
 async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Обрабатываем обычные текстовые сообщения.
     Если мы в состоянии онбординга (awaiting_profile=True) —
-    добавляем текст в буфер профиля.
+    либо обрабатываем выбор тем, либо записываем свободный текст.
     Если нет — просто даём подсказку про /help.
     """
     if not update.message:
@@ -371,20 +465,85 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not text:
         return
 
-    # Если сейчас не ждём описание интересов — мягкая подсказка
+    # Если сейчас НЕ ждём описание интересов — мягкая подсказка
     if not context.user_data.get("awaiting_profile"):
         await update.message.reply_text(
             "Я пока понимаю только команды. Напиши /help, чтобы увидеть список."
         )
         return
 
-    # Мы в режиме онбординга — записываем текст в буфер
+    # --- Обработка специальных кнопок / режимов ---
+
+    # Пользователь нажал "Выбрать темы"
+    if text == TOPIC_CHOOSE_BUTTON_TEXT:
+        context.user_data["topics_mode"] = "main"
+        keyboard = build_main_topics_keyboard()
+        await update.message.reply_text(
+            "Вот общие темы. Нажимай на те, что тебе интересны.\n"
+            "Можно выбрать несколько. В любой момент жми «⬅️ Выйти», чтобы вернуться к свободному вводу.",
+            reply_markup=keyboard,
+        )
+        return
+
+    # Пользователь нажал "⬅️ Выйти" — убираем клавиатуру и возвращаемся к обычному вводу
+    if text == EXIT_TOPICS_BUTTON_TEXT:
+        context.user_data["topics_mode"] = None
+        keyboard = ReplyKeyboardRemove()
+        await update.message.reply_text(
+            "Убрал клавиатуру тем. Можешь продолжить писать своими словами 🙂",
+            reply_markup=keyboard,
+        )
+        return
+
+    # В подменю спорта: "⬅️ Назад к общим темам"
+    if text == BACK_TO_MAIN_TOPICS_BUTTON_TEXT:
+        context.user_data["topics_mode"] = "main"
+        keyboard = build_main_topics_keyboard()
+        await update.message.reply_text(
+            "Вернул список общих тем. Можно выбирать дальше.",
+            reply_markup=keyboard,
+        )
+        return
+
+    topics_mode: Optional[str] = context.user_data.get("topics_mode")
+
+    # --- Выбор подтем спорта ---
+    if topics_mode == "sports" and text in SPORT_SUBTOPICS:
+        selected = set(context.user_data.get("selected_topics", []))
+        selected.add(text)
+        context.user_data["selected_topics"] = list(selected)
+        logger.info("User %s selected sport subtopic: %s", user.id, text)
+        await update.message.reply_text(f"Добавил тему спорта: {text}")
+        return
+
+    # --- Выбор основных тем ---
+    if topics_mode == "main":
+        # Отдельно обрабатываем "Спорт" — открываем подменю
+        if text == "Спорт":
+            context.user_data["topics_mode"] = "sports"
+            keyboard = build_sport_topics_keyboard()
+            await update.message.reply_text(
+                "Выбери вид спорта, который тебе интересен.\n"
+                "Можно несколько. Кнопка «⬅️ Назад к общим темам» вернёт предыдущий список.",
+                reply_markup=keyboard,
+            )
+            return
+
+        if text in MAIN_TOPICS:
+            selected = set(context.user_data.get("selected_topics", []))
+            selected.add(text)
+            context.user_data["selected_topics"] = list(selected)
+            logger.info("User %s selected topic: %s", user.id, text)
+            await update.message.reply_text(f"Добавил тему: {text}")
+            return
+
+    # --- Всё остальное считаем свободным текстом интересов ---
     buffer: List[str] = context.user_data.get("profile_buffer", [])
     buffer.append(text)
     context.user_data["profile_buffer"] = buffer
 
     logger.info(
-        "Onboarding text from user %s: %s (buffer size now %d)",
+        "Onboarding free-text from user %s: %s (buffer size now %d)",
         user.id,
         text,
         len(buffer),
@@ -392,7 +551,7 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     await update.message.reply_text(
         "Записал 👍\n\n"
-        "Можешь добавить ещё одно-два сообщения с интересами или деталями.\n"
+        "Можешь добавить ещё сообщения с интересами или деталями.\n"
         "Когда всё опишешь — просто отправь команду /done."
     )
 
@@ -400,7 +559,7 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /done — завершение онбординга:
-    склеиваем все собранные сообщения и сохраняем в user_profiles.
+    склеиваем все собранные сообщения и выбранные темы и сохраняем в user_profiles.
     """
     if not update.message:
         return
@@ -410,7 +569,6 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Не получилось определить твой Telegram-профиль.")
         return
 
-    # Если мы вообще не в режиме онбординга
     if not context.user_data.get("awaiting_profile"):
         await update.message.reply_text(
             "Сейчас я не собираю описание интересов.\n"
@@ -419,13 +577,26 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     buffer: List[str] = context.user_data.get("profile_buffer", [])
-    raw_interests = "\n\n".join(buffer).strip()
+    selected_topics: List[str] = context.user_data.get("selected_topics", [])
 
+    parts: List[str] = []
+
+    if buffer:
+        parts.append("\n\n".join(buffer).strip())
+
+    if selected_topics:
+        unique_topics = sorted(set(selected_topics))
+        topics_block = "Выбранные темы:\n" + "\n".join(unique_topics)
+        parts.append(topics_block)
+
+    raw_interests = "\n\n".join(parts).strip()
+
+    # Если ни текста, ни выбранных тем — просим что-нибудь выбрать/написать
     if not raw_interests:
         await update.message.reply_text(
-            "Похоже, ты ещё ничего не написал 🙈\n"
-            "Опиши, пожалуйста, в одном-двух сообщениях свои интересы и город, "
-            "а потом снова отправь /done."
+            "Похоже, ты ещё ничего не написал и не выбрал 🙈\n"
+            "Опиши, пожалуйста, в одном-двух сообщениях свои интересы и город "
+            "или выбери что-то из тем, а потом снова отправь /done."
         )
         return
 
@@ -438,13 +609,16 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    # Сбрасываем состояние онбординга
+    # Сбрасываем состояние онбординга и убираем клавиатуру
     context.user_data["awaiting_profile"] = False
     context.user_data["profile_buffer"] = []
+    context.user_data["selected_topics"] = []
+    context.user_data["topics_mode"] = None
 
     await update.message.reply_text(
-        "Отлично, я запомнил твои интересы и город 🙌\n\n"
-        "На основе этого я буду подбирать для тебя персональную ленту."
+        "Отлично, я запомнил твои интересы и выбранные темы 🙌\n\n"
+        "На основе этого я буду подбирать для тебя персональную ленту.",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -482,7 +656,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("me", me))
     application.add_handler(CommandHandler("done", finish_onboarding))
 
-    # Текстовые сообщения (без команд) — для онбординга
+    # Текстовые сообщения (без команд) — для онбординга и выбора тем
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
