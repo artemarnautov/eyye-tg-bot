@@ -6,6 +6,7 @@ import json
 import urllib.request
 import urllib.error
 from typing import Optional, Any, Dict, List
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -319,6 +320,7 @@ async def upsert_user_profile_structured(
     """
     Создаём или обновляем structured_profile в user_profiles.
     Заодно при наличии обновляем location_city/location_country и, при желании, raw_interests.
+    (Сейчас не используется напрямую, но оставляем на будущее.)
     """
     if not supabase:
         logger.warning("Supabase client is not configured, skip upsert_user_profile_structured")
@@ -359,125 +361,237 @@ async def upsert_user_profile_structured(
 
 def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[str, Any]]:
     """
-    Синхронный вызов OpenAI Chat Completions через стандартный urllib.
-    Возвращает dict (structured_profile) или None.
+    Синхронный вызов OpenAI, который из сырого текста интересов строит структурированный JSON-профиль.
+    Возвращает dict или None при ошибке.
     """
     if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY is not set, skip OpenAI call")
+        logger.warning("OPENAI_API_KEY is not set, skipping structured_profile build")
         return None
 
-    model = OPENAI_MODEL or "gpt-4o-mini"
+    system_prompt = """
+Ты помогаешь новостному рекомендательному сервису EYYE.
+По свободному описанию интересов и города пользователя ты должен вернуть
+СТРОГО ОДИН JSON-объект со следующей схемой:
 
-    system_prompt = (
-        "Ты помощник персонализированного новостного сервиса для студентов.\n"
-        "Тебе дают сырое описание интересов, нежелательных тем и города/страны пользователя.\n"
-        "Нужно аккуратно извлечь структурированную информацию.\n\n"
-        "Ответь ТОЛЬКО валидным JSON-объектом по следующей схеме:\n\n"
-        "{\n"
-        '  \"location_city\": string | null,\n'
-        '  \"location_country\": string | null,\n'
-        '  \"topics\": [\n'
-        '    { \"name\": string, \"weight\": number }\n'
-        "  ],\n"
-        '  \"negative_topics\": [string]\n'
-        "}\n\n"
-        "Требования:\n"
-        "- Не выдумывай локацию, если её нет в тексте.\n"
-        "- topics должны быть достаточно общими (например, 'business & startups', 'AI & machine learning').\n"
-        "- negative_topics — короткие описания (например, 'war news', 'Russian politics').\n"
-        "- Никакого текста вне JSON, никаких комментариев.\n"
-    )
-
-    user_prompt = (
-        "Вот сырое описание интересов пользователя и его комментарии:\n\n"
-        f"{raw_interests}\n\n"
-        "Построй, пожалуйста, структурированный профиль по указанной выше схеме."
-    )
-
-    url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions")
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
+{
+  "location_city": string | null,
+  "location_country": string | null,
+  "topics": [
+    {
+      "name": string,
+      "weight": number,
+      "category": string | null,
+      "detail": string | null
     }
+  ],
+  "negative_topics": [string],
+  "interests_as_tags": [string],
+  "user_meta": {
+    "age_group": string | null,
+    "student_status": string | null
+  }
+}
+
+Пояснения:
+
+- location_city / location_country:
+  - Определи по тексту, если возможно (например, "London", "UK").
+  - Если не уверено, ставь null.
+
+- topics:
+  - Это ключевые интересы пользователя.
+  - "name" — короткое название темы (например, "стартапы", "премьер-лига", "аниме").
+  - "weight" — важность от 0.0 до 1.0 (1.0 — самое важное).
+  - "category" — более общий род (например, "business", "sports", "culture", "tech", "education") или null.
+  - "detail" — 1–2 коротких слова уточнения (например, "UK football", "US startups") или null.
+
+- negative_topics:
+  - Темы, которые пользователь явно не любит или не хочет видеть (например, "политика", "крипта").
+
+- interests_as_tags:
+  - Нормализованные теги (латиницей), которые удобно использовать для поиска:
+    например ["startups", "premier_league", "uk_universities"].
+
+- user_meta:
+  - "age_group" — примерно, например "18-24", "25-34", "35-44" или null, если невозможно оценить.
+  - "student_status" — одна из:
+      "school_student", "university_student", "postgraduate_student",
+      "not_student", или null, если непонятно.
+
+Требования:
+
+1. Всегда возвращай ОДИН корректный JSON-объект по схеме выше.
+2. НИКАКОГО текста до или после JSON — только сам объект.
+3. Все строки — в UTF-8, без комментариев и лишних полей.
+4. Если информации мало, ставь null или пустые массивы.
+"""
+
     payload: Dict[str, Any] = {
-        "model": model,
+        "model": OPENAI_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {"role": "user", "content": raw_interests},
         ],
         "temperature": 0.2,
-        "max_tokens": 500,
     }
 
-    data_bytes = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+        },
+    )
 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read()
+            resp_data = resp.read().decode("utf-8")
+            data = json.loads(resp_data)
     except urllib.error.HTTPError as e:
-        try:
-            error_body = e.read()
-        except Exception:
-            error_body = b""
-        logger.exception("HTTPError from OpenAI: %s, body=%s", e, error_body[:500])
+        logger.exception("OpenAI HTTPError while building structured_profile: %s", e)
         return None
-    except Exception as e:
-        logger.exception("Error calling OpenAI: %s", e)
+    except urllib.error.URLError as e:
+        logger.exception("OpenAI URLError while building structured_profile: %s", e)
         return None
-
-    try:
-        resp_json = json.loads(body.decode("utf-8"))
-        content = resp_json["choices"][0]["message"]["content"]
     except Exception:
-        logger.exception("Failed to parse OpenAI response JSON")
+        logger.exception("Unexpected error while calling OpenAI for structured_profile")
         return None
 
     try:
-        # На всякий случай обрежем до первого '{' и последней '}'
-        first = content.find("{")
-        last = content.rfind("}")
-        if first != -1 and last != -1:
-            content = content[first : last + 1]
-
-        parsed = json.loads(content)
-        if not isinstance(parsed, dict):
-            logger.warning("OpenAI returned JSON, но это не объект: %r", parsed)
-            return None
-        return parsed
-    except json.JSONDecodeError:
-        logger.exception("Failed to decode JSON from OpenAI content: %r", content)
+        raw_content = data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        logger.error("Unexpected OpenAI response format for structured_profile: %s", data)
         return None
+
+    # Пытаемся распарсить JSON как есть
+    try:
+        parsed: Any = json.loads(raw_content)
+    except json.JSONDecodeError:
+        # Пытаемся вырезать самый внешний {...}
+        start = raw_content.find("{")
+        end = raw_content.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                parsed = json.loads(raw_content[start : end + 1])
+            except Exception:
+                logger.exception("Failed to parse structured_profile JSON even after trimming")
+                return None
+        else:
+            logger.error("Could not find JSON object in OpenAI structured_profile response: %s", raw_content)
+            return None
+
+    if not isinstance(parsed, dict):
+        logger.error("Structured_profile is not a JSON object: %s", parsed)
+        return None
+
+    # Заполняем дефолты и нормализуем
+    parsed.setdefault("location_city", None)
+    parsed.setdefault("location_country", None)
+    parsed.setdefault("topics", [])
+    parsed.setdefault("negative_topics", [])
+    parsed.setdefault("interests_as_tags", [])
+    parsed.setdefault("user_meta", {})
+
+    # topics
+    topics = parsed.get("topics")
+    if not isinstance(topics, list):
+        topics = []
+    normalized_topics: List[Dict[str, Any]] = []
+    for t in topics:
+        if not isinstance(t, dict):
+            continue
+        name = str(t.get("name", "")).strip()
+        if not name:
+            continue
+        weight = t.get("weight", 1.0)
+        try:
+            weight = float(weight)
+        except (TypeError, ValueError):
+            weight = 1.0
+        category = t.get("category")
+        detail = t.get("detail")
+        normalized_topics.append(
+            {
+                "name": name,
+                "weight": weight,
+                "category": category,
+                "detail": detail,
+            }
+        )
+    parsed["topics"] = normalized_topics
+
+    # negative_topics
+    neg = parsed.get("negative_topics")
+    if not isinstance(neg, list):
+        neg = []
+    parsed["negative_topics"] = [str(x).strip() for x in neg if str(x).strip()]
+
+    # interests_as_tags
+    tags = parsed.get("interests_as_tags")
+    if not isinstance(tags, list):
+        tags = []
+    parsed["interests_as_tags"] = [str(x).strip() for x in tags if str(x).strip()]
+
+    # user_meta
+    user_meta = parsed.get("user_meta")
+    if not isinstance(user_meta, dict):
+        user_meta = {}
+    parsed["user_meta"] = user_meta
+
+    return parsed
 
 
 async def build_and_save_structured_profile(telegram_id: int, raw_interests: str) -> None:
     """
-    Асинхронная обёртка:
-    - в отдельном потоке вызывает OpenAI,
-    - сохраняет structured_profile в Supabase.
-    Ошибки логируются, но не падают наружу.
+    Асинхронно строит structured_profile через OpenAI и сохраняет его в Supabase.
+    Вызывается в фоне, не трогает UX пользователя.
     """
-    logger.info("Building structured_profile for user %s", telegram_id)
+    if supabase is None:
+        logger.warning("Supabase client is not configured, skipping structured_profile build")
+        return
+
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY is not set, skipping structured_profile build")
+        return
 
     try:
-        structured = await asyncio.to_thread(
-            _call_openai_structured_profile_sync, raw_interests
-        )
-        if structured is None:
-            logger.warning(
-                "OpenAI returned None, structured_profile will not be saved for user %s",
-                telegram_id,
-            )
-            return
-
-        ok = await upsert_user_profile_structured(telegram_id, structured, raw_interests)
-        if not ok:
-            logger.warning("Failed to upsert structured_profile for user %s", telegram_id)
-            return
-
-        logger.info("structured_profile saved successfully for user %s", telegram_id)
+        structured = await asyncio.to_thread(_call_openai_structured_profile_sync, raw_interests)
     except Exception:
-        logger.exception("Unexpected error in build_and_save_structured_profile")
+        logger.exception("Failed to call OpenAI (to_thread) for structured_profile")
+        return
+
+    if not structured:
+        logger.warning("OpenAI returned empty structured_profile for user_id=%s", telegram_id)
+        return
+
+    # Достаём локацию, если модель её определила
+    location_city = structured.get("location_city")
+    location_country = structured.get("location_country")
+
+    payload: Dict[str, Any] = {
+        "user_id": telegram_id,
+        "structured_profile": structured,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    if location_city:
+        payload["location_city"] = location_city
+    if location_country:
+        payload["location_country"] = location_country
+
+    try:
+        result = supabase.table("user_profiles").upsert(
+            payload,
+            on_conflict="user_id",
+        ).execute()
+        logger.info(
+            "Structured_profile saved for user_id=%s, result=%s",
+            telegram_id,
+            getattr(result, "data", None),
+        )
+    except Exception:
+        logger.exception("Failed to upsert structured_profile for user_id=%s", telegram_id)
 
 
 # ==========================
@@ -505,6 +619,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Пока что бот умеет немногое:",
             "/ping — проверить, что бот жив",
             "/me — показать, что бот знает о твоём аккаунте",
+            "/feed — черновой список тем, по которым я буду искать новости (когда будет профиль)",
             "/help — показать справку",
         ]
         await update.message.reply_text("\n".join(text_lines))
@@ -529,6 +644,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "",
             "Команды:",
             "/me — показать, что я о тебе знаю",
+            "/feed — по каким темам буду искать новости",
             "/help — показать справку",
             "/ping — проверить, что бот жив",
         ]
@@ -577,6 +693,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start — перезапустить бота и (при необходимости) пройти онбординг",
         "/ping — проверить, что бот жив",
         "/me — показать, что бот знает о тебе в базе и в Telegram",
+        "/feed — черновой вывод, по каким темам я буду искать новости",
         "/done — закончить описание интересов во время онбординга",
         "/help — эта справка",
     ]
@@ -721,6 +838,107 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if update.message:
         await update.message.reply_text("\n".join(all_lines))
+
+
+async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Черновая команда /feed:
+    - читает structured_profile из Supabase,
+    - выводит пользователю, по каким темам мы будем искать новости.
+    """
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return
+
+    if supabase is None:
+        await message.reply_text("Внутренняя ошибка: база профилей не настроена.")
+        return
+
+    try:
+        resp = (
+            supabase.table("user_profiles")
+            .select("structured_profile")
+            .eq("user_id", user.id)
+            .limit(1)
+            .execute()
+        )
+    except Exception:
+        logger.exception("Failed to load structured_profile from Supabase for user_id=%s", user.id)
+        await message.reply_text("Не получилось получить ваш профиль интересов. Попробуйте ещё раз позже.")
+        return
+
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+    if not data:
+        await message.reply_text(
+            "Я пока не знаю ваших интересов. Пройди, пожалуйста, онбординг через /start, "
+            "а потом попробуй /feed ещё раз."
+        )
+        return
+
+    row = data[0]
+    structured = row.get("structured_profile")
+
+    if structured is None:
+        await message.reply_text(
+            "Твой профиль ещё строится. Подожди пару секунд и попробуй /feed снова."
+        )
+        return
+
+    # Supabase может вернуть либо dict, либо JSON-строку
+    if isinstance(structured, str):
+        try:
+            structured = json.loads(structured)
+        except Exception:
+            logger.exception("Failed to parse structured_profile JSON for user_id=%s", user.id)
+            await message.reply_text(
+                "Ваш структурированный профиль сейчас в странном формате. "
+                "Попробуй пройти онбординг заново позже."
+            )
+            return
+
+    if not isinstance(structured, dict):
+        await message.reply_text(
+            "Ваш профиль интересов сейчас в непонятном формате. "
+            "Попробуй пройти онбординг заново позже."
+        )
+        return
+
+    topics = structured.get("topics") or []
+    negative_topics = structured.get("negative_topics") or []
+    tags = structured.get("interests_as_tags") or []
+
+    lines: List[str] = []
+
+    topic_names: List[str] = []
+    for t in topics:
+        if isinstance(t, dict):
+            name = t.get("name")
+            if name:
+                topic_names.append(str(name))
+    topic_names = topic_names[:8]
+
+    if topic_names:
+        lines.append("Я буду искать новости по темам: " + ", ".join(topic_names) + ".")
+
+    if tags:
+        tags_str = ", ".join(str(x) for x in tags[:10])
+        lines.append("Теги интересов: " + tags_str + ".")
+
+    if negative_topics:
+        neg_str = ", ".join(str(x) for x in negative_topics[:8])
+        lines.append("Буду стараться избегать тем: " + neg_str + ".")
+
+    if not lines:
+        lines.append(
+            "У меня пока нет достаточно структурированных данных о твоих интересах. "
+            "Как только профиль обновится, я смогу подбирать под тебя новости."
+        )
+
+    await message.reply_text("\n".join(lines))
 
 
 # ==========================
@@ -992,6 +1210,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("ping", ping))
     application.add_handler(CommandHandler("me", me))
+    application.add_handler(CommandHandler("feed", feed))
     application.add_handler(CommandHandler("done", finish_onboarding))
 
     # Текстовые сообщения (без команд) — для онбординга и выбора тем
@@ -1014,4 +1233,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
