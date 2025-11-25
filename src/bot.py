@@ -525,25 +525,39 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
         logger.warning("OpenAI response without text: %r", resp_json)
         return None
 
-    content = content_text.strip()
+    # --- НОВАЯ ЧАСТЬ: аккуратно вырезаем JSON и парсим ---
+    text_clean = (content_text or "").strip()
 
-    # В ответе модели лежит JSON-объект в текстовом виде, вырезаем его
+    # Вырезаем только то, что между первой "{" и последней "}"
+    start = text_clean.find("{")
+    end = text_clean.rfind("}")
+
+    if start != -1 and end != -1 and end > start:
+        json_candidate = text_clean[start : end + 1]
+    else:
+        # Если по какой-то причине фигурных скобок нет — пробуем весь текст
+        json_candidate = text_clean
+
+    logger.info(
+        "OpenAI structured_profile JSON candidate (first 300 chars): %s",
+        json_candidate[:300],
+    )
+
     try:
-        first = content.find("{")
-        last = content.rfind("}")
-        if first != -1 and last != -1:
-            json_str = content[first : last + 1]
-        else:
-            json_str = content
-
-        parsed = json.loads(json_str)
-    except Exception:
-        logger.exception("Failed to decode JSON from OpenAI content: %r", content[:1000])
+        parsed = json.loads(json_candidate)
+    except json.JSONDecodeError as e:
+        logger.error(
+            "Failed to decode JSON from OpenAI content; error=%s; content_prefix=%r",
+            e,
+            json_candidate[:300],
+        )
         return None
 
     if not isinstance(parsed, dict):
-        logger.warning("OpenAI returned JSON, но это не объект: %r", parsed)
+        logger.warning("OpenAI returned JSON, но это не объект: %r", type(parsed))
         return None
+
+    # --- НОРМАЛИЗАЦИЯ ---
 
     # Нормализация и заполнение дефолтов
     parsed.setdefault("location_city", None)
@@ -600,6 +614,7 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
     parsed["user_meta"] = user_meta
 
     return parsed
+
 
 
 def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
