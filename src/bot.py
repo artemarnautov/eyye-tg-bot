@@ -362,9 +362,7 @@ async def upsert_user_profile_structured(
 
 # ==========================
 # OpenAI: построение structured_profile
-# ==========================
-# ==========================
-# OpenAI: построение structured_profile
+# =============# OpenAI: построение structured_profile
 # ==========================
 
 # JSON Schema для профиля пользователя EYYE.
@@ -385,7 +383,7 @@ PROFILE_JSON_SCHEMA: Dict[str, Any] = {
                     "category": {"type": ["string", "null"]},
                     "detail": {"type": ["string", "null"]},
                 },
-                "required": ["name", "weight"],
+                "required": ["name", "weight", "category", "detail"],
                 "additionalProperties": False,
             },
         },
@@ -679,7 +677,7 @@ def _extract_parsed_profile_from_response(resp_json: Dict[str, Any]) -> (Optiona
         # запасной вариант — если structured нет, а текст лежит наверху
         if parsed is None and broken_text is None:
             top_text = resp_json.get("output_text")
-            if isinstance(top_text, str):
+            if isinstance(top_text, str) and top_text:
                 broken_text = top_text
 
     except Exception:
@@ -731,11 +729,9 @@ def _request_profile_with_schema(raw_interests: str) -> (Optional[Dict[str, Any]
         "text": {
             "format": {
                 "type": "json_schema",
-                "json_schema": {
-                    "name": "eyye_user_profile",
-                    "strict": True,
-                    "schema": PROFILE_JSON_SCHEMA,
-                },
+                "name": "eyye_user_profile",
+                "schema": PROFILE_JSON_SCHEMA,
+                "strict": True,
             }
         },
     }
@@ -812,11 +808,9 @@ def _request_profile_retry_with_schema(
         "text": {
             "format": {
                 "type": "json_schema",
-                "json_schema": {
-                    "name": "eyye_user_profile_retry",
-                    "strict": True,
-                    "schema": PROFILE_JSON_SCHEMA,
-                },
+                "name": "eyye_user_profile_retry",
+                "schema": PROFILE_JSON_SCHEMA,
+                "strict": True,
             }
         },
     }
@@ -951,6 +945,7 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
             "Unexpected error while saving structured_profile for user_id=%s",
             user_id,
         )
+
 
 
 # ==========================
