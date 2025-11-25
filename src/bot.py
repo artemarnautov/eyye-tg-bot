@@ -5,6 +5,7 @@ import asyncio
 import json
 import urllib.request
 import urllib.error
+import time
 from typing import Optional, Any, Dict, List
 from datetime import datetime, timezone
 
@@ -38,8 +39,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # модель берём из окружения, по умолчанию gpt-5-mini
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
-# базовый URL для OpenAI (сейчас используем конкретный endpoint /v1/responses)
+# базовый URL для OpenAI + endpoint Responses API
 OPENAI_API_BASE = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+OPENAI_RESPONSES_URL = OPENAI_API_BASE.rstrip("/") + "/responses"
+
+# таймаут HTTP-запроса к OpenAI (секунды)
+OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "12"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set in environment variables")
@@ -362,7 +367,6 @@ async def upsert_user_profile_structured(
 
 # ==========================
 # OpenAI: построение structured_profile
-# =============# OpenAI: построение structured_profile
 # ==========================
 
 # JSON Schema для профиля пользователя EYYE.
@@ -458,7 +462,7 @@ def _extract_array_for_key_from_partial_json(content: str, key: str) -> Optional
 
 def _build_fallback_profile_from_raw(raw_interests: str) -> Dict[str, Any]:
     """
-    Очень простой fallback-профиль на случай, если OpenAI дважды вернул мусор.
+    Очень простой fallback-профиль на случай, если OpenAI вернул мусор или не сработал.
     Строим темы по тем строкам raw_interests, которые совпадают с MAIN_TOPICS / SPORT_SUBTOPICS.
     """
     lines = [l.strip() for l in (raw_interests or "").splitlines() if l.strip()]
@@ -525,7 +529,7 @@ def _salvage_profile_from_broken_content(
     broken_content: Optional[str],
 ) -> Dict[str, Any]:
     """
-    Третий уровень защиты:
+    Защитный слой:
     - пробуем вытащить topics / negative_topics / interests_as_tags из битого JSON OpenAI;
     - если не получилось вообще ничего — строим fallback из raw_interests.
     """
@@ -688,7 +692,7 @@ def _extract_parsed_profile_from_response(resp_json: Dict[str, Any]) -> (Optiona
 
 def _request_profile_with_schema(raw_interests: str) -> (Optional[Dict[str, Any]], Optional[str]):
     """
-    Первый (основной) запрос к OpenAI:
+    Единственный HTTP-запрос к OpenAI:
     - используем json_schema + strict=true;
     - пытаемся получить parsed из structured output;
     - если не получается — возвращаем (None, broken_text), где broken_text — текстовый ответ.
@@ -736,112 +740,51 @@ def _request_profile_with_schema(raw_interests: str) -> (Optional[Dict[str, Any]
         },
     }
 
-    url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1/responses")
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
 
     data_bytes = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+    req = urllib.request.Request(OPENAI_RESPONSES_URL, data=data_bytes, headers=headers, method="POST")
+
+    start_time = time.monotonic()
+    body: Optional[bytes] = None
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT_SECONDS) as resp:
             body = resp.read()
     except urllib.error.HTTPError as e:
         try:
             error_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             error_body = "<no body>"
-        logger.error("OpenAI HTTPError (primary): %s | body=%s", e, error_body[:2000])
+        elapsed = time.monotonic() - start_time
+        logger.error(
+            "OpenAI HTTPError while building structured_profile (%.2fs): %s | body=%s",
+            elapsed,
+            e,
+            error_body[:2000],
+        )
         return None, None
     except Exception:
-        logger.exception("Error calling OpenAI (primary)")
+        elapsed = time.monotonic() - start_time
+        logger.exception(
+            "Error calling OpenAI while building structured_profile (%.2fs)", elapsed
+        )
+        return None, None
+
+    elapsed = time.monotonic() - start_time
+    logger.info("OpenAI structured_profile HTTP call finished in %.2fs", elapsed)
+
+    if body is None:
+        logger.error("OpenAI response body is empty")
         return None, None
 
     try:
         resp_json = json.loads(body.decode("utf-8"))
     except Exception:
-        logger.exception("Failed to parse OpenAI response JSON (primary): %r", body[:1000])
-        return None, None
-
-    return _extract_parsed_profile_from_response(resp_json)
-
-
-def _request_profile_retry_with_schema(
-    raw_interests: str,
-    broken_content: str,
-) -> (Optional[Dict[str, Any]], Optional[str]):
-    """
-    Второй (единственный ретрай) запрос:
-    - объясняем, что прошлый JSON был битым;
-    - даём исходные интересы и прошлый ответ;
-    - снова просим корректный JSON по той же схеме.
-    """
-    if not OPENAI_API_KEY:
-        return None, None
-
-    model = OPENAI_MODEL or "gpt-5-mini"
-
-    system_prompt = """
-Ты помощник сервиса EYYE. Ранее ты вернул некорректный JSON-профиль пользователя.
-Сейчас тебе нужно СНОВА построить профиль по строгой схеме.
-
-Игнорируй все ошибки прошлого ответа и просто верни новый корректный профиль.
-"""
-
-    user_prompt = (
-        "Вот исходное описание интересов пользователя:\n\n"
-        f"{raw_interests}\n\n"
-        "Вот твой предыдущий ответ (битый JSON, который нужно игнорировать):\n\n"
-        f"{broken_content}\n\n"
-        "Построй, пожалуйста, НОВЫЙ корректный профиль по согласованной схеме."
-    )
-
-    payload: Dict[str, Any] = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "max_output_tokens": 800,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "eyye_user_profile_retry",
-                "schema": PROFILE_JSON_SCHEMA,
-                "strict": True,
-            }
-        },
-    }
-
-    url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1/responses")
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    data_bytes = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read()
-    except urllib.error.HTTPError as e:
-        try:
-            error_body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            error_body = "<no body>"
-        logger.error("OpenAI HTTPError (retry): %s | body=%s", e, error_body[:2000])
-        return None, None
-    except Exception:
-        logger.exception("Error calling OpenAI (retry)")
-        return None, None
-
-    try:
-        resp_json = json.loads(body.decode("utf-8"))
-    except Exception:
-        logger.exception("Failed to parse OpenAI response JSON (retry): %r", body[:1000])
+        logger.exception("Failed to parse OpenAI response JSON: %r", body[:1000])
         return None, None
 
     return _extract_parsed_profile_from_response(resp_json)
@@ -851,44 +794,39 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
     """
     Главная функция построения structured_profile через OpenAI.
 
-    Уровни надёжности:
-    1) Основной запрос с json_schema + strict → пытаемся получить parsed.
-    2) Если не получилось, но есть текстовый ответ → один ретрай с "repair"-промптом.
-    3) Если и после ретрая нет parsed, но есть хотя бы какой-то текст —
-       вытаскиваем максимум из битого ответа или строим fallback из raw_interests.
-    4) Только если вообще нечего спасать — возвращаем None.
+    Упрощённая логика (минимум латентности):
+    1) Один запрос с json_schema + strict → пытаемся получить parsed.
+    2) Если parsed есть — нормализуем и возвращаем.
+    3) Если parsed нет, но есть текстовый broken_content —
+       сразу уходим в salvage (попытка вытащить массивы) + fallback из raw_interests.
+    4) Если вообще ничего не пришло — логируем и возвращаем None.
     """
-    # 1️⃣ Первый запрос
+
     parsed, broken_content = _request_profile_with_schema(raw_interests)
 
+    # 1️⃣ Сразу используем корректный structured output, если он есть
     if isinstance(parsed, dict):
+        logger.info("Structured profile: got parsed JSON from OpenAI")
         return _normalize_profile_dict(parsed)
 
-    # 2️⃣ Ретрай, если есть текстовый ответ
+    # 2️⃣ Нет parsed, но есть текст — пробуем salvage + fallback
     if broken_content:
-        logger.warning("Structured profile not found in primary response, retrying with repair prompt")
-        parsed_retry, broken_retry = _request_profile_retry_with_schema(raw_interests, broken_content)
-        if isinstance(parsed_retry, dict):
-            return _normalize_profile_dict(parsed_retry)
+        logger.warning("Structured profile not found in OpenAI response, salvaging from broken content")
+        salvaged = _salvage_profile_from_broken_content(raw_interests, broken_content)
+        return _normalize_profile_dict(salvaged)
 
-        # 3️⃣ Спасаем максимум из битого ответа (retry или первичного)
-        salvage_source = broken_retry or broken_content
-        if salvage_source:
-            logger.warning("Retry did not return structured profile, salvaging from broken content")
-            salvaged = _salvage_profile_from_broken_content(raw_interests, salvage_source)
-            return _normalize_profile_dict(salvaged)
-
-    # 4️⃣ Вообще нечего спасать: нет parsed и нет текста
-    logger.warning("OpenAI did not return any usable content for structured_profile")
+    # 3️⃣ Вообще нечего спасать: ни parsed, ни текста
+    logger.warning("OpenAI did not return any usable content for structured_profile (no parsed, no text)")
     return None
 
 
-def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
+async def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
     """
-    Строит structured_profile через OpenAI и сохраняет в Supabase.
+    Асинхронно строит structured_profile через OpenAI и сохраняет в Supabase.
 
     ВАЖНО:
-    - raw_interests мы здесь НЕ перезатираем, чтобы не ловить NOT NULL ошибки.
+    - OpenAI вызываем через asyncio.to_thread, чтобы не блокировать event loop.
+    - raw_interests здесь НЕ перезатираем, чтобы не ловить NOT NULL ошибки.
     - Обновляем только location_* и structured_profile.
     """
     text_len = len(raw_interests or "")
@@ -898,7 +836,26 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
         text_len,
     )
 
-    profile = _call_openai_structured_profile_sync(raw_interests)
+    # Если по каким-то причинам нет Supabase или ключа — выходим
+    if not supabase:
+        logger.warning(
+            "build_and_save_structured_profile: Supabase is not configured, skipping for user_id=%s",
+            user_id,
+        )
+        return
+    if not OPENAI_API_KEY:
+        logger.warning(
+            "build_and_save_structured_profile: OPENAI_API_KEY is not set, skipping for user_id=%s",
+            user_id,
+        )
+        return
+
+    # Весь синхронный HTTP и парсинг — в отдельном потоке
+    profile: Optional[Dict[str, Any]] = await asyncio.to_thread(
+        _call_openai_structured_profile_sync,
+        raw_interests,
+    )
+
     if not profile:
         logger.warning(
             "build_and_save_structured_profile: OpenAI returned empty structured_profile for user_id=%s",
@@ -915,6 +872,7 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
     try:
         table = supabase.table("user_profiles")
 
+        # Пытаемся обновить существующую запись
         resp = table.update(update_data).eq("user_id", user_id).execute()
         logger.info(
             "Update structured_profile for user_id=%s: data=%s count=%s",
@@ -925,6 +883,7 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
 
         data_list = getattr(resp, "data", None)
         if not data_list:
+            # Если обновить нечего — вставляем новую запись
             insert_data = {
                 "user_id": user_id,
                 "raw_interests": raw_interests or "",
@@ -945,7 +904,6 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
             "Unexpected error while saving structured_profile for user_id=%s",
             user_id,
         )
-
 
 
 # ==========================
@@ -1198,6 +1156,7 @@ async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Черновая команда /feed:
     - читает structured_profile из Supabase,
+    - если его нет, быстро строит fallback-профиль по raw_interests (без OpenAI),
     - выводит пользователю, по каким темам мы будем искать новости.
     """
     user = update.effective_user
@@ -1213,14 +1172,14 @@ async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         resp = (
             supabase.table("user_profiles")
-            .select("structured_profile")
+            .select("structured_profile, raw_interests")
             .eq("user_id", user.id)
             .limit(1)
             .execute()
         )
     except Exception:
-        logger.exception("Failed to load structured_profile from Supabase for user_id=%s", user.id)
-        await message.reply_text("Не получилось получить ваш профиль интересов. Попробуйте ещё раз позже.")
+        logger.exception("Failed to load profile from Supabase for user_id=%s", user.id)
+        await message.reply_text("Не получилось получить твой профиль интересов. Попробуй ещё раз позже.")
         return
 
     data = getattr(resp, "data", None)
@@ -1228,42 +1187,68 @@ async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         data = getattr(resp, "model", None)
     if not data:
         await message.reply_text(
-            "Я пока не знаю ваших интересов. Пройди, пожалуйста, онбординг через /start, "
+            "Я пока не знаю твоих интересов. Пройди, пожалуйста, онбординг через /start, "
             "а потом попробуй /feed ещё раз."
         )
         return
 
     row = data[0]
     structured = row.get("structured_profile")
+    raw_interests = row.get("raw_interests") or ""
 
-    if structured is None:
-        await message.reply_text(
-            "Твой профиль ещё строится. Подожди пару секунд и попробуй /feed снова."
-        )
-        return
+    # Если structured_profile есть — используем его как основной источник
+    if structured is not None:
+        # Supabase может вернуть либо dict, либо JSON-строку
+        if isinstance(structured, str):
+            try:
+                structured = json.loads(structured)
+            except Exception:
+                logger.exception("Failed to parse structured_profile JSON for user_id=%s", user.id)
+                await message.reply_text(
+                    "Твой структурированный профиль сейчас в странном формате. "
+                    "Попробуй пройти онбординг заново позже."
+                )
+                return
 
-    # Supabase может вернуть либо dict, либо JSON-строку
-    if isinstance(structured, str):
-        try:
-            structured = json.loads(structured)
-        except Exception:
-            logger.exception("Failed to parse structured_profile JSON for user_id=%s", user.id)
+        if not isinstance(structured, dict):
             await message.reply_text(
-                "Ваш структурированный профиль сейчас в странном формате. "
+                "Твой профиль интересов сейчас в непонятном формате. "
                 "Попробуй пройти онбординг заново позже."
             )
             return
 
-    if not isinstance(structured, dict):
-        await message.reply_text(
-            "Ваш профиль интересов сейчас в непонятном формате. "
-            "Попробуй пройти онбординг заново позже."
-        )
-        return
+        profile_dict = structured
+        using_fallback = False
+    else:
+        # structured_profile ещё нет — строим быстрый fallback по raw_interests
+        if not raw_interests:
+            await message.reply_text(
+                "Похоже, у меня пока нет ни структурированного профиля, ни исходного описания интересов 😔\n"
+                "Напиши /start, чтобы пройти онбординг."
+            )
+            return
 
-    topics = structured.get("topics") or []
-    negative_topics = structured.get("negative_topics") or []
-    tags = structured.get("interests_as_tags") or []
+        profile_dict = _normalize_profile_dict(_build_fallback_profile_from_raw(raw_interests))
+        using_fallback = True
+
+        # Параллельно (НЕ блокируя ответ) пробуем построить настоящий structured_profile через OpenAI
+        if OPENAI_API_KEY:
+            application: Application = context.application  # type: ignore[assignment]
+            try:
+                application.create_task(build_and_save_structured_profile(user.id, raw_interests))
+                logger.info(
+                    "feed: scheduled build_and_save_structured_profile for user_id=%s (fallback mode)",
+                    user.id,
+                )
+            except Exception:
+                logger.exception(
+                    "feed: failed to schedule build_and_save_structured_profile for user_id=%s",
+                    user.id,
+                )
+
+    topics = profile_dict.get("topics") or []
+    negative_topics = profile_dict.get("negative_topics") or []
+    tags = profile_dict.get("interests_as_tags") or []
 
     lines: List[str] = []
 
@@ -1290,6 +1275,12 @@ async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append(
             "У меня пока нет достаточно структурированных данных о твоих интересах. "
             "Как только профиль обновится, я смогу подбирать под тебя новости."
+        )
+
+    if using_fallback:
+        lines.append(
+            "\nСейчас я ориентируюсь на быстрый черновой профиль по твоим выборам. "
+            "Параллельно строю более точный профиль с помощью ИИ."
         )
 
     await message.reply_text("\n".join(lines))
