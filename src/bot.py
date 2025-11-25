@@ -602,63 +602,74 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
     return parsed
 
 
-async def build_and_save_structured_profile(telegram_id: int, raw_interests: str) -> None:
+def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
     """
-    Асинхронно строит structured_profile через OpenAI и сохраняет его в Supabase.
-    Вызывается в фоне, не трогает UX пользователя.
+    Строит structured_profile через OpenAI и сохраняет в Supabase.
+
+    ВАЖНО:
+    - raw_interests мы здесь НЕ перезатираем, чтобы не ловить NOT NULL ошибки.
+    - Обновляем только location_* и structured_profile.
     """
-    if supabase is None:
-        logger.warning("Supabase client is not configured, skipping structured_profile build")
-        return
-
-    if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY is not set, skipping structured_profile build")
-        return
-
+    text_len = len(raw_interests or "")
     logger.info(
-        "build_and_save_structured_profile: start for user_id=%s, raw_interests_len=%d",
-        telegram_id,
-        len(raw_interests or ""),
+        "build_and_save_structured_profile: start for user_id=%s, raw_interests_len=%s",
+        user_id,
+        text_len,
     )
 
-    try:
-        structured = await asyncio.to_thread(_call_openai_structured_profile_sync, raw_interests)
-    except Exception:
-        logger.exception("Failed to call OpenAI (to_thread) for structured_profile")
+    profile = _call_openai_structured_profile_sync(raw_interests)
+    if not profile:
+        logger.warning(
+            "OpenAI returned empty structured_profile for user_id=%s", user_id
+        )
         return
 
-    if not structured:
-        logger.warning("OpenAI returned empty structured_profile for user_id=%s", telegram_id)
-        return
-
-    # Достаём локацию, если модель её определила
-    location_city = structured.get("location_city")
-    location_country = structured.get("location_country")
-
-    payload: Dict[str, Any] = {
-        "user_id": telegram_id,
-        "structured_profile": structured,
-        "updated_at": datetime.now(timezone.utc).isoformat(),
+    # Готовим данные для обновления: НЕ трогаем raw_interests
+    update_data = {
+        "location_city": profile.get("location_city"),
+        "location_country": profile.get("location_country"),
+        "structured_profile": profile,
     }
 
-    if location_city:
-        payload["location_city"] = location_city
-    if location_country:
-        payload["location_country"] = location_country
-
     try:
-        result = (
-            supabase.table("user_profiles")
-            .upsert(payload, on_conflict="user_id")
-            .execute()
-        )
+        table = supabase.table("user_profiles")
+
+        # 1) Пытаемся обновить существующую запись
+        resp = table.update(update_data).eq("user_id", user_id).execute()
         logger.info(
-            "Structured_profile saved for user_id=%s, result=%s",
-            telegram_id,
-            getattr(result, "data", None),
+            "Update structured_profile for user_id=%s: data=%s count=%s",
+            user_id,
+            getattr(resp, "data", None),
+            getattr(resp, "count", None),
+        )
+
+        # Если обновление ничего не задело (на всякий случай) — вставим новую строку
+        data_list = getattr(resp, "data", None)
+        if not data_list:
+            insert_data = {
+                "user_id": user_id,
+                # raw_interests обязательное поле NOT NULL — подставляем оригинальный текст
+                "raw_interests": raw_interests or "",
+                "location_city": profile.get("location_city"),
+                "location_country": profile.get("location_country"),
+                "structured_profile": profile,
+            }
+            resp_ins = table.insert(insert_data).execute()
+            logger.info(
+                "Insert user_profile with structured_profile for user_id=%s: data=%s count=%s",
+                user_id,
+                getattr(resp_ins, "data", None),
+                getattr(resp_ins, "count", None),
+            )
+
+    except APIError as e:
+        logger.error(
+            "Failed to save structured_profile for user_id=%s: %s", user_id, e
         )
     except Exception:
-        logger.exception("Failed to upsert structured_profile for user_id=%s", telegram_id)
+        logger.exception(
+            "Unexpected error while saving structured_profile for user_id=%s", user_id
+        )
 
 
 # ==========================
