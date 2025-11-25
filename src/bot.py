@@ -437,26 +437,22 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
 4. Если информации мало, ставь null или пустые массивы.
 """
 
-    # Минимальный валидный payload для Responses API под gpt-5-mini:
-    # - НЕ передаём temperature (эта модель его не поддерживает)
-    # - НЕ используем response_format/text-format, просто просим JSON в промпте
     payload: Dict[str, Any] = {
         "model": model,
         "input": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": raw_interests},
         ],
+        # temperature специально не задаём — gpt-5-mini его не принимает
         "max_output_tokens": 800,
+        "text": {
+            "format": {
+                "type": "text"
+            }
+        },
     }
 
-    # Строим URL до /responses
-    # Если OPENAI_API_BASE уже оканчивается на /responses — второй раз не добавляем
-    base = OPENAI_API_BASE.rstrip("/")
-    if base.endswith("/responses"):
-        url = base
-    else:
-        url = f"{base}/responses"
-
+    url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1/responses")
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
@@ -491,18 +487,34 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
         logger.exception("Failed to parse OpenAI response JSON: %r", body[:1000])
         return None
 
-    # Достаём текст из структуры Responses API:
-    # resp_json["output"][0]["content"][0]["text"]
+    # Достаём текст из структуры Responses API.
+    # Сейчас в output сначала приходит блок type="reasoning", потом type="message".
     content_text: Optional[str] = None
     try:
         output = resp_json.get("output")
-        if isinstance(output, list) and output:
-            msg = output[0]
-            content = msg.get("content")
-            if isinstance(content, list) and content:
-                block = content[0]
-                if isinstance(block, dict):
-                    content_text = block.get("text")
+        if isinstance(output, list):
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") != "message":
+                    # пропускаем reasoning и прочие типы
+                    continue
+                content_list = item.get("content")
+                if not isinstance(content_list, list):
+                    continue
+                for block in content_list:
+                    if not isinstance(block, dict):
+                        continue
+                    # У gpt-5-mini сейчас type="output_text"
+                    block_type = block.get("type")
+                    if block_type in ("output_text", "input_text", "text"):
+                        text_val = block.get("text")
+                        if isinstance(text_val, str):
+                            content_text = text_val
+                            break
+                if content_text:
+                    break
+
         # запасной вариант, если вдруг появится плоское поле output_text
         if not content_text and isinstance(resp_json.get("output_text"), str):
             content_text = resp_json["output_text"]
