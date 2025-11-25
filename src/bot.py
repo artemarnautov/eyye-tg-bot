@@ -39,19 +39,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # по умолчанию теперь gpt-5-mini (но окружение имеет приоритет)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
-# Базовый URL для OpenAI Responses API.
-# Логика:
-# - если OPENAI_BASE_URL заканчивается на /responses — используем его как есть;
-# - иначе добавляем /responses в конец;
-# - по умолчанию: https://api.openai.com/v1/responses
-_raw_openai_base = os.getenv("OPENAI_BASE_URL")
-if not _raw_openai_base:
-    OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
-else:
-    if _raw_openai_base.rstrip("/").endswith("/responses"):
-        OPENAI_RESPONSES_URL = _raw_openai_base.rstrip("/")
-    else:
-        OPENAI_RESPONSES_URL = _raw_openai_base.rstrip("/") + "/responses"
+# базовый URL для OpenAI (можно переопределить через OPENAI_BASE_URL)
+# ожидаем, что это либо полный путь к /v1, либо к /v1/responses
+OPENAI_API_BASE = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set in environment variables")
@@ -202,7 +192,8 @@ async def update_topics_keyboard_markup(
             reply_markup=keyboard,
         )
     except Exception as e:
-        logger.exception("Failed to update topics keyboard: %s", e)
+        # логируем, но не падаем
+        logger.error("Failed to update topics keyboard: %s", e)
 
 
 # ==========================
@@ -268,7 +259,7 @@ async def load_user_from_supabase(telegram_id: int) -> Optional[dict]:
 
 async def load_user_profile(telegram_id: int) -> Optional[Dict[str, Any]]:
     """
-    Читаем профиль пользователя из таблице user_profiles по user_id.
+    Читаем профиль пользователя из таблицы user_profiles по user_id.
     Возвращаем dict или None.
     """
     if not supabase:
@@ -372,7 +363,7 @@ async def upsert_user_profile_structured(
 
 
 # ==========================
-# OpenAI: построение structured_profile (Responses API)
+# OpenAI: построение structured_profile
 # ==========================
 
 def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[str, Any]]:
@@ -385,6 +376,7 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
         logger.warning("OPENAI_API_KEY is not set, skipping structured_profile build")
         return None
 
+    # Берём модель из окружения, по умолчанию gpt-5-mini (через Responses API)
     model = OPENAI_MODEL or "gpt-5-mini"
 
     system_prompt = """
@@ -445,38 +437,29 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
 4. Если информации мало, ставь null или пустые массивы.
 """
 
-    # Новый формат для Responses API (input вместо messages, контент — input_text)
+    # Минимальный валидный payload для Responses API под gpt-5-mini:
+    # - НЕ передаём temperature (эта модель его не поддерживает)
+    # - НЕ используем response_format/text-format, просто просим JSON в промпте
     payload: Dict[str, Any] = {
         "model": model,
         "input": [
-            {
-                "role": "system",
-                "content": [
-                    {"type": "input_text", "text": system_prompt},
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": raw_interests},
-                ],
-            },
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": raw_interests},
         ],
-        "temperature": 0.2,
         "max_output_tokens": 800,
-        "text": {
-            "format": {
-                "type": "text",
-            }
-        },
     }
 
-    url = OPENAI_RESPONSES_URL
+    # Строим URL до /responses
+    # Если OPENAI_API_BASE уже оканчивается на /responses — второй раз не добавляем
+    base = OPENAI_API_BASE.rstrip("/")
+    if base.endswith("/responses"):
+        url = base
+    else:
+        url = f"{base}/responses"
+
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
-        # Обязательный beta-флаг для нового Responses API
-        "OpenAI-Beta": "responses=v1",
     }
 
     data_bytes = json.dumps(payload).encode("utf-8")
@@ -509,26 +492,17 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
         return None
 
     # Достаём текст из структуры Responses API:
-    # resp_json["output"][i]["content"][j] с type="output_text"
+    # resp_json["output"][0]["content"][0]["text"]
     content_text: Optional[str] = None
     try:
         output = resp_json.get("output")
-        if isinstance(output, list):
-            for msg in output:
-                content_list = msg.get("content", [])
-                if not isinstance(content_list, list):
-                    continue
-                for block in content_list:
-                    if (
-                        isinstance(block, dict)
-                        and block.get("type") == "output_text"
-                        and isinstance(block.get("text"), str)
-                    ):
-                        content_text = block["text"]
-                        break
-                if content_text:
-                    break
-
+        if isinstance(output, list) and output:
+            msg = output[0]
+            content = msg.get("content")
+            if isinstance(content, list) and content:
+                block = content[0]
+                if isinstance(block, dict):
+                    content_text = block.get("text")
         # запасной вариант, если вдруг появится плоское поле output_text
         if not content_text and isinstance(resp_json.get("output_text"), str):
             content_text = resp_json["output_text"]
@@ -612,8 +586,6 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
     if not isinstance(user_meta, dict):
         user_meta = {}
     parsed["user_meta"] = user_meta
-
-    logger.info("Structured_profile from OpenAI: %s", parsed)
 
     return parsed
 
