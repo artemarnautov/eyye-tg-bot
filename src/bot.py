@@ -368,6 +368,9 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
         logger.warning("OPENAI_API_KEY is not set, skipping structured_profile build")
         return None
 
+    # Берём модель из окружения, если нет — дефолт делаем gpt-5-mini
+    model = OPENAI_MODEL or "gpt-5-mini"
+
     system_prompt = """
 Ты помогаешь новостному рекомендательному сервису EYYE.
 По свободному описанию интересов и города пользователя ты должен вернуть
@@ -427,63 +430,66 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
 """
 
     payload: Dict[str, Any] = {
-        "model": OPENAI_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": raw_interests},
         ],
         "temperature": 0.2,
+        "max_tokens": 800,
     }
 
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-        },
-    )
+    url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1/chat/completions")
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    data_bytes = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
 
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            resp_data = resp.read().decode("utf-8")
-            data = json.loads(resp_data)
+            body = resp.read()
     except urllib.error.HTTPError as e:
-        logger.exception("OpenAI HTTPError while building structured_profile: %s", e)
+        # Печатаем тело ошибки, чтобы понимать, что именно не так (нет доступа к модели, неверное имя и т.д.)
+        try:
+            error_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            error_body = "<no body>"
+        logger.error(
+            "OpenAI HTTPError while building structured_profile: %s, body=%s",
+            e,
+            error_body[:500],
+        )
         return None
-    except urllib.error.URLError as e:
-        logger.exception("OpenAI URLError while building structured_profile: %s", e)
-        return None
-    except Exception:
-        logger.exception("Unexpected error while calling OpenAI for structured_profile")
+    except Exception as e:
+        logger.exception("Error calling OpenAI: %s", e)
         return None
 
     try:
-        raw_content = data["choices"][0]["message"]["content"].strip()
+        resp_json = json.loads(body.decode("utf-8"))
+        content = resp_json["choices"][0]["message"]["content"]
     except Exception:
-        logger.error("Unexpected OpenAI response format for structured_profile: %s", data)
+        logger.exception("Failed to parse OpenAI response JSON")
         return None
 
-    # Пытаемся распарсить JSON как есть
+    # Парсим JSON из текста (на всякий случай отрезаем всё до первого '{' и после последней '}')
     try:
-        parsed: Any = json.loads(raw_content)
-    except json.JSONDecodeError:
-        # Пытаемся вырезать самый внешний {...}
-        start = raw_content.find("{")
-        end = raw_content.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            try:
-                parsed = json.loads(raw_content[start : end + 1])
-            except Exception:
-                logger.exception("Failed to parse structured_profile JSON even after trimming")
-                return None
-        else:
-            logger.error("Could not find JSON object in OpenAI structured_profile response: %s", raw_content)
+        first = content.find("{")
+        last = content.rfind("}")
+        if first != -1 and last != -1:
+            content = content[first : last + 1]
+
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            logger.warning("OpenAI returned JSON, но это не объект: %r", parsed)
             return None
-
-    if not isinstance(parsed, dict):
-        logger.error("Structured_profile is not a JSON object: %s", parsed)
+        return parsed
+    except json.JSONDecodeError:
+        logger.exception("Failed to decode JSON from OpenAI content: %r", content)
         return None
+
 
     # Заполняем дефолты и нормализуем
     parsed.setdefault("location_city", None)
