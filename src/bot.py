@@ -1,12 +1,11 @@
-# file: src/bot.py
 import logging
 import os
 import asyncio
 import json
 import urllib.request
 import urllib.error
-import time
-from typing import Optional, Any, Dict, List
+from typing import Optional, Any, Dict, List, cast
+from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -30,23 +29,25 @@ from telegram.ext import (
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Читаем токен бота: сначала BOT_TOKEN, потом TELEGRAM_BOT_TOKEN (на всякий случай)
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN")
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# модель берём из окружения, по умолчанию gpt-5-mini
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+# Модель по умолчанию — gpt-4.1-mini (можно переопределить в .env)
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-# базовый URL для OpenAI + endpoint Chat Completions API
+# Базовый URL для OpenAI + endpoint Chat Completions
 OPENAI_API_BASE = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_CHAT_COMPLETIONS_URL = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
 
-# таймаут HTTP-запроса к OpenAI (секунды)
-OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
+# Таймаут HTTP-запроса к OpenAI (секунды)
+OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
 
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in environment variables")
+    raise RuntimeError("BOT_TOKEN or TELEGRAM_BOT_TOKEN is not set in environment variables")
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -194,7 +195,6 @@ async def update_topics_keyboard_markup(
             reply_markup=keyboard,
         )
     except Exception as e:
-        # логируем, но не падаем
         logger.error("Failed to update topics keyboard: %s", e)
 
 
@@ -202,11 +202,9 @@ async def update_topics_keyboard_markup(
 # Работа с Supabase: telegram_users
 # ==========================
 
-
 async def save_user_to_supabase(telegram_id: int, username: Optional[str]) -> None:
     """
-    Сохраняем / обновляем пользователя в таблице telegram_users.
-    Если Supabase не настроен, просто пишем в лог и выходим.
+    upsert в таблицу telegram_users.
     """
     if not supabase:
         logger.warning("Supabase client is not configured, skip save_user_to_supabase")
@@ -225,14 +223,12 @@ async def save_user_to_supabase(telegram_id: int, username: Optional[str]) -> No
         )
         logger.info("Upsert telegram user %s: %s", telegram_id, response)
     except Exception as e:
-        # Логируем, но не падаем
         logger.exception("Error saving user to Supabase: %s", e)
 
 
 async def load_user_from_supabase(telegram_id: int) -> Optional[dict]:
     """
     Читаем пользователя из таблицы telegram_users по id.
-    Возвращаем dict или None.
     """
     if not supabase:
         logger.warning("Supabase client is not configured, skip load_user_from_supabase")
@@ -251,7 +247,6 @@ async def load_user_from_supabase(telegram_id: int) -> Optional[dict]:
             return data[0] if data else None
         return data
     except Exception as e:
-        # Логируем и возвращаем None — наверху покажем только данные из Telegram
         logger.exception("Error loading user from Supabase: %s", e)
         return None
 
@@ -260,11 +255,9 @@ async def load_user_from_supabase(telegram_id: int) -> Optional[dict]:
 # Работа с Supabase: user_profiles
 # ==========================
 
-
 async def load_user_profile(telegram_id: int) -> Optional[Dict[str, Any]]:
     """
-    Читаем профиль пользователя из таблицы user_profiles по user_id.
-    Возвращаем dict или None.
+    Профиль пользователя из user_profiles.
     """
     if not supabase:
         logger.warning("Supabase client is not configured, skip load_user_profile")
@@ -294,8 +287,7 @@ async def upsert_user_profile(
     location_country: Optional[str] = None,
 ) -> bool:
     """
-    Создаём или обновляем профиль пользователя в таблице user_profiles.
-    Пока location_* не парсим и обычно не заполняем.
+    upsert в user_profiles (raw_interests + опционально location_*).
     """
     if not supabase:
         logger.warning("Supabase client is not configured, skip upsert_user_profile")
@@ -329,9 +321,8 @@ async def upsert_user_profile_structured(
     raw_interests: Optional[str] = None,
 ) -> bool:
     """
-    Создаём или обновляем structured_profile в user_profiles.
-    Заодно при наличии обновляем location_city/location_country и, при желании, raw_interests.
-    (Сейчас не используется напрямую, но оставляем на будущее.)
+    upsert structured_profile в user_profiles.
+    (На будущее, сейчас напрямую не зовём.)
     """
     if not supabase:
         logger.warning("Supabase client is not configured, skip upsert_user_profile_structured")
@@ -342,7 +333,6 @@ async def upsert_user_profile_structured(
         "structured_profile": structured_profile,
     }
 
-    # Если модель выделила локацию — синхронизируем
     loc_city = structured_profile.get("location_city") or structured_profile.get("city")
     loc_country = structured_profile.get("location_country") or structured_profile.get("country")
 
@@ -367,172 +357,13 @@ async def upsert_user_profile_structured(
 
 
 # ==========================
-# OpenAI: построение structured_profile
+# OpenAI: structured_profile
 # ==========================
-
-# JSON Schema для профиля пользователя EYYE.
-# Оставляем как документацию к структуре, которую хотим получить от модели.
-PROFILE_JSON_SCHEMA: Dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "location_city": {"type": ["string", "null"]},
-        "location_country": {"type": ["string", "null"]},
-        "topics": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "weight": {"type": "number"},
-                    "category": {"type": ["string", "null"]},
-                    "detail": {"type": ["string", "null"]},
-                },
-                "required": ["name", "weight", "category", "detail"],
-                "additionalProperties": False,
-            },
-        },
-        "negative_topics": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "interests_as_tags": {
-            "type": "array",
-            "items": {"type": "string"},
-        },
-        "user_meta": {
-            "type": "object",
-            "properties": {
-                "age_group": {"type": ["string", "null"]},
-                "student_status": {"type": ["string", "null"]},
-            },
-            "required": ["age_group", "student_status"],
-            "additionalProperties": False,
-        },
-    },
-    "required": [
-        "location_city",
-        "location_country",
-        "topics",
-        "negative_topics",
-        "interests_as_tags",
-        "user_meta",
-    ],
-    "additionalProperties": False,
-}
-
-
-def call_openai_responses(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Универсальная обёртка вокруг OpenAI Chat Completions.
-
-    Принимает payload в "старом" формате:
-    - model: str (опционально)
-    - input: str | list (сообщение или список сообщений)
-      * если это список dict'ов вида {"role": "...", "content": "..."} — используем как messages;
-      * иначе превращаем всё в один user-message.
-    - max_output_tokens: int (опционально; по умолчанию 512)
-    - temperature: float (опционально; по умолчанию 0.2)
-    - response_format: dict (опционально) — пробрасывается в Chat Completions.
-
-    Возвращает dict с сырым JSON-ответом; при любой ошибке — пустой dict {}.
-    """
-    if not OPENAI_API_KEY:
-        logger.warning("No OPENAI_API_KEY configured, skipping OpenAI call")
-        return {}
-
-    model = payload.get("model") or OPENAI_MODEL or "gpt-5-mini"
-    input_field = payload.get("input")
-    max_tokens = int(payload.get("max_output_tokens") or 512)
-    temperature = float(payload.get("temperature") or 0.2)
-    response_format = payload.get("response_format")
-
-    # Собираем messages
-    if isinstance(input_field, list):
-        # Если это список сообщений в стиле chat.completions — используем как есть
-        if input_field and isinstance(input_field[0], dict) and "role" in input_field[0] and "content" in input_field[0]:
-            messages = input_field
-        else:
-            # Иначе сериализуем как одно user-сообщение
-            messages = [{"role": "user", "content": json.dumps(input_field, ensure_ascii=False)}]
-    else:
-        messages = [{"role": "user", "content": str(input_field)}]
-
-    body: Dict[str, Any] = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-    }
-    if isinstance(response_format, dict):
-        body["response_format"] = response_format
-
-    data_bytes = json.dumps(body).encode("utf-8")
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-
-    req = urllib.request.Request(
-        OPENAI_CHAT_COMPLETIONS_URL,
-        data=data_bytes,
-        headers=headers,
-        method="POST",
-    )
-
-    start_ts = time.time()
-    try:
-        with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT_SECONDS) as resp:
-            raw = resp.read().decode("utf-8")
-        elapsed = time.time() - start_ts
-        logger.info("OpenAI chat.completions call OK (%.2fs)", elapsed)
-
-        # Опционально: короткий debug-лог первых символов ответа
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("OpenAI raw response (truncated): %s", raw[:500])
-
-        return json.loads(raw)
-    except urllib.error.HTTPError as e:
-        elapsed = time.time() - start_ts
-        try:
-            error_body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            error_body = "<no body>"
-        logger.error(
-            "OpenAI HTTPError in chat.completions (%.2fs), code=%s, body=%s",
-            elapsed,
-            e.code,
-            error_body[:500],
-        )
-        return {}
-    except Exception as e:
-        elapsed = time.time() - start_ts
-        logger.error("Error calling OpenAI chat.completions (%.2fs): %s", elapsed, e)
-        return {}
-
-
-def _extract_chat_completion_content(resp_json: Dict[str, Any]) -> Optional[str]:
-    """
-    Аккуратно достаём message.content из ответа chat.completions.
-    """
-    try:
-        choices = resp_json.get("choices")
-        if not choices:
-            return None
-        first = choices[0] or {}
-        message = first.get("message") or {}
-        content = message.get("content")
-        if isinstance(content, str):
-            return content
-        return None
-    except Exception:
-        logger.exception("Failed to extract message.content from OpenAI response")
-        return None
-
 
 def _build_fallback_profile_from_raw(raw_interests: str) -> Dict[str, Any]:
     """
-    Очень простой fallback-профиль на случай, если OpenAI не ответил вообще.
-    Строим темы по тем строкам raw_interests, которые совпадают с MAIN_TOPICS / SPORT_SUBTOPICS.
+    Очень простой fallback-профиль, если OpenAI не ответил.
+    Строим темы по строкам raw_interests, которые совпадают с MAIN_TOPICS / SPORT_SUBTOPICS.
     """
     lines = [l.strip() for l in (raw_interests or "").splitlines() if l.strip()]
 
@@ -595,11 +426,9 @@ def _build_fallback_profile_from_raw(raw_interests: str) -> Dict[str, Any]:
 
 def _normalize_profile_dict(profile: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Унифицированная нормализация профиля:
-    - дефолты полей,
-    - нормализация списка topics / negative_topics / interests_as_tags / user_meta.
+    Нормализация профиля: дефолты и чистка.
     """
-    profile = dict(profile)  # на всякий случай копия
+    profile = dict(profile)
 
     profile.setdefault("location_city", None)
     profile.setdefault("location_country", None)
@@ -608,9 +437,8 @@ def _normalize_profile_dict(profile: Dict[str, Any]) -> Dict[str, Any]:
     profile.setdefault("interests_as_tags", [])
     profile.setdefault("user_meta", {})
 
-    # topics
     topics = profile.get("topics")
-    if not isinstance(topics, List):
+    if not isinstance(topics, list):
         topics = []
     normalized_topics: List[Dict[str, Any]] = []
     for t in topics:
@@ -636,19 +464,16 @@ def _normalize_profile_dict(profile: Dict[str, Any]) -> Dict[str, Any]:
         )
     profile["topics"] = normalized_topics
 
-    # negative_topics
     neg = profile.get("negative_topics")
     if not isinstance(neg, list):
         neg = []
     profile["negative_topics"] = [str(x).strip() for x in neg if str(x).strip()]
 
-    # interests_as_tags
     tags = profile.get("interests_as_tags")
     if not isinstance(tags, list):
         tags = []
     profile["interests_as_tags"] = [str(x).strip() for x in tags if str(x).strip()]
 
-    # user_meta
     user_meta = profile.get("user_meta")
     if not isinstance(user_meta, dict):
         user_meta = {}
@@ -657,58 +482,141 @@ def _normalize_profile_dict(profile: Dict[str, Any]) -> Dict[str, Any]:
     return profile
 
 
+def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Обёртка вокруг OpenAI Chat Completions.
+    Принимает payload со старыми полями (input, max_output_tokens и т.п.),
+    под капотом бьёт в /v1/chat/completions.
+    """
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY is not set, skipping OpenAI call")
+        return {}
+
+    url = OPENAI_CHAT_COMPLETIONS_URL
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    model = payload.get("model") or OPENAI_MODEL or "gpt-4.1-mini"
+
+    # 1) если передали messages — используем их;
+    # 2) если нет, смотрим input (список сообщений или строка).
+    messages = payload.get("messages")
+    if not messages:
+        input_field = payload.get("input")
+        if isinstance(input_field, list):
+            messages = input_field
+        else:
+            messages = [{"role": "user", "content": str(input_field)}]
+
+    max_tokens = payload.get("max_tokens")
+    if max_tokens is None:
+        max_tokens = payload.get("max_output_tokens", 512)
+    try:
+        max_tokens_int = int(max_tokens)
+    except (TypeError, ValueError):
+        max_tokens_int = 512
+
+    temperature = payload.get("temperature", 0.2)
+    try:
+        temperature_float = float(temperature)
+    except (TypeError, ValueError):
+        temperature_float = 0.2
+
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens_int,
+        "temperature": temperature_float,
+    }
+
+    if "response_format" in payload:
+        body["response_format"] = payload["response_format"]
+
+    data = json.dumps(body).encode("utf-8")
+
+    started_at = datetime.now(timezone.utc)
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT_SECONDS) as resp:
+            raw = resp.read().decode("utf-8")
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        logger.info("OpenAI chat.completions call OK (%.2fs)", elapsed)
+        return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        try:
+            error_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            error_body = "<no body>"
+        logger.error(
+            "OpenAI HTTPError in chat.completions (%.2fs), code=%s, body=%s",
+            elapsed,
+            e.code,
+            error_body[:1000],
+        )
+        return {}
+    except Exception as e:
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        logger.exception("Error calling OpenAI chat.completions (%.2fs): %s", elapsed, e)
+        return {}
+
+
 def _call_openai_structured_profile_sync(raw_interests: str) -> Dict[str, Any]:
     """
-    Главная функция построения structured_profile через OpenAI.
-
-    Логика:
-    1) Один запрос к Chat Completions с response_format={"type": "json_object"}.
-    2) Пытаемся распарсить message.content как JSON-объект.
-    3) Если не получилось или ответа нет — используем fallback из raw_interests.
+    Строим structured_profile через gpt-4.1-mini в JSON-режиме.
+    Если что-то пошло не так — fallback из raw_interests.
     """
-    # Если ключа нет — сразу fallback
     if not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY is not set, skipping structured_profile build")
-        fallback = _build_fallback_profile_from_raw(raw_interests)
-        return _normalize_profile_dict(fallback)
-
-    model = OPENAI_MODEL or "gpt-5-mini"
+        return _normalize_profile_dict(_build_fallback_profile_from_raw(raw_interests))
 
     system_prompt = """
 Ты помогаешь новостному рекомендательному сервису EYYE.
 По свободному описанию интересов и города пользователя ты должен вернуть
-СТРОГО ОДИН JSON-объект со следующими полями:
+СТРОГО JSON-объект с полями:
 
-- location_city: строка или null — город.
-- location_country: строка или null — страна.
-- topics: массив объектов { name, weight, category, detail }:
-  - name — короткое название темы ("стартапы", "премьер-лига", "аниме").
-  - weight — важность от 0.0 до 1.0.
-  - category — общий род ("business", "sports", "culture", "tech", "education" и т.п.) или null.
-  - detail — 1–2 слова уточнения ("UK football", "US startups") или null.
-- negative_topics: массив строк с темами, которые пользователь НЕ хочет видеть.
-- interests_as_tags: массив нормализованных тегов латиницей ("startups", "premier_league", "uk_universities").
-- user_meta: объект с полями:
-  - age_group — примерный возраст ("18-24", "25-34" и т.п.) или null.
-  - student_status — "school_student", "university_student", "postgraduate_student", "not_student" или null.
+{
+  "location_city": string | null,
+  "location_country": string | null,
+  "topics": [
+    {
+      "name": string,
+      "weight": number,
+      "category": string | null,
+      "detail": string | null
+    },
+    ...
+  ],
+  "negative_topics": [string, ...],
+  "interests_as_tags": [string, ...],
+  "user_meta": {
+    "age_group": string | null,
+    "student_status": string | null
+  }
+}
 
-Если информации мало — используй null и пустые массивы.
+Требования:
+- Никакого текста вне JSON.
+- Если информации нет — используй null или пустые массивы.
+- weight от 0.0 до 1.0.
+- category — общий род ("business", "sports", "culture", "tech", "education" и т.п.) или null.
+- interests_as_tags — короткие теги латиницей ("startups", "premier_league", "uk_universities").
 """
 
     payload: Dict[str, Any] = {
-        "model": model,
-        "input": [
+        "model": OPENAI_MODEL or "gpt-4.1-mini",
+        "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": raw_interests},
         ],
         "max_output_tokens": 800,
-        "temperature": 0.2,
-        # Просим строго JSON-объект
+        "temperature": 0.1,
         "response_format": {"type": "json_object"},
     }
 
-    resp_json = call_openai_responses(payload)
-
+    resp_json = call_openai_chat(payload)
     if not resp_json:
         logger.warning(
             "OpenAI did not return response JSON for structured_profile. Using fallback from raw_interests."
@@ -716,40 +624,35 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Dict[str, Any]:
         fallback = _build_fallback_profile_from_raw(raw_interests)
         return _normalize_profile_dict(fallback)
 
-    content = _extract_chat_completion_content(resp_json)
-    if not content:
-        logger.warning(
-            "OpenAI structured_profile: no message.content in response. Using fallback from raw_interests."
-        )
-        fallback = _build_fallback_profile_from_raw(raw_interests)
-        return _normalize_profile_dict(fallback)
-
     try:
-        profile = json.loads(content)
-    except json.JSONDecodeError:
-        logger.exception(
-            "OpenAI structured_profile: failed to parse JSON from content. Using fallback from raw_interests."
+        choices = resp_json.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("No choices in OpenAI response")
+
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Empty content in OpenAI response")
+
+        logger.debug(
+            "OpenAI structured_profile raw content (first 200 chars): %s",
+            content[:200].replace("\n", " "),
         )
+
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            raise ValueError("Parsed JSON is not an object")
+
+        return _normalize_profile_dict(parsed)
+    except Exception:
+        logger.exception("Failed to parse OpenAI structured_profile response. Using fallback.")
         fallback = _build_fallback_profile_from_raw(raw_interests)
         return _normalize_profile_dict(fallback)
-
-    if not isinstance(profile, dict):
-        logger.warning(
-            "OpenAI structured_profile: parsed JSON is not an object. Using fallback from raw_interests."
-        )
-        fallback = _build_fallback_profile_from_raw(raw_interests)
-        return _normalize_profile_dict(fallback)
-
-    return _normalize_profile_dict(profile)
 
 
 def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
     """
     Строит structured_profile (через OpenAI или fallback) и сохраняет в Supabase.
-
-    ВАЖНО:
-    - raw_interests мы здесь НЕ перезатираем, чтобы не ловить NOT NULL ошибки.
-    - Обновляем только location_* и structured_profile.
     """
     text_len = len(raw_interests or "")
     logger.info(
@@ -825,14 +728,12 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
 
 
 # ==========================
-# Хендлеры команд
+# Команды
 # ==========================
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /start — сохраняем пользователя в Supabase.
-    Если Supabase настроен и профиля ещё нет — запускаем онбординг по интересам.
+    /start — онбординг или приветствие, если профиль уже есть.
     """
     user = update.effective_user
 
@@ -842,7 +743,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message:
         return
 
-    # Если Supabase не настроен — ведёмся как раньше, без онбординга по профилю
     if not supabase or not user:
         text_lines = [
             "Привет! Это EYYE — твой персональный новостной ассистент.",
@@ -856,11 +756,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\n".join(text_lines))
         return
 
-    # Проверяем, есть ли уже профиль интересов
     profile = await load_user_profile(user.id)
 
     if profile:
-        # Профиль уже есть — приветствуем и даём подсказки
         context.user_data["awaiting_profile"] = False
         context.user_data["profile_buffer"] = []
         context.user_data["selected_topics"] = []
@@ -885,7 +783,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    # Профиля ещё нет — запускаем онбординг по свободному тексту + кнопкам тем
+    # Профиля ещё нет — запускаем онбординг
     context.user_data["awaiting_profile"] = True
     context.user_data["profile_buffer"] = []
     context.user_data["selected_topics"] = []
@@ -916,9 +814,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /help — список команд.
-    """
     text_lines = [
         "Доступные команды:",
         "/start — перезапустить бота и (при необходимости) пройти онбординг",
@@ -928,25 +823,18 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/done — закончить описание интересов во время онбординга",
         "/help — эта справка",
     ]
-
     if update.message:
         await update.message.reply_text("\n".join(text_lines))
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /ping — простая проверка, что бот жив.
-    """
     if update.message:
         await update.message.reply_text("pong")
 
 
 async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /me — показать:
-    - данные из Telegram,
-    - если получится, данные из Supabase по пользователю,
-    - профиль интересов из user_profiles (если есть, включая structured_profile).
+    /me — Telegram-данные + Supabase + structured_profile (если есть).
     """
     user = update.effective_user
     if not user:
@@ -954,10 +842,8 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("Не получилось определить твой Telegram-профиль.")
         return
 
-    # На всякий случай ещё раз сохраняем пользователя
     await save_user_to_supabase(user.id, user.username)
 
-    # Базовая информация из Telegram
     tg_lines: List[str] = [
         "Данные из Telegram:",
         f"id: {user.id}",
@@ -967,14 +853,12 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "",
     ]
 
-    # Если Supabase не настроен — просто говорим об этом
     if not supabase:
         tg_lines.append("Supabase сейчас не настроен, поэтому показываю только данные из Telegram.")
         if update.message:
             await update.message.reply_text("\n".join(tg_lines))
         return
 
-    # Пытаемся прочитать запись из telegram_users
     row = await load_user_from_supabase(user.id)
 
     if not row:
@@ -986,7 +870,6 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text("\n".join(tg_lines))
         return
 
-    # Если запись есть, добавляем её в вывод
     sb_lines: List[str] = [
         "Информация о тебе в базе EYYE (Supabase / telegram_users):",
         f"id: {row.get('id')}",
@@ -995,7 +878,6 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "",
     ]
 
-    # Профиль интересов (user_profiles)
     profile = await load_user_profile(user.id)
     profile_lines: List[str] = []
 
@@ -1015,12 +897,10 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 profile_lines.append(f"- страна: {loc_country}")
             profile_lines.append("")
 
-        # structured_profile (jsonb)
         structured = profile.get("structured_profile")
         if structured is None:
             profile_lines.append("structured_profile: ещё не посчитан или пуст.")
         else:
-            # Supabase может вернуть dict или строку
             if isinstance(structured, str):
                 try:
                     structured_data = json.loads(structured)
@@ -1059,7 +939,6 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                         profile_lines.append(f"  • {nt}")
                 else:
                     profile_lines.append("- negative_topics: []")
-
     else:
         profile_lines.append("Профиль интересов ещё не заполнен.")
         profile_lines.append("Напиши /start, чтобы пройти онбординг или обновить данные.")
@@ -1073,10 +952,8 @@ async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Черновая команда /feed:
-    - читает structured_profile из Supabase,
-    - если его нет, быстро строит fallback-профиль по raw_interests (без OpenAI),
-    - выводит пользователю, по каким темам мы будем искать новости.
+    /feed — читаем structured_profile.
+    Если его ещё нет — быстрый fallback по raw_interests + параллельно строим нормальный профиль.
     """
     user = update.effective_user
     message = update.effective_message
@@ -1115,9 +992,7 @@ async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     structured = row.get("structured_profile")
     raw_interests = row.get("raw_interests") or ""
 
-    # Если structured_profile есть — используем его как основной источник
     if structured is not None:
-        # Supabase может вернуть либо dict, либо JSON-строку
         if isinstance(structured, str):
             try:
                 structured = json.loads(structured)
@@ -1139,7 +1014,6 @@ async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         profile_dict = structured
         using_fallback = False
     else:
-        # structured_profile ещё нет — строим быстрый fallback по raw_interests
         if not raw_interests:
             await message.reply_text(
                 "Похоже, у меня пока нет ни структурированного профиля, ни исходного описания интересов 😔\n"
@@ -1150,9 +1024,8 @@ async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         profile_dict = _normalize_profile_dict(_build_fallback_profile_from_raw(raw_interests))
         using_fallback = True
 
-        # Параллельно (НЕ блокируя ответ) пробуем построить настоящий structured_profile через OpenAI
         if OPENAI_API_KEY:
-            application: Application = context.application  # type: ignore[assignment]
+            application: Application = cast(Application, context.application)
             try:
                 application.create_task(
                     asyncio.to_thread(build_and_save_structured_profile, user.id, raw_interests)
@@ -1208,16 +1081,13 @@ async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ==========================
-# Онбординг: обработка текста и кнопок тем
+# Онбординг: текст + кнопки
 # ==========================
-
 
 async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Обрабатываем обычные текстовые сообщения.
-    Если мы в состоянии онбординга (awaiting_profile=True) —
-    либо обрабатываем выбор тем, либо записываем свободный текст.
-    Если нет — просто даём подсказку про /help.
+    Любые текстовые сообщения во время онбординга:
+    либо выбор тем, либо свободный текст.
     """
     if not update.message:
         return
@@ -1230,16 +1100,13 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not text_raw:
         return
 
-    # Если сейчас НЕ ждём описание интересов — мягкая подсказка
     if not context.user_data.get("awaiting_profile"):
         await update.message.reply_text(
             "Я пока понимаю только команды. Напиши /help, чтобы увидеть список."
         )
         return
 
-    # Специальные кнопки, которые НЕ зависят от префикса "✅"
     if text_raw == TOPIC_CHOOSE_BUTTON_TEXT:
-        # Пользователь вошёл в режим выбора общих тем
         context.user_data["topics_mode"] = "main"
         selected_topics: List[str] = context.user_data.get("selected_topics", [])
         keyboard = build_main_topics_keyboard(selected_topics)
@@ -1253,12 +1120,10 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if text_raw == START_READING_BUTTON_TEXT:
-        # "Начать читать" действует так же, как /done
         await finish_onboarding(update, context)
         return
 
     if text_raw == EXIT_TOPICS_BUTTON_TEXT:
-        # Убираем клавиатуру и выходим из режима выбора тем
         context.user_data["topics_mode"] = None
         context.user_data["topics_keyboard_message_id"] = None
         context.user_data["topics_keyboard_chat_id"] = None
@@ -1270,7 +1135,6 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if text_raw == BACK_TO_MAIN_TOPICS_BUTTON_TEXT:
-        # Возврат из подменю спорта к общим темам
         context.user_data["topics_mode"] = "main"
         selected_topics = context.user_data.get("selected_topics", [])
         keyboard = build_main_topics_keyboard(selected_topics)
@@ -1282,7 +1146,6 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         context.user_data["topics_keyboard_chat_id"] = sent.chat_id
         return
 
-    # Нормализуем текст (убираем "✅ ")
     text = strip_checkmark(text_raw)
 
     topics_mode: Optional[str] = context.user_data.get("topics_mode")
@@ -1290,7 +1153,7 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     keyboard_message_id = context.user_data.get("topics_keyboard_message_id")
     keyboard_chat_id = context.user_data.get("topics_keyboard_chat_id")
 
-    # --- Выбор подтем спорта ---
+    # Подтемы спорта
     if topics_mode == "sports" and text in SPORT_SUBTOPICS:
         selected = set(selected_topics)
         if text in selected:
@@ -1299,7 +1162,6 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             selected.add(text)
         context.user_data["selected_topics"] = list(selected)
 
-        # Обновляем клавиатуру без новых сообщений
         if keyboard_message_id and keyboard_chat_id:
             await update_topics_keyboard_markup(
                 context,
@@ -1310,9 +1172,8 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         return
 
-    # --- Выбор основных тем ---
+    # Основные темы
     if topics_mode == "main":
-        # Отдельно обрабатываем "Спорт" — открываем подменю
         if text == "Спорт":
             context.user_data["topics_mode"] = "sports"
             selected_topics = context.user_data.get("selected_topics", [])
@@ -1334,7 +1195,6 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 selected.add(text)
             context.user_data["selected_topics"] = list(selected)
 
-            # Обновляем клавиатуру без текста от бота
             if keyboard_message_id and keyboard_chat_id:
                 await update_topics_keyboard_markup(
                     context,
@@ -1345,7 +1205,7 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
             return
 
-    # --- Всё остальное считаем свободным текстом интересов ---
+    # Свободный текст
     buffer: List[str] = context.user_data.get("profile_buffer", [])
     buffer.append(text_raw)
     context.user_data["profile_buffer"] = buffer
@@ -1366,9 +1226,7 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    /done — завершение онбординга:
-    склеиваем все собранные сообщения и выбранные темы и сохраняем в user_profiles.
-    Параллельно (в фоне) строим structured_profile через OpenAI, если доступно.
+    /done — конец онбординга: сохраняем raw_interests и в фоне строим structured_profile.
     """
     if not update.message:
         return
@@ -1389,7 +1247,6 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     selected_topics: List[str] = context.user_data.get("selected_topics", [])
 
     parts: List[str] = []
-
     if buffer:
         parts.append("\n\n".join(buffer).strip())
 
@@ -1400,7 +1257,6 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     raw_interests = "\n\n".join(parts).strip()
 
-    # Если ни текста, ни выбранных тем — просим что-нибудь выбрать/написать
     if not raw_interests:
         await update.message.reply_text(
             "Похоже, ты ещё ничего не написал и не выбрал 🙈\n"
@@ -1409,7 +1265,6 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    # Сохраняем профиль в Supabase
     ok = await upsert_user_profile(user.id, raw_interests)
 
     if not ok:
@@ -1418,7 +1273,6 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    # Сбрасываем состояние онбординга и убираем клавиатуру
     context.user_data["awaiting_profile"] = False
     context.user_data["profile_buffer"] = []
     context.user_data["selected_topics"] = []
@@ -1433,7 +1287,6 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         reply_markup=ReplyKeyboardRemove(),
     )
 
-    # В фоне строим structured_profile (если есть Supabase и OPENAI_API_KEY)
     if not supabase:
         logger.warning("Supabase is not configured, skip building structured_profile")
         return
@@ -1441,9 +1294,8 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         logger.warning("OPENAI_API_KEY is not set, skip building structured_profile")
         return
 
-    application: Application = context.application  # type: ignore[assignment]
+    application: Application = cast(Application, context.application)
     try:
-        # Запускаем тяжёлую синхронную функцию в отдельном потоке, чтобы не блокировать обработку апдейтов
         application.create_task(
             asyncio.to_thread(build_and_save_structured_profile, user.id, raw_interests)
         )
@@ -1459,11 +1311,7 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # Глобальный обработчик ошибок
 # ==========================
 
-
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Логируем любые необработанные исключения и стараемся аккуратно ответить пользователю.
-    """
     logger.exception("Exception while handling update: %s", context.error)
 
     try:
@@ -1480,11 +1328,9 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # Сборка и запуск приложения
 # ==========================
 
-
 def build_application() -> Application:
     application = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Команды
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("ping", ping))
@@ -1492,7 +1338,6 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("feed", feed))
     application.add_handler(CommandHandler("done", finish_onboarding))
 
-    # Текстовые сообщения (без команд) — для онбординга и выбора тем
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -1512,4 +1357,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
