@@ -7,7 +7,6 @@ import urllib.request
 import urllib.error
 import time
 from typing import Optional, Any, Dict, List
-from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -39,12 +38,12 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # модель берём из окружения, по умолчанию gpt-5-mini
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
-# базовый URL для OpenAI + endpoint Responses API
+# базовый URL для OpenAI + endpoint Chat Completions API
 OPENAI_API_BASE = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_RESPONSES_URL = OPENAI_API_BASE.rstrip("/") + "/responses"
+OPENAI_CHAT_COMPLETIONS_URL = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
 
 # таймаут HTTP-запроса к OpenAI (секунды)
-OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "12"))
+OPENAI_TIMEOUT_SECONDS = int(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set in environment variables")
@@ -203,6 +202,7 @@ async def update_topics_keyboard_markup(
 # Работа с Supabase: telegram_users
 # ==========================
 
+
 async def save_user_to_supabase(telegram_id: int, username: Optional[str]) -> None:
     """
     Сохраняем / обновляем пользователя в таблице telegram_users.
@@ -259,6 +259,7 @@ async def load_user_from_supabase(telegram_id: int) -> Optional[dict]:
 # ==========================
 # Работа с Supabase: user_profiles
 # ==========================
+
 
 async def load_user_profile(telegram_id: int) -> Optional[Dict[str, Any]]:
     """
@@ -369,15 +370,8 @@ async def upsert_user_profile_structured(
 # OpenAI: построение structured_profile
 # ==========================
 
-# Таймаут запроса к OpenAI в секундах
-OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "12"))
-
-# Конечная точка Responses API
-OPENAI_RESPONSES_URL = OPENAI_API_BASE.rstrip("/") + "/responses"
-
 # JSON Schema для профиля пользователя EYYE.
-# Эта схема используется в Responses API (text.format.type = "json_schema"),
-# чтобы модель генерировала строго структурированный объект.
+# Оставляем как документацию к структуре, которую хотим получить от модели.
 PROFILE_JSON_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -427,37 +421,111 @@ PROFILE_JSON_SCHEMA: Dict[str, Any] = {
 }
 
 
-def _extract_array_for_key_from_partial_json(content: str, key: str) -> Optional[Any]:
+def call_openai_responses(payload: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Пытаемся вытащить JSON-массив для ключа "key" из частично сломанного JSON-текста.
-    Пример: ... "topics": [ { ... }, { ... } ], ...
+    Универсальная обёртка вокруг OpenAI Chat Completions.
+
+    Принимает payload в "старом" формате:
+    - model: str (опционально)
+    - input: str | list (сообщение или список сообщений)
+      * если это список dict'ов вида {"role": "...", "content": "..."} — используем как messages;
+      * иначе превращаем всё в один user-message.
+    - max_output_tokens: int (опционально; по умолчанию 512)
+    - temperature: float (опционально; по умолчанию 0.2)
+    - response_format: dict (опционально) — пробрасывается в Chat Completions.
+
+    Возвращает dict с сырым JSON-ответом; при любой ошибке — пустой dict {}.
+    """
+    if not OPENAI_API_KEY:
+        logger.warning("No OPENAI_API_KEY configured, skipping OpenAI call")
+        return {}
+
+    model = payload.get("model") or OPENAI_MODEL or "gpt-5-mini"
+    input_field = payload.get("input")
+    max_tokens = int(payload.get("max_output_tokens") or 512)
+    temperature = float(payload.get("temperature") or 0.2)
+    response_format = payload.get("response_format")
+
+    # Собираем messages
+    if isinstance(input_field, list):
+        # Если это список сообщений в стиле chat.completions — используем как есть
+        if input_field and isinstance(input_field[0], dict) and "role" in input_field[0] and "content" in input_field[0]:
+            messages = input_field
+        else:
+            # Иначе сериализуем как одно user-сообщение
+            messages = [{"role": "user", "content": json.dumps(input_field, ensure_ascii=False)}]
+    else:
+        messages = [{"role": "user", "content": str(input_field)}]
+
+    body: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    if isinstance(response_format, dict):
+        body["response_format"] = response_format
+
+    data_bytes = json.dumps(body).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    req = urllib.request.Request(
+        OPENAI_CHAT_COMPLETIONS_URL,
+        data=data_bytes,
+        headers=headers,
+        method="POST",
+    )
+
+    start_ts = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT_SECONDS) as resp:
+            raw = resp.read().decode("utf-8")
+        elapsed = time.time() - start_ts
+        logger.info("OpenAI chat.completions call OK (%.2fs)", elapsed)
+
+        # Опционально: короткий debug-лог первых символов ответа
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("OpenAI raw response (truncated): %s", raw[:500])
+
+        return json.loads(raw)
+    except urllib.error.HTTPError as e:
+        elapsed = time.time() - start_ts
+        try:
+            error_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            error_body = "<no body>"
+        logger.error(
+            "OpenAI HTTPError in chat.completions (%.2fs), code=%s, body=%s",
+            elapsed,
+            e.code,
+            error_body[:500],
+        )
+        return {}
+    except Exception as e:
+        elapsed = time.time() - start_ts
+        logger.error("Error calling OpenAI chat.completions (%.2fs): %s", elapsed, e)
+        return {}
+
+
+def _extract_chat_completion_content(resp_json: Dict[str, Any]) -> Optional[str]:
+    """
+    Аккуратно достаём message.content из ответа chat.completions.
     """
     try:
-        key_pos = content.find(f'"{key}"')
-        if key_pos == -1:
+        choices = resp_json.get("choices")
+        if not choices:
             return None
-
-        bracket_start = content.find("[", key_pos)
-        if bracket_start == -1:
-            return None
-
-        depth = 0
-        end_idx: Optional[int] = None
-        for i, ch in enumerate(content[bracket_start:], start=bracket_start):
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    end_idx = i
-                    break
-
-        if end_idx is None:
-            return None
-
-        array_str = content[bracket_start : end_idx + 1]
-        return json.loads(array_str)
+        first = choices[0] or {}
+        message = first.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        return None
     except Exception:
+        logger.exception("Failed to extract message.content from OpenAI response")
         return None
 
 
@@ -525,55 +593,6 @@ def _build_fallback_profile_from_raw(raw_interests: str) -> Dict[str, Any]:
     }
 
 
-def _salvage_profile_from_broken_content(
-    raw_interests: str,
-    broken_content: Optional[str],
-) -> Dict[str, Any]:
-    """
-    Пытаемся вытащить topics / negative_topics / interests_as_tags из битого JSON OpenAI.
-    Если не получилось вообще ничего — строим fallback из raw_interests.
-    """
-    topics: List[Any] = []
-    negative: List[Any] = []
-    tags: List[Any] = []
-
-    if broken_content:
-        topics_candidate = _extract_array_for_key_from_partial_json(broken_content, "topics")
-        if isinstance(topics_candidate, list):
-            topics = topics_candidate
-
-        neg_candidate = _extract_array_for_key_from_partial_json(broken_content, "negative_topics")
-        if isinstance(neg_candidate, list):
-            negative = neg_candidate
-
-        tags_candidate = _extract_array_for_key_from_partial_json(broken_content, "interests_as_tags")
-        if isinstance(tags_candidate, list):
-            tags = tags_candidate
-
-    if not topics and not negative and not tags:
-        logger.warning("Could not salvage anything from broken_content, using raw_interests fallback")
-        return _build_fallback_profile_from_raw(raw_interests)
-
-    logger.warning(
-        "Salvaged structured_profile from broken_content: topics=%d, negative_topics=%d, tags=%d",
-        len(topics),
-        len(negative),
-        len(tags),
-    )
-
-    return {
-        "location_city": None,
-        "location_country": None,
-        "topics": topics,
-        "negative_topics": negative,
-        "interests_as_tags": tags,
-        "user_meta": {
-            "age_group": None,
-            "student_status": None,
-        },
-    }
-
-
 def _normalize_profile_dict(profile: Dict[str, Any]) -> Dict[str, Any]:
     """
     Унифицированная нормализация профиля:
@@ -591,7 +610,7 @@ def _normalize_profile_dict(profile: Dict[str, Any]) -> Dict[str, Any]:
 
     # topics
     topics = profile.get("topics")
-    if not isinstance(topics, list):
+    if not isinstance(topics, List):
         topics = []
     normalized_topics: List[Dict[str, Any]] = []
     for t in topics:
@@ -638,91 +657,42 @@ def _normalize_profile_dict(profile: Dict[str, Any]) -> Dict[str, Any]:
     return profile
 
 
-def _extract_parsed_profile_from_response(
-    resp_json: Dict[str, Any],
-) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+def _call_openai_structured_profile_sync(raw_interests: str) -> Dict[str, Any]:
     """
-    Достаём из ответа Responses API:
-    - parsed (dict) — если модель вернула structured output,
-    - broken_text (str) — если есть только текстовый ответ (похожий на JSON, но может быть битым).
+    Главная функция построения structured_profile через OpenAI.
+
+    Логика:
+    1) Один запрос к Chat Completions с response_format={"type": "json_object"}.
+    2) Пытаемся распарсить message.content как JSON-объект.
+    3) Если не получилось или ответа нет — используем fallback из raw_interests.
     """
-    parsed: Optional[Dict[str, Any]] = None
-    broken_text: Optional[str] = None
-
-    try:
-        output = resp_json.get("output")
-        if isinstance(output, list):
-            for item in output:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") != "message":
-                    continue
-                content_list = item.get("content")
-                if not isinstance(content_list, list):
-                    continue
-                for block in content_list:
-                    if not isinstance(block, dict):
-                        continue
-
-                    # 1) structured JSON — parsed/json в блоке
-                    parsed_candidate = block.get("parsed") or block.get("json")
-                    if isinstance(parsed_candidate, dict):
-                        parsed = parsed_candidate
-                        break
-
-                    # 2) текстовый блок — потенциально битый JSON
-                    block_type = block.get("type")
-                    if block_type in ("output_text", "input_text", "text"):
-                        text_val = block.get("text")
-                        if isinstance(text_val, str) and broken_text is None:
-                            broken_text = text_val
-
-                if parsed is not None:
-                    break
-
-        # запасной вариант — если structured нет, а текст лежит наверху
-        if parsed is None and broken_text is None:
-            top_text = resp_json.get("output_text")
-            if isinstance(top_text, str) and top_text:
-                broken_text = top_text
-
-    except Exception:
-        logger.exception("Failed to extract structured output from OpenAI response")
-
-    return parsed, broken_text
-
-
-def _request_profile_with_schema(raw_interests: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Один запрос к OpenAI:
-    - используем json_schema + strict=true;
-    - пытаемся получить parsed из structured output;
-    - если не получается — возвращаем (None, broken_text), где broken_text — текстовый ответ.
-    """
+    # Если ключа нет — сразу fallback
     if not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY is not set, skipping structured_profile build")
-        return None, None
+        fallback = _build_fallback_profile_from_raw(raw_interests)
+        return _normalize_profile_dict(fallback)
 
     model = OPENAI_MODEL or "gpt-5-mini"
 
     system_prompt = """
 Ты помогаешь новостному рекомендательному сервису EYYE.
 По свободному описанию интересов и города пользователя ты должен вернуть
-структурированный профиль с полями:
+СТРОГО ОДИН JSON-объект со следующими полями:
 
-- location_city / location_country — город и страна (если понятно, иначе null).
-- topics — список объектов { name, weight, category, detail }:
+- location_city: строка или null — город.
+- location_country: строка или null — страна.
+- topics: массив объектов { name, weight, category, detail }:
   - name — короткое название темы ("стартапы", "премьер-лига", "аниме").
   - weight — важность от 0.0 до 1.0.
   - category — общий род ("business", "sports", "culture", "tech", "education" и т.п.) или null.
   - detail — 1–2 слова уточнения ("UK football", "US startups") или null.
-- negative_topics — массив строк с темами, которые пользователь не хочет видеть.
-- interests_as_tags — нормализованные теги латиницей ("startups", "premier_league", "uk_universities").
-- user_meta:
+- negative_topics: массив строк с темами, которые пользователь НЕ хочет видеть.
+- interests_as_tags: массив нормализованных тегов латиницей ("startups", "premier_league", "uk_universities").
+- user_meta: объект с полями:
   - age_group — примерный возраст ("18-24", "25-34" и т.п.) или null.
   - student_status — "school_student", "university_student", "postgraduate_student", "not_student" или null.
 
-Старайся заполнять как можно аккуратнее, но если информации мало — используй null и пустые массивы.
+Если информации мало — используй null и пустые массивы.
 """
 
     payload: Dict[str, Any] = {
@@ -732,95 +702,45 @@ def _request_profile_with_schema(raw_interests: str) -> tuple[Optional[Dict[str,
             {"role": "user", "content": raw_interests},
         ],
         "max_output_tokens": 800,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "eyye_user_profile",
-                "schema": PROFILE_JSON_SCHEMA,
-                "strict": True,
-            }
-        },
+        "temperature": 0.2,
+        # Просим строго JSON-объект
+        "response_format": {"type": "json_object"},
     }
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    resp_json = call_openai_responses(payload)
 
-    data_bytes = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(OPENAI_RESPONSES_URL, data=data_bytes, headers=headers, method="POST")
-
-    started_at = datetime.now(timezone.utc)
-
-    try:
-        with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT_SECONDS) as resp:
-            body = resp.read()
-        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
-        logger.info("OpenAI structured_profile call finished in %.2fs", elapsed)
-    except urllib.error.HTTPError as e:
-        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
-        try:
-            error_body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            error_body = "<no body>"
-        logger.error(
-            "OpenAI HTTPError while building structured_profile (%.2fs), code=%s, body=%s",
-            elapsed,
-            e.code,
-            error_body[:1000],
+    if not resp_json:
+        logger.warning(
+            "OpenAI did not return response JSON for structured_profile. Using fallback from raw_interests."
         )
-        return None, None
-    except Exception:
-        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
-        logger.exception("Error calling OpenAI while building structured_profile (%.2fs)", elapsed)
-        return None, None
+        fallback = _build_fallback_profile_from_raw(raw_interests)
+        return _normalize_profile_dict(fallback)
+
+    content = _extract_chat_completion_content(resp_json)
+    if not content:
+        logger.warning(
+            "OpenAI structured_profile: no message.content in response. Using fallback from raw_interests."
+        )
+        fallback = _build_fallback_profile_from_raw(raw_interests)
+        return _normalize_profile_dict(fallback)
 
     try:
-        resp_json = json.loads(body.decode("utf-8"))
-    except Exception:
-        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        profile = json.loads(content)
+    except json.JSONDecodeError:
         logger.exception(
-            "Failed to parse OpenAI response JSON while building structured_profile (%.2fs): %r",
-            elapsed,
-            body[:1000],
+            "OpenAI structured_profile: failed to parse JSON from content. Using fallback from raw_interests."
         )
-        return None, None
+        fallback = _build_fallback_profile_from_raw(raw_interests)
+        return _normalize_profile_dict(fallback)
 
-    parsed, broken = _extract_parsed_profile_from_response(resp_json)
-    if parsed is None and broken is None:
-        err = resp_json.get("error")
-        if err:
-            logger.error("OpenAI JSON error field while building structured_profile: %s", err)
+    if not isinstance(profile, dict):
+        logger.warning(
+            "OpenAI structured_profile: parsed JSON is not an object. Using fallback from raw_interests."
+        )
+        fallback = _build_fallback_profile_from_raw(raw_interests)
+        return _normalize_profile_dict(fallback)
 
-    return parsed, broken
-
-
-def _call_openai_structured_profile_sync(raw_interests: str) -> Dict[str, Any]:
-    """
-    Главная функция построения structured_profile через OpenAI.
-
-    Уровни надёжности:
-    1) Пытаемся получить structured JSON из Responses API.
-    2) Если есть только текст — вытаскиваем максимум из битого ответа.
-    3) Если вообще ничего нет (ни parsed, ни текста) — строим fallback только из raw_interests.
-    """
-    parsed, broken_content = _request_profile_with_schema(raw_interests)
-
-    if isinstance(parsed, Dict):
-        return _normalize_profile_dict(parsed)
-
-    if broken_content:
-        logger.warning("Structured profile not found, salvaging from broken text")
-        salvaged = _salvage_profile_from_broken_content(raw_interests, broken_content)
-        return _normalize_profile_dict(salvaged)
-
-    # Вообще нечего спасать: используем чистый fallback
-    logger.warning(
-        "OpenAI did not return any usable content for structured_profile (no parsed, no text). "
-        "Using raw_interests-only fallback."
-    )
-    fallback = _build_fallback_profile_from_raw(raw_interests)
-    return _normalize_profile_dict(fallback)
+    return _normalize_profile_dict(profile)
 
 
 def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
@@ -907,6 +827,7 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
 # ==========================
 # Хендлеры команд
 # ==========================
+
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -1233,7 +1154,9 @@ async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if OPENAI_API_KEY:
             application: Application = context.application  # type: ignore[assignment]
             try:
-                application.create_task(build_and_save_structured_profile(user.id, raw_interests))
+                application.create_task(
+                    asyncio.to_thread(build_and_save_structured_profile, user.id, raw_interests)
+                )
                 logger.info(
                     "feed: scheduled build_and_save_structured_profile for user_id=%s (fallback mode)",
                     user.id,
@@ -1287,6 +1210,7 @@ async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ==========================
 # Онбординг: обработка текста и кнопок тем
 # ==========================
+
 
 async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -1518,23 +1442,23 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     application: Application = context.application  # type: ignore[assignment]
-try:
-    # Запускаем тяжёлую синхронную функцию в отдельном потоке, чтобы не блокировать обработку апдейтов
-    application.create_task(
-        asyncio.to_thread(build_and_save_structured_profile, user.id, raw_interests)
-    )
-    logger.info(
-        "finish_onboarding: scheduled build_and_save_structured_profile for user_id=%s",
-        user.id,
-    )
-except Exception:
-    logger.exception("finish_onboarding: failed to schedule build_and_save_structured_profile")
-
+    try:
+        # Запускаем тяжёлую синхронную функцию в отдельном потоке, чтобы не блокировать обработку апдейтов
+        application.create_task(
+            asyncio.to_thread(build_and_save_structured_profile, user.id, raw_interests)
+        )
+        logger.info(
+            "finish_onboarding: scheduled build_and_save_structured_profile for user_id=%s",
+            user.id,
+        )
+    except Exception:
+        logger.exception("finish_onboarding: failed to schedule build_and_save_structured_profile")
 
 
 # ==========================
 # Глобальный обработчик ошибок
 # ==========================
+
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -1555,6 +1479,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ==========================
 # Сборка и запуск приложения
 # ==========================
+
 
 def build_application() -> Application:
     application = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -1587,3 +1512,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
