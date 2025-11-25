@@ -35,12 +35,10 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# можешь переопределить модель через переменную окружения OPENAI_MODEL
-# по умолчанию теперь gpt-5-mini (но окружение имеет приоритет)
+# модель берём из окружения, по умолчанию gpt-5-mini
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
-# базовый URL для OpenAI (можно переопределить через OPENAI_BASE_URL)
-# ожидаем, что это либо полный путь к /v1, либо к /v1/responses
+# базовый URL для OpenAI (сейчас используем конкретный endpoint /v1/responses)
 OPENAI_API_BASE = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 
 if not BOT_TOKEN:
@@ -437,7 +435,7 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
 4. Если информации мало, ставь null или пустые массивы.
 """
 
-    # ⚙️ ВАЖНО: теперь формат задаём через text.format, как требует Responses API
+    # ⚙️ ВАЖНО: формат задаём через text.format, как требует Responses API
     payload: Dict[str, Any] = {
         "model": model,
         "input": [
@@ -630,16 +628,26 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
     return parsed
 
 
+# ==========================
+# ASYNC: построение и сохранение structured_profile
+# ==========================
 
-
-def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
+async def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
     """
-    Строит structured_profile через OpenAI и сохраняет в Supabase.
+    Асинхронно строит structured_profile через OpenAI и сохраняет его в Supabase.
 
     ВАЖНО:
-    - raw_interests мы здесь НЕ перезатираем, чтобы не ловить NOT NULL ошибки.
+    - raw_interests здесь НЕ перезатираем, чтобы не ловить NOT NULL.
     - Обновляем только location_* и structured_profile.
+    - НИКОГДА не кидаем исключения наружу (только логируем).
     """
+    if supabase is None:
+        logger.warning(
+            "build_and_save_structured_profile: Supabase is not configured, skip for user_id=%s",
+            user_id,
+        )
+        return
+
     text_len = len(raw_interests or "")
     logger.info(
         "build_and_save_structured_profile: start for user_id=%s, raw_interests_len=%s",
@@ -647,14 +655,27 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
         text_len,
     )
 
-    profile = _call_openai_structured_profile_sync(raw_interests)
-    if not profile:
-        logger.warning(
-            "OpenAI returned empty structured_profile for user_id=%s", user_id
+    # Вызываем синхронный HTTP-клиент OpenAI в отдельном потоке,
+    # чтобы не блокировать event loop Telegram-бота.
+    try:
+        profile: Optional[Dict[str, Any]] = await asyncio.to_thread(
+            _call_openai_structured_profile_sync,
+            raw_interests,
+        )
+    except Exception:
+        logger.exception(
+            "build_and_save_structured_profile: OpenAI call crashed for user_id=%s",
+            user_id,
         )
         return
 
-    # Готовим данные для обновления: НЕ трогаем raw_interests
+    if not profile:
+        logger.warning(
+            "build_and_save_structured_profile: OpenAI returned empty structured_profile for user_id=%s",
+            user_id,
+        )
+        return
+
     update_data = {
         "location_city": profile.get("location_city"),
         "location_country": profile.get("location_country"),
@@ -666,19 +687,18 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
 
         # 1) Пытаемся обновить существующую запись
         resp = table.update(update_data).eq("user_id", user_id).execute()
+        data_list = getattr(resp, "data", None)
         logger.info(
-            "Update structured_profile for user_id=%s: data=%s count=%s",
+            "build_and_save_structured_profile: update for user_id=%s: data=%s count=%s",
             user_id,
-            getattr(resp, "data", None),
+            data_list,
             getattr(resp, "count", None),
         )
 
-        # Если обновление ничего не задело (на всякий случай) — вставим новую строку
-        data_list = getattr(resp, "data", None)
+        # Если обновление ничего не задело — вставим новую строку
         if not data_list:
             insert_data = {
                 "user_id": user_id,
-                # raw_interests обязательное поле NOT NULL — подставляем оригинальный текст
                 "raw_interests": raw_interests or "",
                 "location_city": profile.get("location_city"),
                 "location_country": profile.get("location_country"),
@@ -686,20 +706,19 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
             }
             resp_ins = table.insert(insert_data).execute()
             logger.info(
-                "Insert user_profile with structured_profile for user_id=%s: data=%s count=%s",
+                "build_and_save_structured_profile: insert for user_id=%s: data=%s count=%s",
                 user_id,
                 getattr(resp_ins, "data", None),
                 getattr(resp_ins, "count", None),
             )
 
-    except APIError as e:
-        logger.error(
-            "Failed to save structured_profile for user_id=%s: %s", user_id, e
-        )
     except Exception:
+        # Ловим всё, чтобы фонова задача не падала наружу
         logger.exception(
-            "Unexpected error while saving structured_profile for user_id=%s", user_id
+            "build_and_save_structured_profile: failed to save structured_profile for user_id=%s",
+            user_id,
         )
+        return
 
 
 # ==========================
@@ -1283,7 +1302,17 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     application: Application = context.application  # type: ignore[assignment]
-    application.create_task(build_and_save_structured_profile(user.id, raw_interests))
+    try:
+        application.create_task(build_and_save_structured_profile(user.id, raw_interests))
+        logger.info(
+            "finish_onboarding: scheduled build_and_save_structured_profile for user_id=%s",
+            user.id,
+        )
+    except Exception:
+        logger.exception(
+            "finish_onboarding: failed to schedule build_and_save_structured_profile for user_id=%s",
+            user.id,
+        )
 
 
 # ==========================
