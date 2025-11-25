@@ -39,8 +39,19 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 # по умолчанию теперь gpt-5-mini (но окружение имеет приоритет)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 
-# базовый URL для OpenAI (можно переопределить через OPENAI_BASE_URL)
-OPENAI_API_BASE = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+# Базовый URL для OpenAI Responses API.
+# Логика:
+# - если OPENAI_BASE_URL заканчивается на /responses — используем его как есть;
+# - иначе добавляем /responses в конец;
+# - по умолчанию: https://api.openai.com/v1/responses
+_raw_openai_base = os.getenv("OPENAI_BASE_URL")
+if not _raw_openai_base:
+    OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+else:
+    if _raw_openai_base.rstrip("/").endswith("/responses"):
+        OPENAI_RESPONSES_URL = _raw_openai_base.rstrip("/")
+    else:
+        OPENAI_RESPONSES_URL = _raw_openai_base.rstrip("/") + "/responses"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set in environment variables")
@@ -361,117 +372,7 @@ async def upsert_user_profile_structured(
 
 
 # ==========================
-# OpenAI: helper для Responses API
-# ==========================
-
-def _openai_responses_call(
-    messages: List[Dict[str, Any]],
-    *,
-    response_format: Optional[Dict[str, Any]] = None,
-    max_output_tokens: int = 1500,
-) -> Optional[str]:
-    """
-    Синхронный вызов OpenAI Responses API.
-
-    messages — список сообщений формата [{role, content}, ...], как в чатах.
-    Возвращает текст из output[0].content[0].text или None при ошибке.
-    """
-    if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY is not set, skipping OpenAI call")
-        return None
-
-    payload: Dict[str, Any] = {
-        "model": OPENAI_MODEL,
-        "input": messages,
-        "max_output_tokens": max_output_tokens,
-    }
-    if response_format is not None:
-        payload["response_format"] = response_format
-
-    data = json.dumps(payload).encode("utf-8")
-
-    req = urllib.request.Request(
-        f"{OPENAI_API_BASE}/responses",
-        data=data,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=40) as resp:
-            body = resp.read().decode("utf-8")
-        resp_json = json.loads(body)
-    except urllib.error.HTTPError as e:
-        try:
-            err_body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            err_body = "<no body>"
-        logger.error("OpenAI HTTPError: %s | body=%s", e, err_body[:1000])
-        return None
-    except Exception:
-        logger.exception("Unexpected error while calling OpenAI Responses API")
-        return None
-
-    try:
-        output = resp_json.get("output")
-        if isinstance(output, list) and output:
-            content = output[0].get("content")
-            if isinstance(content, list) and content:
-                text = content[0].get("text")
-                if isinstance(text, str):
-                    return text
-
-        logger.warning("OpenAI response had no text in expected format: %r", resp_json)
-        return None
-    except Exception:
-        logger.exception("Failed to extract text from OpenAI response: %r", resp_json)
-        return None
-
-
-def _openai_json_object(
-    system_prompt: str,
-    user_content: str,
-    *,
-    max_output_tokens: int = 1500,
-) -> Optional[Dict[str, Any]]:
-    """
-    Упрощённый helper: вызывает Responses API в JSON mode и возвращает dict.
-    """
-    messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content},
-    ]
-
-    text = _openai_responses_call(
-        messages,
-        response_format={"type": "json_object"},
-        max_output_tokens=max_output_tokens,
-    )
-
-    if text is None:
-        return None
-
-    try:
-        obj = json.loads(text)
-    except json.JSONDecodeError:
-        logger.exception(
-            "Failed to parse JSON object from OpenAI text: %s",
-            text[:800],
-        )
-        return None
-
-    if not isinstance(obj, dict):
-        logger.warning("OpenAI JSON object is not dict: %r", obj)
-        return None
-
-    return obj
-
-
-# ==========================
-# OpenAI: построение structured_profile
+# OpenAI: построение structured_profile (Responses API)
 # ==========================
 
 def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[str, Any]]:
@@ -484,7 +385,6 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
         logger.warning("OPENAI_API_KEY is not set, skipping structured_profile build")
         return None
 
-    # Берём модель из окружения, по умолчанию gpt-5-mini (через Responses API)
     model = OPENAI_MODEL or "gpt-5-mini"
 
     system_prompt = """
@@ -545,29 +445,38 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
 4. Если информации мало, ставь null или пустые массивы.
 """
 
-    # Новый формат для Responses API:
-    # - "input" вместо "messages"
-    # - "max_output_tokens" вместо "max_tokens"
-    # - необязательный блок "text.format" вместо старого response_format
+    # Новый формат для Responses API (input вместо messages, контент — input_text)
     payload: Dict[str, Any] = {
         "model": model,
         "input": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": raw_interests},
+            {
+                "role": "system",
+                "content": [
+                    {"type": "input_text", "text": system_prompt},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": raw_interests},
+                ],
+            },
         ],
         "temperature": 0.2,
         "max_output_tokens": 800,
         "text": {
             "format": {
-                "type": "text"
+                "type": "text",
             }
         },
     }
 
-    url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1/responses")
+    url = OPENAI_RESPONSES_URL
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
+        # Обязательный beta-флаг для нового Responses API
+        "OpenAI-Beta": "responses=v1",
     }
 
     data_bytes = json.dumps(payload).encode("utf-8")
@@ -600,17 +509,26 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
         return None
 
     # Достаём текст из структуры Responses API:
-    # resp_json["output"][0]["content"][0]["text"]
+    # resp_json["output"][i]["content"][j] с type="output_text"
     content_text: Optional[str] = None
     try:
         output = resp_json.get("output")
-        if isinstance(output, list) and output:
-            msg = output[0]
-            content = msg.get("content")
-            if isinstance(content, list) and content:
-                block = content[0]
-                if isinstance(block, dict):
-                    content_text = block.get("text")
+        if isinstance(output, list):
+            for msg in output:
+                content_list = msg.get("content", [])
+                if not isinstance(content_list, list):
+                    continue
+                for block in content_list:
+                    if (
+                        isinstance(block, dict)
+                        and block.get("type") == "output_text"
+                        and isinstance(block.get("text"), str)
+                    ):
+                        content_text = block["text"]
+                        break
+                if content_text:
+                    break
+
         # запасной вариант, если вдруг появится плоское поле output_text
         if not content_text and isinstance(resp_json.get("output_text"), str):
             content_text = resp_json["output_text"]
@@ -694,6 +612,8 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
     if not isinstance(user_meta, dict):
         user_meta = {}
     parsed["user_meta"] = user_meta
+
+    logger.info("Structured_profile from OpenAI: %s", parsed)
 
     return parsed
 
@@ -1396,4 +1316,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
