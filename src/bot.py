@@ -437,7 +437,7 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
 4. Если информации мало, ставь null или пустые массивы.
 """
 
-    # ⚙️ ВАЖНО: просим API вернуть валидный JSON-объект.
+    # ⚙️ ВАЖНО: теперь формат задаём через text.format, как требует Responses API
     payload: Dict[str, Any] = {
         "model": model,
         "input": [
@@ -445,8 +445,11 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
             {"role": "user", "content": raw_interests},
         ],
         "max_output_tokens": 800,
-        "response_format": {
-            "type": "json_object"
+        "text": {
+            "format": {
+                # Просим отдать один JSON-объект
+                "type": "json_object"
+            }
         },
     }
 
@@ -509,7 +512,7 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
                     if block_type in ("output_text", "input_text", "text"):
                         text_val = block.get("text")
 
-                    # Возможные JSON-форматы (на будущее)
+                    # Потенциальные json-форматы (на будущее)
                     if block_type in ("output_json", "json", "json_object"):
                         if isinstance(block.get("json"), str):
                             text_val = block["json"]
@@ -544,8 +547,7 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
     try:
         parsed = json.loads(content)
     except Exception:
-        # 2️⃣ fallback: вырезаем JSON по первой '{' и последней '}' —
-        # на случай, если модель всё-таки добавила мусор вокруг.
+        # 2️⃣ fallback: вырезаем JSON по первой '{' и последней '}'
         try:
             first = content.find("{")
             last = content.rfind("}")
