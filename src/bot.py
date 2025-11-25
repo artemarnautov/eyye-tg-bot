@@ -437,18 +437,16 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
 4. Если информации мало, ставь null или пустые массивы.
 """
 
+    # ⚙️ ВАЖНО: просим API вернуть валидный JSON-объект.
     payload: Dict[str, Any] = {
         "model": model,
         "input": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": raw_interests},
         ],
-        # temperature специально не задаём — gpt-5-mini его не принимает
         "max_output_tokens": 800,
-        "text": {
-            "format": {
-                "type": "text"
-            }
+        "response_format": {
+            "type": "json_object"
         },
     }
 
@@ -487,8 +485,7 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
         logger.exception("Failed to parse OpenAI response JSON: %r", body[:1000])
         return None
 
-    # Достаём текст из структуры Responses API.
-    # Сейчас в output сначала приходит блок type="reasoning", потом type="message".
+    # Достаём текст/JSON из структуры Responses API
     content_text: Optional[str] = None
     try:
         output = resp_json.get("output")
@@ -497,7 +494,6 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
                 if not isinstance(item, dict):
                     continue
                 if item.get("type") != "message":
-                    # пропускаем reasoning и прочие типы
                     continue
                 content_list = item.get("content")
                 if not isinstance(content_list, list):
@@ -505,17 +501,33 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
                 for block in content_list:
                     if not isinstance(block, dict):
                         continue
-                    # У gpt-5-mini сейчас type="output_text"
                     block_type = block.get("type")
+
+                    text_val: Optional[str] = None
+
+                    # Обычный текстовый ответ
                     if block_type in ("output_text", "input_text", "text"):
                         text_val = block.get("text")
-                        if isinstance(text_val, str):
-                            content_text = text_val
-                            break
+
+                    # Возможные JSON-форматы (на будущее)
+                    if block_type in ("output_json", "json", "json_object"):
+                        if isinstance(block.get("json"), str):
+                            text_val = block["json"]
+                        elif "parsed" in block:
+                            try:
+                                text_val = json.dumps(
+                                    block["parsed"], ensure_ascii=False
+                                )
+                            except TypeError:
+                                pass
+
+                    if isinstance(text_val, str):
+                        content_text = text_val
+                        break
                 if content_text:
                     break
 
-        # запасной вариант, если вдруг появится плоское поле output_text
+        # запасной вариант
         if not content_text and isinstance(resp_json.get("output_text"), str):
             content_text = resp_json["output_text"]
     except Exception:
@@ -525,39 +537,39 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
         logger.warning("OpenAI response without text: %r", resp_json)
         return None
 
-    # --- НОВАЯ ЧАСТЬ: аккуратно вырезаем JSON и парсим ---
-    text_clean = (content_text or "").strip()
+    content = content_text.strip()
 
-    # Вырезаем только то, что между первой "{" и последней "}"
-    start = text_clean.find("{")
-    end = text_clean.rfind("}")
-
-    if start != -1 and end != -1 and end > start:
-        json_candidate = text_clean[start : end + 1]
-    else:
-        # Если по какой-то причине фигурных скобок нет — пробуем весь текст
-        json_candidate = text_clean
-
-    logger.info(
-        "OpenAI structured_profile JSON candidate (first 300 chars): %s",
-        json_candidate[:300],
-    )
-
+    # 1️⃣ сначала пробуем распарсить весь ответ целиком
+    parsed: Optional[Dict[str, Any]] = None
     try:
-        parsed = json.loads(json_candidate)
-    except json.JSONDecodeError as e:
-        logger.error(
-            "Failed to decode JSON from OpenAI content; error=%s; content_prefix=%r",
-            e,
-            json_candidate[:300],
-        )
-        return None
+        parsed = json.loads(content)
+    except Exception:
+        # 2️⃣ fallback: вырезаем JSON по первой '{' и последней '}' —
+        # на случай, если модель всё-таки добавила мусор вокруг.
+        try:
+            first = content.find("{")
+            last = content.rfind("}")
+            if first != -1 and last != -1:
+                json_candidate = content[first : last + 1]
+            else:
+                json_candidate = content
+
+            logger.info(
+                "OpenAI structured_profile JSON candidate (first 300 chars): %s",
+                json_candidate[:300],
+            )
+            parsed = json.loads(json_candidate)
+        except Exception as e2:
+            logger.error(
+                "Failed to decode JSON from OpenAI content; error=%s; content_prefix=%r",
+                e2,
+                content[:500],
+            )
+            return None
 
     if not isinstance(parsed, dict):
-        logger.warning("OpenAI returned JSON, но это не объект: %r", type(parsed))
+        logger.warning("OpenAI returned JSON, но это не объект: %r", parsed)
         return None
-
-    # --- НОРМАЛИЗАЦИЯ ---
 
     # Нормализация и заполнение дефолтов
     parsed.setdefault("location_city", None)
@@ -614,6 +626,7 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[st
     parsed["user_meta"] = user_meta
 
     return parsed
+
 
 
 
