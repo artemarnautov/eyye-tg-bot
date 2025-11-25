@@ -369,6 +369,12 @@ async def upsert_user_profile_structured(
 # OpenAI: построение structured_profile
 # ==========================
 
+# Таймаут запроса к OpenAI в секундах
+OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "12"))
+
+# Конечная точка Responses API
+OPENAI_RESPONSES_URL = OPENAI_API_BASE.rstrip("/") + "/responses"
+
 # JSON Schema для профиля пользователя EYYE.
 # Эта схема используется в Responses API (text.format.type = "json_schema"),
 # чтобы модель генерировала строго структурированный объект.
@@ -425,11 +431,6 @@ def _extract_array_for_key_from_partial_json(content: str, key: str) -> Optional
     """
     Пытаемся вытащить JSON-массив для ключа "key" из частично сломанного JSON-текста.
     Пример: ... "topics": [ { ... }, { ... } ], ...
-    Алгоритм:
-    - находим `"key"`
-    - ищем первую '[' после него
-    - считаем вложенные '[' / ']'
-    - когда счётчик вернулся к 0 — вырезаем подстроку и пытаемся json.loads(...)
     """
     try:
         key_pos = content.find(f'"{key}"')
@@ -441,7 +442,7 @@ def _extract_array_for_key_from_partial_json(content: str, key: str) -> Optional
             return None
 
         depth = 0
-        end_idx = None
+        end_idx: Optional[int] = None
         for i, ch in enumerate(content[bracket_start:], start=bracket_start):
             if ch == "[":
                 depth += 1
@@ -462,7 +463,7 @@ def _extract_array_for_key_from_partial_json(content: str, key: str) -> Optional
 
 def _build_fallback_profile_from_raw(raw_interests: str) -> Dict[str, Any]:
     """
-    Очень простой fallback-профиль на случай, если OpenAI вернул мусор или не сработал.
+    Очень простой fallback-профиль на случай, если OpenAI не ответил вообще.
     Строим темы по тем строкам raw_interests, которые совпадают с MAIN_TOPICS / SPORT_SUBTOPICS.
     """
     lines = [l.strip() for l in (raw_interests or "").splitlines() if l.strip()]
@@ -529,9 +530,8 @@ def _salvage_profile_from_broken_content(
     broken_content: Optional[str],
 ) -> Dict[str, Any]:
     """
-    Защитный слой:
-    - пробуем вытащить topics / negative_topics / interests_as_tags из битого JSON OpenAI;
-    - если не получилось вообще ничего — строим fallback из raw_interests.
+    Пытаемся вытащить topics / negative_topics / interests_as_tags из битого JSON OpenAI.
+    Если не получилось вообще ничего — строим fallback из raw_interests.
     """
     topics: List[Any] = []
     negative: List[Any] = []
@@ -638,7 +638,9 @@ def _normalize_profile_dict(profile: Dict[str, Any]) -> Dict[str, Any]:
     return profile
 
 
-def _extract_parsed_profile_from_response(resp_json: Dict[str, Any]) -> (Optional[Dict[str, Any]], Optional[str]):
+def _extract_parsed_profile_from_response(
+    resp_json: Dict[str, Any],
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Достаём из ответа Responses API:
     - parsed (dict) — если модель вернула structured output,
@@ -690,9 +692,9 @@ def _extract_parsed_profile_from_response(resp_json: Dict[str, Any]) -> (Optiona
     return parsed, broken_text
 
 
-def _request_profile_with_schema(raw_interests: str) -> (Optional[Dict[str, Any]], Optional[str]):
+def _request_profile_with_schema(raw_interests: str) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
-    Единственный HTTP-запрос к OpenAI:
+    Один запрос к OpenAI:
     - используем json_schema + strict=true;
     - пытаемся получить parsed из structured output;
     - если не получается — возвращаем (None, broken_text), где broken_text — текстовый ответ.
@@ -748,85 +750,85 @@ def _request_profile_with_schema(raw_interests: str) -> (Optional[Dict[str, Any]
     data_bytes = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(OPENAI_RESPONSES_URL, data=data_bytes, headers=headers, method="POST")
 
-    start_time = time.monotonic()
-    body: Optional[bytes] = None
+    started_at = datetime.now(timezone.utc)
 
     try:
         with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT_SECONDS) as resp:
             body = resp.read()
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        logger.info("OpenAI structured_profile call finished in %.2fs", elapsed)
     except urllib.error.HTTPError as e:
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
         try:
             error_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             error_body = "<no body>"
-        elapsed = time.monotonic() - start_time
         logger.error(
-            "OpenAI HTTPError while building structured_profile (%.2fs): %s | body=%s",
+            "OpenAI HTTPError while building structured_profile (%.2fs), code=%s, body=%s",
             elapsed,
-            e,
-            error_body[:2000],
+            e.code,
+            error_body[:1000],
         )
         return None, None
     except Exception:
-        elapsed = time.monotonic() - start_time
-        logger.exception(
-            "Error calling OpenAI while building structured_profile (%.2fs)", elapsed
-        )
-        return None, None
-
-    elapsed = time.monotonic() - start_time
-    logger.info("OpenAI structured_profile HTTP call finished in %.2fs", elapsed)
-
-    if body is None:
-        logger.error("OpenAI response body is empty")
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        logger.exception("Error calling OpenAI while building structured_profile (%.2fs)", elapsed)
         return None, None
 
     try:
         resp_json = json.loads(body.decode("utf-8"))
     except Exception:
-        logger.exception("Failed to parse OpenAI response JSON: %r", body[:1000])
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        logger.exception(
+            "Failed to parse OpenAI response JSON while building structured_profile (%.2fs): %r",
+            elapsed,
+            body[:1000],
+        )
         return None, None
 
-    return _extract_parsed_profile_from_response(resp_json)
+    parsed, broken = _extract_parsed_profile_from_response(resp_json)
+    if parsed is None and broken is None:
+        err = resp_json.get("error")
+        if err:
+            logger.error("OpenAI JSON error field while building structured_profile: %s", err)
+
+    return parsed, broken
 
 
-def _call_openai_structured_profile_sync(raw_interests: str) -> Optional[Dict[str, Any]]:
+def _call_openai_structured_profile_sync(raw_interests: str) -> Dict[str, Any]:
     """
     Главная функция построения structured_profile через OpenAI.
 
-    Упрощённая логика (минимум латентности):
-    1) Один запрос с json_schema + strict → пытаемся получить parsed.
-    2) Если parsed есть — нормализуем и возвращаем.
-    3) Если parsed нет, но есть текстовый broken_content —
-       сразу уходим в salvage (попытка вытащить массивы) + fallback из raw_interests.
-    4) Если вообще ничего не пришло — логируем и возвращаем None.
+    Уровни надёжности:
+    1) Пытаемся получить structured JSON из Responses API.
+    2) Если есть только текст — вытаскиваем максимум из битого ответа.
+    3) Если вообще ничего нет (ни parsed, ни текста) — строим fallback только из raw_interests.
     """
-
     parsed, broken_content = _request_profile_with_schema(raw_interests)
 
-    # 1️⃣ Сразу используем корректный structured output, если он есть
-    if isinstance(parsed, dict):
-        logger.info("Structured profile: got parsed JSON from OpenAI")
+    if isinstance(parsed, Dict):
         return _normalize_profile_dict(parsed)
 
-    # 2️⃣ Нет parsed, но есть текст — пробуем salvage + fallback
     if broken_content:
-        logger.warning("Structured profile not found in OpenAI response, salvaging from broken content")
+        logger.warning("Structured profile not found, salvaging from broken text")
         salvaged = _salvage_profile_from_broken_content(raw_interests, broken_content)
         return _normalize_profile_dict(salvaged)
 
-    # 3️⃣ Вообще нечего спасать: ни parsed, ни текста
-    logger.warning("OpenAI did not return any usable content for structured_profile (no parsed, no text)")
-    return None
+    # Вообще нечего спасать: используем чистый fallback
+    logger.warning(
+        "OpenAI did not return any usable content for structured_profile (no parsed, no text). "
+        "Using raw_interests-only fallback."
+    )
+    fallback = _build_fallback_profile_from_raw(raw_interests)
+    return _normalize_profile_dict(fallback)
 
 
-async def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
+def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
     """
-    Асинхронно строит structured_profile через OpenAI и сохраняет в Supabase.
+    Строит structured_profile (через OpenAI или fallback) и сохраняет в Supabase.
 
     ВАЖНО:
-    - OpenAI вызываем через asyncio.to_thread, чтобы не блокировать event loop.
-    - raw_interests здесь НЕ перезатираем, чтобы не ловить NOT NULL ошибки.
+    - raw_interests мы здесь НЕ перезатираем, чтобы не ловить NOT NULL ошибки.
     - Обновляем только location_* и structured_profile.
     """
     text_len = len(raw_interests or "")
@@ -836,29 +838,26 @@ async def build_and_save_structured_profile(user_id: int, raw_interests: str) ->
         text_len,
     )
 
-    # Если по каким-то причинам нет Supabase или ключа — выходим
+    try:
+        profile = _call_openai_structured_profile_sync(raw_interests)
+    except Exception:
+        logger.exception(
+            "build_and_save_structured_profile: unexpected error in _call_openai_structured_profile_sync "
+            "for user_id=%s",
+            user_id,
+        )
+        return
+
+    if not profile or not isinstance(profile, dict):
+        logger.warning(
+            "build_and_save_structured_profile: got empty or invalid structured_profile for user_id=%s",
+            user_id,
+        )
+        return
+
     if not supabase:
         logger.warning(
-            "build_and_save_structured_profile: Supabase is not configured, skipping for user_id=%s",
-            user_id,
-        )
-        return
-    if not OPENAI_API_KEY:
-        logger.warning(
-            "build_and_save_structured_profile: OPENAI_API_KEY is not set, skipping for user_id=%s",
-            user_id,
-        )
-        return
-
-    # Весь синхронный HTTP и парсинг — в отдельном потоке
-    profile: Optional[Dict[str, Any]] = await asyncio.to_thread(
-        _call_openai_structured_profile_sync,
-        raw_interests,
-    )
-
-    if not profile:
-        logger.warning(
-            "build_and_save_structured_profile: OpenAI returned empty structured_profile for user_id=%s",
+            "build_and_save_structured_profile: supabase client is not configured, skip saving for user_id=%s",
             user_id,
         )
         return
@@ -872,18 +871,17 @@ async def build_and_save_structured_profile(user_id: int, raw_interests: str) ->
     try:
         table = supabase.table("user_profiles")
 
-        # Пытаемся обновить существующую запись
         resp = table.update(update_data).eq("user_id", user_id).execute()
+        data_list = getattr(resp, "data", None)
+
         logger.info(
             "Update structured_profile for user_id=%s: data=%s count=%s",
             user_id,
-            getattr(resp, "data", None),
+            data_list,
             getattr(resp, "count", None),
         )
 
-        data_list = getattr(resp, "data", None)
         if not data_list:
-            # Если обновить нечего — вставляем новую запись
             insert_data = {
                 "user_id": user_id,
                 "raw_interests": raw_interests or "",
@@ -1520,17 +1518,18 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     application: Application = context.application  # type: ignore[assignment]
-    try:
-        application.create_task(build_and_save_structured_profile(user.id, raw_interests))
-        logger.info(
-            "finish_onboarding: scheduled build_and_save_structured_profile for user_id=%s",
-            user.id,
-        )
-    except Exception:
-        logger.exception(
-            "finish_onboarding: failed to schedule build_and_save_structured_profile for user_id=%s",
-            user.id,
-        )
+try:
+    # Запускаем тяжёлую синхронную функцию в отдельном потоке, чтобы не блокировать обработку апдейтов
+    application.create_task(
+        asyncio.to_thread(build_and_save_structured_profile, user.id, raw_interests)
+    )
+    logger.info(
+        "finish_onboarding: scheduled build_and_save_structured_profile for user_id=%s",
+        user.id,
+    )
+except Exception:
+    logger.exception("finish_onboarding: failed to schedule build_and_save_structured_profile")
+
 
 
 # ==========================
