@@ -1195,11 +1195,6 @@ def _generate_cards_for_tags_via_openai_sync(
 
 
 
-    except Exception:
-        logger.exception("Failed to parse OpenAI card generation response")
-        return []
-
-
 def _insert_cards_into_db(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Вставка карточек в таблицу cards. Возвращаем то, что вернул Supabase.
