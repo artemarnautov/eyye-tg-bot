@@ -1,12 +1,12 @@
+# file: src/bot.py
 import logging
 import os
 import asyncio
 import json
 import urllib.request
 import urllib.error
-import time
-from typing import Optional, Any, Dict, List, cast, Set
-from datetime import datetime, timezone
+from typing import Optional, Any, Dict, List, Tuple, cast
+from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -47,23 +47,15 @@ OPENAI_CHAT_COMPLETIONS_URL = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
 # Таймаут HTTP-запроса к OpenAI (секунды)
 OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
 
+# Простейший rate-limit для генерации ленты (в секундах)
+FEED_OPENAI_COOLDOWN_SECONDS = int(os.getenv("FEED_OPENAI_COOLDOWN_SECONDS", "60"))
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN or TELEGRAM_BOT_TOKEN is not set in environment variables")
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-
-# Админы (для внутренних команд /feed, /reset_profile и т.п.)
-_admin_ids_env = os.getenv("ADMIN_TELEGRAM_IDS") or os.getenv("ADMIN_TELEGRAM_ID") or ""
-ADMIN_IDS: Set[int] = set()
-for part in _admin_ids_env.split(","):
-    part = part.strip()
-    if part.isdigit():
-        ADMIN_IDS.add(int(part))
-
-# Простые счётчики для rate limit OpenAI по пользователям
-OPENAI_RATE_LIMIT: Dict[int, List[float]] = {}
 
 # ==========================
 # Логирование
@@ -113,6 +105,10 @@ SPORT_SUBTOPICS: List[str] = [
 ]
 
 
+# ==========================
+# Вспомогательные функции
+# ==========================
+
 def strip_checkmark(text: str) -> str:
     """
     Убираем префикс '✅ ' у текста кнопки, если он есть.
@@ -121,6 +117,19 @@ def strip_checkmark(text: str) -> str:
         return text.lstrip("✅").strip()
     return text
 
+
+def _truncate(text: str, max_len: int = 1500) -> str:
+    """
+    Обрезаем длинную строку для отправки в Telegram.
+    """
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3] + "..."
+
+
+# ==========================
+# Клавиатуры
+# ==========================
 
 def build_choose_topics_entry_keyboard() -> ReplyKeyboardMarkup:
     """
@@ -208,37 +217,6 @@ async def update_topics_keyboard_markup(
         )
     except Exception as e:
         logger.error("Failed to update topics keyboard: %s", e)
-
-
-# ==========================
-# Вспомогательные функции: админы и rate limit
-# ==========================
-
-def is_admin(telegram_id: int) -> bool:
-    """
-    Проверка, является ли пользователь админом (для внутренних команд).
-    Если ADMIN_IDS пустой, считаем, что админские ограничения выключены.
-    """
-    if not ADMIN_IDS:
-        return True
-    return telegram_id in ADMIN_IDS
-
-
-def is_allowed_openai_call(user_id: int, max_calls: int = 5, window_seconds: int = 60) -> bool:
-    """
-    Простейший rate limit на обращения к OpenAI для одного пользователя.
-    Возвращает True, если можно сделать запрос, False — если лимит исчерпан.
-    """
-    now = time.time()
-    calls = OPENAI_RATE_LIMIT.get(user_id, [])
-    # чистим старые записи
-    calls = [t for t in calls if now - t < window_seconds]
-    if len(calls) >= max_calls:
-        OPENAI_RATE_LIMIT[user_id] = calls
-        return False
-    calls.append(now)
-    OPENAI_RATE_LIMIT[user_id] = calls
-    return True
 
 
 # ==========================
@@ -355,6 +333,28 @@ async def upsert_user_profile(
         return True
     except Exception as e:
         logger.exception("Error saving user profile to Supabase: %s", e)
+        return False
+
+
+async def delete_user_profile(telegram_id: int) -> bool:
+    """
+    Удаление профиля пользователя (для /reset_profile).
+    """
+    if not supabase:
+        logger.warning("Supabase client is not configured, skip delete_user_profile")
+        return False
+
+    try:
+        resp = (
+            supabase.table("user_profiles")
+            .delete()
+            .eq("user_id", telegram_id)
+            .execute()
+        )
+        logger.info("Deleted user_profile for %s: %s", telegram_id, resp)
+        return True
+    except Exception:
+        logger.exception("Error deleting user profile from Supabase for %s", telegram_id)
         return False
 
 
@@ -705,15 +705,7 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
     )
 
     try:
-        # Мягкий rate limit, чтобы не спамить OpenAI при частых перезапусках онбординга
-        if is_allowed_openai_call(user_id, max_calls=3, window_seconds=300):
-            profile = _call_openai_structured_profile_sync(raw_interests)
-        else:
-            logger.warning(
-                "build_and_save_structured_profile: rate limit for user_id=%s, using fallback-only profile",
-                user_id,
-            )
-            profile = _normalize_profile_dict(_build_fallback_profile_from_raw(raw_interests))
+        profile = _call_openai_structured_profile_sync(raw_interests)
     except Exception:
         logger.exception(
             "build_and_save_structured_profile: unexpected error in _call_openai_structured_profile_sync "
@@ -779,327 +771,439 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
 
 
 # ==========================
-# Генерация персональной ленты
+# OpenAI: генерация новостной ленты
 # ==========================
 
-def _build_fallback_feed_from_profile(
-    raw_interests: str,
-    structured_profile: Optional[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    """
-    Простой fallback-генератор ленты на случай, если OpenAI недоступен или сработал rate limit.
-    Карточки строятся на основе тем профиля или текста интересов.
-    """
-    items: List[Dict[str, Any]] = []
-    profile = structured_profile
+# Память rate-limit для генерации ленты (в памяти процесса)
+_last_feed_openai_call: Dict[int, datetime] = {}
 
-    # Если профиль не передали или он не словарь — строим его из raw_interests
-    if not isinstance(profile, dict):
-        profile = _normalize_profile_dict(_build_fallback_profile_from_raw(raw_interests))
 
+def _is_allowed_feed_openai_call(user_id: int) -> bool:
+    """
+    Проверяем, не слишком ли часто мы дергаем OpenAI для генерации ленты.
+    """
+    if FEED_OPENAI_COOLDOWN_SECONDS <= 0:
+        return True
+
+    now = datetime.now(timezone.utc)
+    last = _last_feed_openai_call.get(user_id)
+    if not last:
+        _last_feed_openai_call[user_id] = now
+        return True
+
+    delta = (now - last).total_seconds()
+    if delta >= FEED_OPENAI_COOLDOWN_SECONDS:
+        _last_feed_openai_call[user_id] = now
+        return True
+
+    return False
+
+
+def _build_fallback_feed_from_profile(profile: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]]:
+    """
+    Простейший fallback, если OpenAI не ответил.
+    Строим карточки на основе тем профиля.
+    """
     topics = profile.get("topics") or []
-    tags_global = profile.get("interests_as_tags") or []
+    if not isinstance(topics, list):
+        topics = []
 
-    # Берём до 5 тематик
-    if isinstance(topics, list) and topics:
-        for idx, t in enumerate(topics[:5], start=1):
-            if not isinstance(t, dict):
-                continue
-            name = t.get("name") or "тема"
-            cat = t.get("category") or "general"
-            tags: List[str] = [cat] if cat else []
-            for tg in tags_global:
-                if len(tags) >= 3:
-                    break
-                if tg not in tags:
-                    tags.append(tg)
+    # сортируем по weight убыванию
+    sorted_topics: List[Dict[str, Any]] = []
+    for t in topics:
+        if not isinstance(t, dict):
+            continue
+        try:
+            w = float(t.get("weight", 1.0))
+        except (TypeError, ValueError):
+            w = 1.0
+        t_copy = dict(t)
+        t_copy["_weight"] = w
+        sorted_topics.append(t_copy)
 
-            items.append(
-                {
-                    "id": str(idx),
-                    "title": f"Что нового по теме «{name}»",
-                    "text": (
-                        "Здесь будет короткий дайджест по этой теме. "
-                        "Сейчас это тестовая карточка, чтобы проверить работу ленты."
-                    ),
-                    "topic": name,
-                    "tags": tags,
-                }
-            )
+    sorted_topics.sort(key=lambda x: x.get("_weight", 1.0), reverse=True)
 
-    # Если тем вообще нет — делаем одну тестовую карточку
-    if not items:
-        snippet = (raw_interests or "").strip()
-        if len(snippet) > 200:
-            snippet = snippet[:200] + "…"
-        if not snippet:
-            snippet = "ты ещё не рассказал, что тебе интересно."
-
+    items: List[Dict[str, Any]] = []
+    if not sorted_topics:
         items.append(
             {
-                "id": "1",
-                "title": "Персональная лента EYYE",
-                "text": (
-                    "Здесь появятся новости, подобранные под твои интересы. "
-                    "Пока что я вижу только такое описание: "
-                    f"«{snippet}»"
+                "id": "fallback-0",
+                "title": "Ещё мало данных о твоих интересах",
+                "summary": "Я уже запомнил твой профиль и дальше буду подбирать новости под тебя. "
+                "Продолжай пользоваться ботом, чтобы лента становилась точнее.",
+                "topic": None,
+                "tag": None,
+                "importance": 0.5,
+            }
+        )
+        return items
+
+    for idx, t in enumerate(sorted_topics[:limit]):
+        name = str(t.get("name") or "интересная тема")
+        cat = t.get("category")
+        tag = cat or name
+        items.append(
+            {
+                "id": f"fallback-{idx+1}",
+                "title": f"Свежие истории по теме: {name.capitalize()}",
+                "summary": (
+                    "Я буду подбирать для тебя новости и истории по этой теме. "
+                    "Чем больше ты будешь читать и взаимодействовать с лентой, тем точнее станет подбор."
                 ),
-                "topic": "общие интересы",
-                "tags": ["eyye", "test_feed"],
+                "topic": name,
+                "tag": tag,
+                "importance": float(t.get("_weight", 1.0)),
             }
         )
 
     return items
 
 
-def _generate_feed_items_sync(
-    raw_interests: str,
-    structured_profile: Optional[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
+def _call_openai_generate_feed_sync(structured_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Синхронная функция, которая строит ленту через OpenAI.
-    Возвращает список карточек. Если что-то пошло не так, использует fallback.
+    Генерация массива карточек новостей на основе structured_profile.
+    Возвращает список словарей-элементов ленты.
     """
-    # Если нет ключа OpenAI — сразу fallback
     if not OPENAI_API_KEY:
-        logger.warning("_generate_feed_items_sync: OPENAI_API_KEY is not set, using fallback feed")
-        return _build_fallback_feed_from_profile(raw_interests, structured_profile)
-
-    # Если профиль пришёл строкой — пытаемся распарсить
-    if isinstance(structured_profile, str):
-        try:
-            structured_profile = json.loads(structured_profile)
-        except Exception:
-            logger.exception("_generate_feed_items_sync: failed to parse structured_profile string")
-            structured_profile = None
-
-    if not isinstance(structured_profile, dict):
-        profile_for_prompt = _normalize_profile_dict(_build_fallback_profile_from_raw(raw_interests))
-    else:
-        profile_for_prompt = structured_profile
-
-    try:
-        profile_json = json.dumps(profile_for_prompt, ensure_ascii=False)
-    except Exception:
-        profile_json = "{}"
+        logger.warning("OPENAI_API_KEY is not set, using fallback feed")
+        return _build_fallback_feed_from_profile(structured_profile)
 
     system_prompt = """
-Ты — генератор персональной новостной ленты для EYYE.
+Ты помогаешь персональному новостному сервису EYYE.
+На основе профиля интересов пользователя тебе нужно придумать несколько (5–10) новостных карточек.
 
-По описанию интересов пользователя и его структурированному профилю
-собери короткую ленту из 5–7 карточек. Карточка — это один пост,
-который выглядит как запись в новостном Telegram-канале.
+Это пока МАКЕТЫ карточек, не реальные новости, но:
+- они должны ощущаться как настоящие новости,
+- быть короткими, цепляющими и разнообразными,
+- соответствовать интересам пользователя.
 
-Важно:
-- Пиши кратко и понятно, без сложных терминов.
-- Ориентируйся на интересы пользователя (темы, теги, город, студенческий статус).
-- Можно придумывать новости, но они должны быть реалистичными и «вечнозелёными»
-  (без привязки к конкретной дате и спорным политическим событиям).
-- Не упоминай, что ты модель или ИИ, просто давай контент.
-
-Выведи СТРОГО один JSON-объект вида:
+ФОРМАТ ОТВЕТА — СТРОГО JSON:
 
 {
   "items": [
     {
-      "id": "1",
-      "title": "Короткий заголовок",
-      "text": "1–2 предложения текста карточки.",
-      "topic": "краткое название темы",
-      "tags": ["tag1", "tag2"]
+      "id": "string",
+      "title": "string",
+      "summary": "string",
+      "topic": "string | null",
+      "tag": "string | null",
+      "importance": number
     },
     ...
   ]
 }
 
-Никакого текста вне JSON.
+Где:
+- id — короткий стабильный идентификатор карточки (можешь использовать "item_1", "item_2", ...).
+- title — короткий заголовок (до ~80 символов).
+- summary — 1–2 предложения, чуть подробнее о сути.
+- topic — человекочитаемое название темы (можно на русском).
+- tag — короткий тег латиницей ("startups", "premier_league", "uk_universities").
+- importance — число от 0.0 до 1.0 (насколько эта карточка важна для пользователя).
+
+ТРЕБОВАНИЯ:
+- Никакого текста вне JSON.
+- От 5 до 10 элементов в массиве items.
+- Не дублируй одну и ту же идею; делай карточки разноформатными и по разным темам из профиля.
 """
 
-    user_prompt = f"""
-Исходное описание интересов и ответов пользователя:
+    user_content = json.dumps(structured_profile, ensure_ascii=False)
 
-\"\"\"{raw_interests}\"\"\"
+    payload: Dict[str, Any] = {
+        "model": OPENAI_MODEL or "gpt-4.1-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
+        "max_output_tokens": 900,
+        "temperature": 0.7,
+        "response_format": {"type": "json_object"},
+    }
 
-Структурированный профиль (JSON):
+    resp_json = call_openai_chat(payload)
+    if not resp_json:
+        logger.warning("OpenAI did not return response JSON for feed. Using fallback feed.")
+        return _build_fallback_feed_from_profile(structured_profile)
 
-```json
-{profile_json}
-Сгенерируй персональную ленту.
-"""
-payload: Dict[str, Any] = {
-    "model": OPENAI_MODEL or "gpt-4.1-mini",
-    "messages": [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ],
-    "max_output_tokens": 900,
-    "temperature": 0.4,
-    "response_format": {"type": "json_object"},
-}
+    try:
+        choices = resp_json.get("choices")
+        if not isinstance(choices, list) or not choices:
+            raise ValueError("No choices in OpenAI response for feed")
 
-resp_json = call_openai_chat(payload)
-if not resp_json:
-    logger.warning("_generate_feed_items_sync: OpenAI did not return response, using fallback feed")
-    return _build_fallback_feed_from_profile(raw_interests, profile_for_prompt)
+        message = choices[0].get("message") or {}
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("Empty content in OpenAI feed response")
 
-try:
-    choices = resp_json.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise ValueError("No choices in OpenAI response for feed")
-
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    if not isinstance(content, str) or not content.strip():
-        raise ValueError("Empty content in OpenAI response for feed")
-
-    logger.debug(
-        "OpenAI feed raw content (first 200 chars): %s",
-        content[:200].replace("\n", " "),
-    )
-
-    parsed = json.loads(content)
-    items = parsed.get("items")
-    if not isinstance(items, list) or not items:
-        raise ValueError("Parsed JSON has no 'items' list")
-
-    cleaned_items: List[Dict[str, Any]] = []
-    for idx, item in enumerate(items, start=1):
-        if not isinstance(item, dict):
-            continue
-        cleaned_items.append(
-            {
-                "id": str(item.get("id") or idx),
-                "title": str(item.get("title") or "").strip() or f"Карточка {idx}",
-                "text": str(item.get("text") or "").strip(),
-                "topic": str(item.get("topic") or "").strip(),
-                "tags": [
-                    str(t).strip()
-                    for t in (item.get("tags") or [])
-                    if str(t).strip()
-                ],
-            }
+        logger.debug(
+            "OpenAI feed raw content (first 200 chars): %s",
+            content[:200].replace("\n", " "),
         )
 
-    if not cleaned_items:
-        raise ValueError("No valid items after cleaning")
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            raise ValueError("Parsed feed JSON is not an object")
 
-    return cleaned_items
-except Exception:
-    logger.exception("_generate_feed_items_sync: failed to parse OpenAI response, using fallback feed")
-    return _build_fallback_feed_from_profile(raw_interests, profile_for_prompt)
-def _format_feed_for_telegram(items: List[Dict[str, Any]]) -> List[str]:
-"""
-Превращает список карточек в список текстов для отправки в Telegram.
-"""
-messages: List[str] = []
-for idx, item in enumerate(items, start=1):
-title = item.get("title") or f"Карточка {idx}"
-text = item.get("text") or ""
-topic = item.get("topic") or ""
-tags = item.get("tags") or []
-    lines: List[str] = [f"{idx}. {title}"]
-    if text:
-        lines.append("")
-        lines.append(text)
-    if topic or tags:
-        lines.append("")
-    if topic:
-        lines.append(f"Тема: {topic}")
-    if tags:
-        tags_str = ", ".join([str(t) for t in tags[:5]])
-        lines.append(f"Теги: {tags_str}")
+        items = parsed.get("items")
+        if not isinstance(items, list) or not items:
+            raise ValueError("No 'items' list in feed JSON")
 
-    messages.append("\n".join(lines).strip())
+        normalized_items: List[Dict[str, Any]] = []
+        for idx, it in enumerate(items):
+            if not isinstance(it, dict):
+                continue
+            item_id = str(it.get("id") or f"item_{idx+1}")
+            title = str(it.get("title") or "").strip()
+            summary = str(it.get("summary") or "").strip()
+            topic = it.get("topic")
+            tag = it.get("tag")
+            try:
+                importance = float(it.get("importance", 1.0))
+            except (TypeError, ValueError):
+                importance = 1.0
 
-return messages
-async def generate_and_send_feed_for_user(
-application: Application,
-user_id: int,
-chat_id: int,
-raw_interests: str,
-structured_profile: Optional[Dict[str, Any]] = None,
+            if not title and not summary:
+                continue
+
+            normalized_items.append(
+                {
+                    "id": item_id,
+                    "title": title or "Новость для тебя",
+                    "summary": summary or "Короткая новость по твоим интересам.",
+                    "topic": topic,
+                    "tag": tag,
+                    "importance": importance,
+                }
+            )
+
+        if not normalized_items:
+            raise ValueError("All feed items were invalid after normalization")
+
+        return normalized_items
+    except Exception:
+        logger.exception("Failed to parse OpenAI feed response. Using fallback feed.")
+        return _build_fallback_feed_from_profile(structured_profile)
+
+
+def _format_feed_for_message(feed_items: List[Dict[str, Any]]) -> str:
+    """
+    Собираем текстовое сообщение с несколькими карточками ленты.
+    """
+    if not feed_items:
+        return (
+            "Пока у меня нет достаточно данных, чтобы собрать ленту. "
+            "Попробуй ещё раз чуть позже или дополни профиль через /start."
+        )
+
+    lines: List[str] = []
+    lines.append("Готово! Вот твоя персональная лента 👇")
+    lines.append("")
+
+    for idx, item in enumerate(feed_items, start=1):
+        title = item.get("title") or "Новость для тебя"
+        summary = item.get("summary") or ""
+        topic = item.get("topic")
+        tag = item.get("tag")
+
+        lines.append(f"{idx}. {title}")
+        if summary:
+            lines.append(summary)
+        meta_parts: List[str] = []
+        if topic:
+            meta_parts.append(f"тема: {topic}")
+        if tag:
+            meta_parts.append(f"тег: {tag}")
+        if meta_parts:
+            lines.append(" · ".join(meta_parts))
+        lines.append("")  # пустая строка между карточками
+
+    return "\n".join(lines)
+
+
+async def _send_personalized_feed_from_profile(
+    chat_id: int,
+    user_id: int,
+    profile_dict: Dict[str, Any],
+    context: ContextTypes.DEFAULT_TYPE,
+    reason: str = "default",
 ) -> None:
-"""
-Асинхронный помощник: строит (или берёт fallback) ленту и отправляет её пользователю.
-"""
-if not raw_interests.strip():
-await application.bot.send_message(
-chat_id=chat_id,
-text=(
-"У меня пока нет описания твоих интересов, поэтому ленту собрать не могу.\n"
-"Напиши /start и расскажи, что тебе интересно."
-),
-)
-return
-# Пробуем использовать OpenAI с простым rate limit.
-use_openai = bool(OPENAI_API_KEY)
-if use_openai:
-    if not is_allowed_openai_call(user_id, max_calls=5, window_seconds=60):
-        logger.warning(
-            "generate_and_send_feed_for_user: OpenAI rate limit for user_id=%s, using fallback feed",
-            user_id,
+    """
+    Генерация и отправка ленты из structured_profile (или fallback-профиля).
+    """
+    logger.info(
+        "Sending personalized feed for user_id=%s (reason=%s)",
+        user_id,
+        reason,
+    )
+
+    # проверка rate-limit для OpenAI
+    if _is_allowed_feed_openai_call(user_id):
+        feed_items = await asyncio.to_thread(_call_openai_generate_feed_sync, profile_dict)
+    else:
+        logger.info("Feed OpenAI call is rate-limited for user_id=%s, using fallback feed only", user_id)
+        feed_items = _build_fallback_feed_from_profile(profile_dict)
+
+    text = _format_feed_for_message(feed_items)
+
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=text)
+    except Exception:
+        logger.exception("Failed to send personalized feed to chat_id=%s", chat_id)
+
+
+async def _load_effective_profile(
+    user_id: int,
+) -> Tuple[Optional[Dict[str, Any]], bool, Optional[str]]:
+    """
+    Загружаем эффективный профиль пользователя:
+    - если есть structured_profile — используем его;
+    - иначе строим fallback из raw_interests.
+    Возвращаем (profile_dict, using_fallback, raw_interests_or_none).
+    """
+    if not supabase:
+        logger.warning("_load_effective_profile: Supabase is not configured")
+        return None, False, None
+
+    try:
+        resp = (
+            supabase.table("user_profiles")
+            .select("structured_profile, raw_interests")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
         )
-        use_openai = False
+    except Exception:
+        logger.exception("_load_effective_profile: failed to query Supabase for user_id=%s", user_id)
+        return None, False, None
 
-if use_openai:
-    items = await asyncio.to_thread(
-        _generate_feed_items_sync,
-        raw_interests,
-        structured_profile,
-    )
-else:
-    items = _build_fallback_feed_from_profile(raw_interests, structured_profile)
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+    if not data:
+        return None, False, None
 
-if not items:
-    await application.bot.send_message(
-        chat_id=chat_id,
-        text=(
-            "Не получилось собрать ленту прямо сейчас. "
-            "Попробуй, пожалуйста, ещё раз чуть позже."
-        ),
-    )
-    return
+    row = data[0]
+    structured = row.get("structured_profile")
+    raw_interests = row.get("raw_interests") or ""
 
-texts = _format_feed_for_telegram(items)
+    if structured is not None:
+        if isinstance(structured, str):
+            try:
+                structured_obj = json.loads(structured)
+            except Exception:
+                logger.exception(
+                    "_load_effective_profile: failed to parse structured_profile JSON for user_id=%s",
+                    user_id,
+                )
+                structured_obj = None
+        else:
+            structured_obj = structured
 
-# Сначала сообщение-заголовок, чтобы пользователь понимал, что происходит
-await application.bot.send_message(
-    chat_id=chat_id,
-    text="Готово! Вот твоя персональная лента 👇",
-)
+        if not isinstance(structured_obj, dict):
+            logger.warning(
+                "_load_effective_profile: structured_profile has unexpected type for user_id=%s",
+                user_id,
+            )
+            profile_dict = None
+        else:
+            profile_dict = _normalize_profile_dict(structured_obj)
+            return profile_dict, False, raw_interests
 
-for text in texts:
-    await application.bot.send_message(chat_id=chat_id, text=text)
-==========================
-Команды
-==========================
+    # сюда попадаем, если structured_profile нет или он странный
+    if not raw_interests:
+        return None, True, None
+
+    fallback_profile = _normalize_profile_dict(_build_fallback_profile_from_raw(raw_interests))
+
+    # параллельно пробуем построить нормальный профиль, если есть OpenAI
+    if OPENAI_API_KEY:
+        try:
+            app = cast(Application, Application._get_instance())
+            app.create_task(
+                asyncio.to_thread(build_and_save_structured_profile, user_id, raw_interests)
+            )
+            logger.info(
+                "_load_effective_profile: scheduled build_and_save_structured_profile for user_id=%s",
+                user_id,
+            )
+        except Exception:
+            logger.exception(
+                "_load_effective_profile: failed to schedule build_and_save_structured_profile for user_id=%s",
+                user_id,
+            )
+
+    return fallback_profile, True, raw_interests
+
+
+# ==========================
+# Команды
+# ==========================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-"""
-/start — онбординг или приветствие, если профиль уже есть.
-"""
-user = update.effective_user
-if user:
-    await save_user_to_supabase(user.id, user.username)
+    """
+    /start — онбординг или мгновенная выдача ленты, если профиль уже есть.
+    """
+    user = update.effective_user
 
-if not update.message:
-    return
+    if user:
+        await save_user_to_supabase(user.id, user.username)
 
-if not supabase or not user:
-    text_lines = [
-        "Привет! Это EYYE — твой персональный новостной ассистент.",
-        "",
-        "Пока что бот умеет немногое:",
-        "/ping — проверить, что бот жив",
-        "/me — показать, что бот знает о твоём аккаунте",
-        "/help — показать справку",
-    ]
-    await update.message.reply_text("\n".join(text_lines))
-    return
+    if not update.message:
+        return
 
-profile = await load_user_profile(user.id)
+    if not supabase or not user:
+        # Режим без базы — просто справка
+        text_lines = [
+            "Привет! Это EYYE — твой персональный новостной ассистент.",
+            "",
+            "Пока что бот умеет немногое:",
+            "/ping — проверить, что бот жив",
+            "/me — показать, что бот знает о твоём аккаунте",
+            "/help — показать справку",
+        ]
+        await update.message.reply_text("\n".join(text_lines))
+        return
 
-if profile:
-    context.user_data["awaiting_profile"] = False
+    profile = await load_user_profile(user.id)
+
+    if profile:
+        # Профиль уже есть — сразу показываем ленту
+        context.user_data["awaiting_profile"] = False
+        context.user_data["profile_buffer"] = []
+        context.user_data["selected_topics"] = []
+        context.user_data["topics_mode"] = None
+        context.user_data["topics_keyboard_message_id"] = None
+        context.user_data["topics_keyboard_chat_id"] = None
+
+        await update.message.reply_text(
+            "Снова привет 👋\n\n"
+            "Я уже помню твои интересы. Обновляю под тебя ленту прямо сейчас.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+
+        effective_profile, using_fallback, _ = await _load_effective_profile(user.id)
+        if not effective_profile:
+            await update.message.reply_text(
+                "Пока не смог собрать твой профиль интересов. "
+                "Попробуй обновить его через /start чуть позже."
+            )
+            return
+
+        await _send_personalized_feed_from_profile(
+            chat_id=update.effective_chat.id,
+            user_id=user.id,
+            profile_dict=effective_profile,
+            context=context,
+            reason="start_existing_profile",
+        )
+        if using_fallback:
+            await update.message.reply_text(
+                "Пока использую черновой профиль, в фоне строю более точный вариант с помощью ИИ."
+            )
+        return
+
+    # Профиля ещё нет — запускаем онбординг
+    context.user_data["awaiting_profile"] = True
     context.user_data["profile_buffer"] = []
     context.user_data["selected_topics"] = []
     context.user_data["topics_mode"] = None
@@ -1107,554 +1211,389 @@ if profile:
     context.user_data["topics_keyboard_chat_id"] = None
 
     text_lines = [
-        "Снова привет 👋",
+        "Привет 👋",
         "",
-        "Я уже помню твои интересы и город.",
+        "Я — EYYE, твой персональный новостной ассистент.",
+        "Чтобы настроить ленту под тебя, можно сделать так:",
         "",
-        "Команды:",
-        "/me — показать, что я о тебе знаю",
-        "/raw_profile — показать сырые данные профиля (для отладки)",
-        "/help — показать справку",
-        "/ping — проверить, что бот жив",
+        "1) Написать в свободной форме, что тебе интересно читать,",
+        "   где ты живёшь/учишься и что не хочется видеть.",
         "",
-        "А ниже я обновлю твою персональную ленту 👇",
+        "2) Или нажать кнопку «Выбрать темы» ниже и выбрать из списка общих тем.",
+        "",
+        "Можешь комбинировать оба подхода: и выбирать темы, и дописывать детали текстом.",
+        "Когда всё опишешь — просто отправь команду /done или нажми «Начать читать».",
+        "",
+        "— Жду твоё первое сообщение 🙂",
     ]
     await update.message.reply_text(
         "\n".join(text_lines),
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=build_choose_topics_entry_keyboard(),
     )
 
-    # Пытаемся сразу отправить ленту по текущему профилю
-    raw_interests = str(profile.get("raw_interests") or "")
-    structured_profile = profile.get("structured_profile")
 
-    # Если structured_profile строкой — попробуем распарсить
-    if isinstance(structured_profile, str):
-        try:
-            structured_profile = json.loads(structured_profile)
-        except json.JSONDecodeError:
-            structured_profile = None
-
-    application: Application = cast(Application, context.application)
-    chat = update.effective_chat
-    if chat:
-        try:
-            application.create_task(
-                generate_and_send_feed_for_user(
-                    application,
-                    user.id,
-                    chat.id,
-                    raw_interests,
-                    structured_profile,
-                )
-            )
-        except Exception:
-            logger.exception("start: failed to schedule generate_and_send_feed_for_user")
-
-    return
-
-# Профиля ещё нет — запускаем онбординг
-context.user_data["awaiting_profile"] = True
-context.user_data["profile_buffer"] = []
-context.user_data["selected_topics"] = []
-context.user_data["topics_mode"] = None
-context.user_data["topics_keyboard_message_id"] = None
-context.user_data["topics_keyboard_chat_id"] = None
-
-text_lines = [
-    "Привет 👋",
-    "",
-    "Я — EYYE, твой персональный новостной ассистент.",
-    "Чтобы настроить ленту под тебя, можно сделать так:",
-    "",
-    "1) Написать в свободной форме, что тебе интересно читать,",
-    "   где ты живёшь/учишься и что не хочется видеть.",
-    "",
-    "2) Или нажать кнопку «Выбрать темы» ниже и выбрать из списка общих тем.",
-    "",
-    "Можешь комбинировать оба подхода: и выбирать темы, и дописывать детали текстом.",
-    "Когда всё опишешь — просто отправь команду /done.",
-    "",
-    "— Жду твоё первое сообщение 🙂",
-]
-await update.message.reply_text(
-    "\n".join(text_lines),
-    reply_markup=build_choose_topics_entry_keyboard(),
-)
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-text_lines = [
-"Доступные команды:",
-"/start — перезапустить бота и (при необходимости) пройти онбординг",
-"/ping — проверить, что бот жив",
-"/me — показать, что бот знает о тебе в базе и в Telegram",
-"/raw_profile — показать сырые данные профиля (для отладки)",
-"/reset_profile — сбросить профиль (для разработчика)",
-"/done — закончить описание интересов во время онбординга",
-"/help — эта справка",
-]
-if update.message:
-await update.message.reply_text("\n".join(text_lines))
+    """
+    /help — простая справка.
+    """
+    text_lines = [
+        "Доступные команды:",
+        "/start — перезапустить бота и (при необходимости) пройти онбординг",
+        "/ping — проверить, что бот жив",
+        "/me — показать, что бот знает о тебе",
+        "/feed — черновой вывод тем/тегов профиля (для отладки)",
+        "/raw_profile — показать сохранённые raw_interests и structured_profile (обрезано)",
+        "/done — закончить описание интересов во время онбординга",
+        "/help — эта справка",
+        "/reset_profile — удалить профиль и пройти онбординг заново (для тестов)",
+    ]
+    if update.message:
+        await update.message.reply_text("\n".join(text_lines))
+
+
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-if update.message:
-await update.message.reply_text("pong")
+    """
+    /ping — проверка, что бот жив.
+    """
+    if update.message:
+        await update.message.reply_text("pong")
+
 
 async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-"""
-/me — Telegram-данные + Supabase + structured_profile (если есть).
-"""
-user = update.effective_user
-if not user:
-if update.message:
-await update.message.reply_text("Не получилось определить твой Telegram-профиль.")
-return
+    """
+    /me — Telegram-данные + Supabase + structured_profile (если есть).
+    """
+    user = update.effective_user
+    if not user:
+        if update.message:
+            await update.message.reply_text("Не получилось определить твой Telegram-профиль.")
+        return
 
-await save_user_to_supabase(user.id, user.username)
+    await save_user_to_supabase(user.id, user.username)
 
-tg_lines: List[str] = [
-    "Данные из Telegram:",
-    f"id: {user.id}",
-    f"username: {user.username}",
-    f"first_name: {user.first_name}",
-    f"last_name: {user.last_name}",
-    "",
-]
+    tg_lines: List[str] = [
+        "Данные из Telegram:",
+        f"id: {user.id}",
+        f"username: {user.username}",
+        f"first_name: {user.first_name}",
+        f"last_name: {user.last_name}",
+        "",
+    ]
 
-if not supabase:
-    tg_lines.append("Supabase сейчас не настроен, поэтому показываю только данные из Telegram.")
-    if update.message:
-        await update.message.reply_text("\n".join(tg_lines))
-    return
+    if not supabase:
+        tg_lines.append("Supabase сейчас не настроен, поэтому показываю только данные из Telegram.")
+        if update.message:
+            await update.message.reply_text("\n".join(tg_lines))
+        return
 
-row = await load_user_from_supabase(user.id)
+    row = await load_user_from_supabase(user.id)
 
-if not row:
-    tg_lines.append(
-        "Supabase сейчас отвечает с ошибкой или запись ещё не создана.\n"
-        "Показываю только данные из Telegram."
-    )
-    if update.message:
-        await update.message.reply_text("\n".join(tg_lines))
-    return
+    if not row:
+        tg_lines.append(
+            "Supabase сейчас отвечает с ошибкой или запись ещё не создана.\n"
+            "Показываю только данные из Telegram."
+        )
+        if update.message:
+            await update.message.reply_text("\n".join(tg_lines))
+        return
 
-sb_lines: List[str] = [
-    "Информация о тебе в базе EYYE (Supabase / telegram_users):",
-    f"id: {row.get('id')}",
-    f"username: {row.get('username')}",
-    f"created_at: {row.get('created_at')}",
-    "",
-]
+    sb_lines: List[str] = [
+        "Информация о тебе в базе EYYE (Supabase / telegram_users):",
+        f"id: {row.get('id')}",
+        f"username: {row.get('username')}",
+        f"created_at: {row.get('created_at')}",
+        "",
+    ]
 
-profile = await load_user_profile(user.id)
-profile_lines: List[str] = []
+    profile = await load_user_profile(user.id)
+    profile_lines: List[str] = []
 
-if profile:
-    profile_lines.append("Профиль интересов (user_profiles):")
-    raw = profile.get("raw_interests") or ""
-    profile_lines.append("raw_interests:")
-    profile_lines.append(raw)
-    profile_lines.append("")
-    loc_city = profile.get("location_city")
-    loc_country = profile.get("location_country")
-    if loc_city or loc_country:
-        profile_lines.append("Локация (если заполнена):")
-        if loc_city:
-            profile_lines.append(f"- город: {loc_city}")
-        if loc_country:
-            profile_lines.append(f"- страна: {loc_country}")
+    if profile:
+        profile_lines.append("Профиль интересов (user_profiles):")
+        raw = profile.get("raw_interests") or ""
+        profile_lines.append("raw_interests:")
+        profile_lines.append(_truncate(raw, 800))
+        profile_lines.append("")
+        loc_city = profile.get("location_city")
+        loc_country = profile.get("location_country")
+        if loc_city or loc_country:
+            profile_lines.append("Локация (если заполнена):")
+            if loc_city:
+                profile_lines.append(f"- город: {loc_city}")
+            if loc_country:
+                profile_lines.append(f"- страна: {loc_country}")
+            profile_lines.append("")
+
+        structured = profile.get("structured_profile")
+        if structured is None:
+            profile_lines.append("structured_profile: ещё не посчитан или пуст.")
+        else:
+            if isinstance(structured, str):
+                try:
+                    structured_data = json.loads(structured)
+                except json.JSONDecodeError:
+                    structured_data = None
+            else:
+                structured_data = structured
+
+            if not isinstance(structured_data, dict):
+                profile_lines.append("structured_profile: есть, но не удалось распарсить JSON.")
+            else:
+                profile_lines.append("structured_profile (кратко):")
+                sp_city = structured_data.get("location_city") or "—"
+                sp_country = structured_data.get("location_country") or "—"
+                profile_lines.append(f"- city: {sp_city}")
+                profile_lines.append(f"- country: {sp_country}")
+
+                topics = structured_data.get("topics") or []
+                if topics:
+                    profile_lines.append("- topics:")
+                    for topic in topics[:10]:
+                        if not isinstance(topic, dict):
+                            continue
+                        name = topic.get("name") or "unknown"
+                        weight = topic.get("weight")
+                        if isinstance(weight, (int, float)):
+                            weight_str = f"{weight:.2f}"
+                        else:
+                            weight_str = "?"
+                        profile_lines.append(f"  • {name} ({weight_str})")
+                else:
+                    profile_lines.append("- topics: []")
+
+                negative = structured_data.get("negative_topics") or []
+                if negative:
+                    profile_lines.append("- negative_topics:")
+                    for nt in negative[:10]:
+                        profile_lines.append(f"  • {nt}")
+                else:
+                    profile_lines.append("- negative_topics: []")
+    else:
+        profile_lines.append("Профиль интересов ещё не заполнен.")
+        profile_lines.append("Напиши /start, чтобы пройти онбординг или обновить данные.")
         profile_lines.append("")
 
+    all_lines = tg_lines + sb_lines + profile_lines
+
+    if update.message:
+        await update.message.reply_text("\n".join(all_lines))
+
+
+async def raw_profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /raw_profile — показать сырые данные профиля (raw_interests + structured_profile JSON, обрезанные).
+    Удобно для отладки.
+    """
+    user = update.effective_user
+    if not user or not update.message:
+        return
+
+    if not supabase:
+        await update.message.reply_text("Supabase не настроен, профиль недоступен.")
+        return
+
+    profile = await load_user_profile(user.id)
+    if not profile:
+        await update.message.reply_text(
+            "Профиль не найден. Пройди онбординг через /start, чтобы я запомнил твои интересы."
+        )
+        return
+
+    raw = profile.get("raw_interests") or ""
     structured = profile.get("structured_profile")
+
+    lines: List[str] = []
+    lines.append("raw_interests (обрезано):")
+    lines.append(_truncate(raw, 1200))
+    lines.append("")
+
     if structured is None:
-        profile_lines.append("structured_profile: ещё не посчитан или пуст.")
+        lines.append("structured_profile: ещё не посчитан или пуст.")
     else:
         if isinstance(structured, str):
+            structured_str = structured
+        else:
             try:
-                structured_data = json.loads(structured)
-            except json.JSONDecodeError:
-                structured_data = None
-        else:
-            structured_data = structured
+                structured_str = json.dumps(structured, ensure_ascii=False, indent=2)
+            except Exception:
+                structured_str = str(structured)
+        lines.append("structured_profile (обрезано):")
+        lines.append(_truncate(structured_str, 1800))
 
-        if not isinstance(structured_data, dict):
-            profile_lines.append("structured_profile: есть, но не удалось распарсить JSON.")
-        else:
-            profile_lines.append("structured_profile:")
-            sp_city = structured_data.get("location_city") or "—"
-            sp_country = structured_data.get("location_country") or "—"
-            profile_lines.append(f"- city: {sp_city}")
-            profile_lines.append(f"- country: {sp_country}")
+    await update.message.reply_text("\n".join(lines))
 
-            topics = structured_data.get("topics") or []
-            if topics:
-                profile_lines.append("- topics:")
-                for topic in topics:
-                    name = topic.get("name") or "unknown"
-                    weight = topic.get("weight")
-                    if isinstance(weight, (int, float)):
-                        weight_str = f"{weight:.2f}"
-                    else:
-                        weight_str = "?"
-                    profile_lines.append(f"  • {name} ({weight_str})")
-            else:
-                profile_lines.append("- topics: []")
 
-            negative = structured_data.get("negative_topics") or []
-            if negative:
-                profile_lines.append("- negative_topics:")
-                for nt in negative:
-                    profile_lines.append(f"  • {nt}")
-            else:
-                profile_lines.append("- negative_topics: []")
-else:
-    profile_lines.append("Профиль интересов ещё не заполнен.")
-    profile_lines.append("Напиши /start, чтобы пройти онбординг или обновить данные.")
-    profile_lines.append("")
-
-all_lines = tg_lines + sb_lines + profile_lines
-
-if update.message:
-    await update.message.reply_text("\n".join(all_lines))
-async def raw_profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-"""
-/raw_profile — показать raw_interests и structured_profile (обрезанный для отладки).
-"""
-user = update.effective_user
-message = update.effective_message
-if user is None or message is None:
-    return
-
-if supabase is None:
-    await message.reply_text("Supabase сейчас не настроен, поэтому профиль прочитать не могу.")
-    return
-
-profile = await load_user_profile(user.id)
-if not profile:
-    await message.reply_text(
-        "Профиль для этого пользователя не найден.\n"
-        "Сначала пройди онбординг через /start."
-    )
-    return
-
-raw_interests = profile.get("raw_interests") or ""
-structured = profile.get("structured_profile")
-
-# Превью raw_interests
-if not raw_interests:
-    raw_preview = "— (пусто)"
-else:
-    if len(raw_interests) > 1000:
-        raw_preview = raw_interests[:1000] + "…"
-    else:
-        raw_preview = raw_interests
-
-# Превью structured_profile
-if structured is None:
-    structured_preview = "— structured_profile ещё не посчитан."
-else:
-    if isinstance(structured, str):
-        try:
-            structured_obj = json.loads(structured)
-        except json.JSONDecodeError:
-            structured_obj = structured
-    else:
-        structured_obj = structured
-    try:
-        structured_text = json.dumps(structured_obj, ensure_ascii=False, indent=2)
-    except Exception:
-        structured_text = str(structured_obj)
-    if len(structured_text) > 1500:
-        structured_preview = structured_text[:1500] + "…"
-    else:
-        structured_preview = structured_text
-
-lines = [
-    "raw_interests (обрезано до 1000 символов):",
-    "",
-    raw_preview,
-    "",
-    "structured_profile (обрезано до ~1500 символов):",
-    "",
-    structured_preview,
-]
-
-await message.reply_text("\n".join(lines))
 async def reset_profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-"""
-/reset_profile — сброс профиля пользователя (только для админов).
-"""
-user = update.effective_user
-message = update.effective_message
-if user is None or message is None:
-    return
-
-if not is_admin(user.id):
-    await message.reply_text(
-        "Команда /reset_profile доступна только разработчику бота."
-    )
-    return
-
-if supabase is None:
-    await message.reply_text("Supabase сейчас не настроен, сбрасывать нечего.")
-    return
-
-try:
-    supabase.table("user_profiles").delete().eq("user_id", user.id).execute()
-    logger.info("reset_profile_command: deleted user_profile for user_id=%s", user.id)
-except Exception:
-    logger.exception("reset_profile_command: failed to delete user_profile for user_id=%s", user.id)
-    await message.reply_text(
-        "Не получилось удалить профиль из базы. Посмотри логи на сервере."
-    )
-    return
-
-# Сбрасываем локальное состояние онбординга
-context.user_data["awaiting_profile"] = False
-context.user_data["profile_buffer"] = []
-context.user_data["selected_topics"] = []
-context.user_data["topics_mode"] = None
-context.user_data["topics_keyboard_message_id"] = None
-context.user_data["topics_keyboard_chat_id"] = None
-
-await message.reply_text(
-    "Профиль в базе очищен. Можешь заново пройти онбординг через /start."
-)
-async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-"""
-/feed — читаем structured_profile.
-Если его ещё нет — быстрый fallback по raw_interests + параллельно строим нормальный профиль.
-Используется как отладочная команда (для админов).
-"""
-user = update.effective_user
-message = update.effective_message
-if user is None or message is None:
-    return
-
-if not is_admin(user.id):
-    await message.reply_text(
-        "Команда /feed сейчас используется только для отладки.\n"
-        "Для получения ленты просто пройди онбординг через /start."
-    )
-    return
-
-if supabase is None:
-    await message.reply_text("Внутренняя ошибка: база профилей не настроена.")
-    return
-
-try:
-    resp = (
-        supabase.table("user_profiles")
-        .select("structured_profile, raw_interests")
-        .eq("user_id", user.id)
-        .limit(1)
-        .execute()
-    )
-except Exception:
-    logger.exception("Failed to load profile from Supabase for user_id=%s", user.id)
-    await message.reply_text("Не получилось получить твой профиль интересов. Попробуй ещё раз позже.")
-    return
-
-data = getattr(resp, "data", None)
-if data is None:
-    data = getattr(resp, "model", None)
-if not data:
-    await message.reply_text(
-        "Я пока не знаю твоих интересов. Пройди, пожалуйста, онбординг через /start, "
-        "а потом попробуй /feed ещё раз."
-    )
-    return
-
-row = data[0]
-structured = row.get("structured_profile")
-raw_interests = row.get("raw_interests") or ""
-
-if structured is not None:
-    if isinstance(structured, str):
-        try:
-            structured = json.loads(structured)
-        except Exception:
-            logger.exception("Failed to parse structured_profile JSON for user_id=%s", user.id)
-            await message.reply_text(
-                "Твой структурированный профиль сейчас в странном формате. "
-                "Попробуй пройти онбординг заново позже."
-            )
-            return
-
-    if not isinstance(structured, dict):
-        await message.reply_text(
-            "Твой профиль интересов сейчас в непонятном формате. "
-            "Попробуй пройти онбординг заново позже."
-        )
+    """
+    /reset_profile — удалить профиль и начать онбординг заново.
+    Пока без ограничения по ролям (удобно для разработки).
+    """
+    user = update.effective_user
+    if not user or not update.message:
         return
 
-    profile_dict = structured
-    using_fallback = False
-else:
-    if not raw_interests:
-        await message.reply_text(
-            "Похоже, у меня пока нет ни структурированного профиля, ни исходного описания интересов 😔\n"
-            "Напиши /start, чтобы пройти онбординг."
-        )
+    if not supabase:
+        await update.message.reply_text("Supabase не настроен, сброс профиля невозможен.")
         return
 
-    profile_dict = _normalize_profile_dict(_build_fallback_profile_from_raw(raw_interests))
-    using_fallback = True
-
-    if OPENAI_API_KEY:
-        application: Application = cast(Application, context.application)
-        try:
-            application.create_task(
-                asyncio.to_thread(build_and_save_structured_profile, user.id, raw_interests)
-            )
-        except Exception:
-            logger.exception(
-                "feed: failed to schedule build_and_save_structured_profile for user_id=%s",
-                user.id,
-            )
-
-topics = profile_dict.get("topics") or []
-negative_topics = profile_dict.get("negative_topics") or []
-tags = profile_dict.get("interests_as_tags") or []
-
-lines: List[str] = []
-
-topic_names: List[str] = []
-for t in topics:
-    if isinstance(t, dict):
-        name = t.get("name")
-        if name:
-            topic_names.append(str(name))
-topic_names = topic_names[:8]
-
-if topic_names:
-    lines.append("Я буду искать новости по темам: " + ", ".join(topic_names) + ".")
-
-if tags:
-    tags_str = ", ".join(str(x) for x in tags[:10])
-    lines.append("Теги интересов: " + tags_str + ".")
-
-if negative_topics:
-    neg_str = ", ".join(str(x) for x in negative_topics[:8])
-    lines.append("Буду стараться избегать тем: " + neg_str + ".")
-
-if not lines:
-    lines.append(
-        "У меня пока нет достаточно структурированных данных о твоих интересах. "
-        "Как только профиль обновится, я смогу подбирать под тебя новости."
-    )
-
-if using_fallback:
-    lines.append(
-        "\nСейчас я ориентируюсь на быстрый черновой профиль по твоим выборам. "
-        "Параллельно строю более точный профиль с помощью ИИ."
-    )
-
-await message.reply_text("\n".join(lines))
-==========================
-Онбординг: текст + кнопки
-==========================
-async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-"""
-Любые текстовые сообщения во время онбординга:
-либо выбор тем, либо свободный текст.
-"""
-if not update.message:
-return
-user = update.effective_user
-if not user:
-    return
-
-text_raw = (update.message.text or "").strip()
-if not text_raw:
-    return
-
-if not context.user_data.get("awaiting_profile"):
-    await update.message.reply_text(
-        "Я пока понимаю только команды. Напиши /help, чтобы увидеть список."
-    )
-    return
-
-if text_raw == TOPIC_CHOOSE_BUTTON_TEXT:
-    context.user_data["topics_mode"] = "main"
-    selected_topics: List[str] = context.user_data.get("selected_topics", [])
-    keyboard = build_main_topics_keyboard(selected_topics)
-    sent = await update.message.reply_text(
-        "Вот общие темы. Нажимай на те, что тебе интересны.\n"
-        "Можно выбрать несколько. В любой момент жми «⬅️ Назад», чтобы вернуться к свободному вводу.",
-        reply_markup=keyboard,
-    )
-    context.user_data["topics_keyboard_message_id"] = sent.message_id
-    context.user_data["topics_keyboard_chat_id"] = sent.chat_id
-    return
-
-if text_raw == START_READING_BUTTON_TEXT:
-    await finish_onboarding(update, context)
-    return
-
-if text_raw == EXIT_TOPICS_BUTTON_TEXT:
-    context.user_data["topics_mode"] = None
-    context.user_data["topics_keyboard_message_id"] = None
-    context.user_data["topics_keyboard_chat_id"] = None
-    keyboard = ReplyKeyboardRemove()
-    await update.message.reply_text(
-        "Убрал клавиатуру тем. Можешь продолжить писать своими словами 🙂",
-        reply_markup=keyboard,
-    )
-    return
-
-if text_raw == BACK_TO_MAIN_TOPICS_BUTTON_TEXT:
-    context.user_data["topics_mode"] = "main"
-    selected_topics = context.user_data.get("selected_topics", [])
-    keyboard = build_main_topics_keyboard(selected_topics)
-    sent = await update.message.reply_text(
-        "Вернул список общих тем. Можно выбирать дальше.",
-        reply_markup=keyboard,
-    )
-    context.user_data["topics_keyboard_message_id"] = sent.message_id
-    context.user_data["topics_keyboard_chat_id"] = sent.chat_id
-    return
-
-text = strip_checkmark(text_raw)
-
-topics_mode: Optional[str] = context.user_data.get("topics_mode")
-selected_topics: List[str] = context.user_data.get("selected_topics", [])
-keyboard_message_id = context.user_data.get("topics_keyboard_message_id")
-keyboard_chat_id = context.user_data.get("topics_keyboard_chat_id")
-
-# Подтемы спорта
-if topics_mode == "sports" and text in SPORT_SUBTOPICS:
-    selected = set(selected_topics)
-    if text in selected:
-        selected.remove(text)
+    ok = await delete_user_profile(user.id)
+    if ok:
+        # Сброс локального состояния онбординга
+        context.user_data.clear()
+        await update.message.reply_text(
+            "Я удалил твой профиль интересов. "
+            "Чтобы настроить всё заново, отправь /start.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
     else:
-        selected.add(text)
-    context.user_data["selected_topics"] = list(selected)
-
-    if keyboard_message_id and keyboard_chat_id:
-        await update_topics_keyboard_markup(
-            context,
-            keyboard_chat_id,
-            keyboard_message_id,
-            topics_mode,
-            context.user_data["selected_topics"],
+        await update.message.reply_text(
+            "Не получилось удалить профиль. Попробуй чуть позже."
         )
-    return
 
-# Основные темы
-if topics_mode == "main":
-    if text == "Спорт":
-        context.user_data["topics_mode"] = "sports"
-        selected_topics = context.user_data.get("selected_topics", [])
-        keyboard = build_sport_topics_keyboard(selected_topics)
+
+async def feed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /feed — отладочная команда: читаем structured_profile и показываем список тем/тегов.
+    Это НЕ основная точка входа в ленту.
+    """
+    user = update.effective_user
+    message = update.effective_message
+
+    if user is None or message is None:
+        return
+
+    if supabase is None:
+        await message.reply_text("Внутренняя ошибка: база профилей не настроена.")
+        return
+
+    profile_dict, using_fallback, _ = await _load_effective_profile(user.id)
+    if not profile_dict:
+        await message.reply_text(
+            "Я пока не знаю твоих интересов. Пройди, пожалуйста, онбординг через /start."
+        )
+        return
+
+    topics = profile_dict.get("topics") or []
+    negative_topics = profile_dict.get("negative_topics") or []
+    tags = profile_dict.get("interests_as_tags") or []
+
+    lines: List[str] = []
+
+    topic_names: List[str] = []
+    for t in topics:
+        if isinstance(t, dict):
+            name = t.get("name")
+            if name:
+                topic_names.append(str(name))
+    topic_names = topic_names[:12]
+
+    if topic_names:
+        lines.append("Основные темы, по которым я ориентируюсь:")
+        lines.append(", ".join(topic_names) + ".")
+        lines.append("")
+
+    if tags:
+        tags_str = ", ".join(str(x) for x in tags[:15])
+        lines.append("Теги интересов:")
+        lines.append(tags_str + ".")
+        lines.append("")
+
+    if negative_topics:
+        neg_str = ", ".join(str(x) for x in negative_topics[:10])
+        lines.append("Темы, которых стоит избегать:")
+        lines.append(neg_str + ".")
+        lines.append("")
+
+    if using_fallback:
+        lines.append(
+            "Сейчас использую черновой профиль по твоим выборам. "
+            "В фоне строю более точный профиль с помощью ИИ."
+        )
+
+    if not lines:
+        lines.append(
+            "У меня пока нет достаточно структурированных данных о твоих интересах. "
+            "Как только профиль обновится, я смогу подбирать под тебя новости."
+        )
+
+    await message.reply_text("\n".join(lines))
+
+
+# ==========================
+# Онбординг: текст + кнопки
+# ==========================
+
+async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Любые текстовые сообщения во время онбординга:
+    либо выбор тем, либо свободный текст.
+    """
+    if not update.message:
+        return
+
+    user = update.effective_user
+    if not user:
+        return
+
+    text_raw = (update.message.text or "").strip()
+    if not text_raw:
+        return
+
+    if not context.user_data.get("awaiting_profile"):
+        await update.message.reply_text(
+            "Сейчас я уже не собираю профиль. Напиши /start, чтобы обновить свои интересы."
+        )
+        return
+
+    if text_raw == TOPIC_CHOOSE_BUTTON_TEXT:
+        context.user_data["topics_mode"] = "main"
+        selected_topics: List[str] = context.user_data.get("selected_topics", [])
+        keyboard = build_main_topics_keyboard(selected_topics)
         sent = await update.message.reply_text(
-            "Выбери вид спорта, который тебе интересен.\n"
-            "Можно несколько. Кнопка «⬅️ Назад к общим темам» вернёт предыдущий список.",
+            "Вот общие темы. Нажимай на те, что тебе интересны.\n"
+            "Можно выбрать несколько. В любой момент жми «⬅️ Назад», чтобы вернуться к свободному вводу.",
             reply_markup=keyboard,
         )
         context.user_data["topics_keyboard_message_id"] = sent.message_id
         context.user_data["topics_keyboard_chat_id"] = sent.chat_id
         return
 
-    if text in MAIN_TOPICS:
+    if text_raw == START_READING_BUTTON_TEXT:
+        await finish_onboarding(update, context)
+        return
+
+    if text_raw == EXIT_TOPICS_BUTTON_TEXT:
+        context.user_data["topics_mode"] = None
+        context.user_data["topics_keyboard_message_id"] = None
+        context.user_data["topics_keyboard_chat_id"] = None
+        keyboard = ReplyKeyboardRemove()
+        await update.message.reply_text(
+            "Убрал клавиатуру тем. Можешь продолжить писать своими словами 🙂",
+            reply_markup=keyboard,
+        )
+        return
+
+    if text_raw == BACK_TO_MAIN_TOPICS_BUTTON_TEXT:
+        context.user_data["topics_mode"] = "main"
+        selected_topics = context.user_data.get("selected_topics", [])
+        keyboard = build_main_topics_keyboard(selected_topics)
+        sent = await update.message.reply_text(
+            "Вернул список общих тем. Можно выбирать дальше.",
+            reply_markup=keyboard,
+        )
+        context.user_data["topics_keyboard_message_id"] = sent.message_id
+        context.user_data["topics_keyboard_chat_id"] = sent.chat_id
+        return
+
+    text = strip_checkmark(text_raw)
+
+    topics_mode: Optional[str] = context.user_data.get("topics_mode")
+    selected_topics: List[str] = context.user_data.get("selected_topics", [])
+    keyboard_message_id = context.user_data.get("topics_keyboard_message_id")
+    keyboard_chat_id = context.user_data.get("topics_keyboard_chat_id")
+
+    # Подтемы спорта
+    if topics_mode == "sports" and text in SPORT_SUBTOPICS:
         selected = set(selected_topics)
         if text in selected:
             selected.remove(text)
@@ -1672,160 +1611,215 @@ if topics_mode == "main":
             )
         return
 
-# Свободный текст
-buffer: List[str] = context.user_data.get("profile_buffer", [])
-buffer.append(text_raw)
-context.user_data["profile_buffer"] = buffer
-
-logger.info(
-    "Onboarding free-text from user %s: %s (buffer size now %d)",
-    user.id,
-    text_raw,
-    len(buffer),
-)
-
-await update.message.reply_text(
-    "Записал 👍\n\n"
-    "Можешь добавить ещё сообщения с интересами или деталями.\n"
-    "Когда всё опишешь — просто отправь команду /done или нажми «Начать читать»."
-)
-async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-"""
-/done — конец онбординга: сохраняем raw_interests и в фоне строим structured_profile.
-"""
-if not update.message:
-return
-user = update.effective_user
-if not user:
-    await update.message.reply_text("Не получилось определить твой Telegram-профиль.")
-    return
-
-if not context.user_data.get("awaiting_profile"):
-    await update.message.reply_text(
-        "Сейчас я не собираю описание интересов.\n"
-        "Если хочешь обновить профиль, напиши /start."
-    )
-    return
-
-buffer: List[str] = context.user_data.get("profile_buffer", [])
-selected_topics: List[str] = context.user_data.get("selected_topics", [])
-
-parts: List[str] = []
-if buffer:
-    parts.append("\n\n".join(buffer).strip())
-
-if selected_topics:
-    unique_topics = sorted(set(selected_topics))
-    topics_block = "Выбранные темы:\n" + "\n".join(unique_topics)
-    parts.append(topics_block)
-
-raw_interests = "\n\n".join(parts).strip()
-
-if not raw_interests:
-    await update.message.reply_text(
-        "Похоже, ты ещё ничего не написал и не выбрал 🙈\n"
-        "Опиши, пожалуйста, в одном-двух сообщениях свои интересы и город "
-        "или выбери что-то из тем, а потом снова отправь /done или нажми «Начать читать»."
-    )
-    return
-
-ok = await upsert_user_profile(user.id, raw_interests)
-
-if not ok:
-    await update.message.reply_text(
-        "Не получилось сохранить профиль. Попробуй, пожалуйста, ещё раз чуть позже."
-    )
-    return
-
-context.user_data["awaiting_profile"] = False
-context.user_data["profile_buffer"] = []
-context.user_data["selected_topics"] = []
-context.user_data["topics_mode"] = None
-context.user_data["topics_keyboard_message_id"] = None
-context.user_data["topics_keyboard_chat_id"] = None
-
-await update.message.reply_text(
-    "Отлично, я запомнил твои интересы и выбранные темы 🙌\n\n"
-    "Дальше я в фоне попробую аккуратно структурировать профиль с помощью ИИ, "
-    "чтобы позже точнее подбирать тебе новости. Посмотреть профиль можно командой /me.",
-    reply_markup=ReplyKeyboardRemove(),
-)
-
-# Сразу после онбординга пробуем собрать и отправить первую ленту в фоне
-chat = update.effective_chat
-if chat:
-    application: Application = cast(Application, context.application)
-    try:
-        application.create_task(
-            generate_and_send_feed_for_user(
-                application,
-                user.id,
-                chat.id,
-                raw_interests,
-                structured_profile=None,
+    # Основные темы
+    if topics_mode == "main":
+        if text == "Спорт":
+            context.user_data["topics_mode"] = "sports"
+            selected_topics = context.user_data.get("selected_topics", [])
+            keyboard = build_sport_topics_keyboard(selected_topics)
+            sent = await update.message.reply_text(
+                "Выбери вид спорта, который тебе интересен.\n"
+                "Можно несколько. Кнопка «⬅️ Назад к общим темам» вернёт предыдущий список.",
+                reply_markup=keyboard,
             )
-        )
-    except Exception:
-        logger.exception("finish_onboarding: failed to schedule generate_and_send_feed_for_user")
+            context.user_data["topics_keyboard_message_id"] = sent.message_id
+            context.user_data["topics_keyboard_chat_id"] = sent.chat_id
+            return
 
-if not supabase:
-    logger.warning("Supabase is not configured, skip building structured_profile")
-    return
-if not OPENAI_API_KEY:
-    logger.warning("OPENAI_API_KEY is not set, skip building structured_profile")
-    return
+        if text in MAIN_TOPICS:
+            selected = set(selected_topics)
+            if text in selected:
+                selected.remove(text)
+            else:
+                selected.add(text)
+            context.user_data["selected_topics"] = list(selected)
 
-application: Application = cast(Application, context.application)
-try:
-    application.create_task(
-        asyncio.to_thread(build_and_save_structured_profile, user.id, raw_interests)
-    )
+            if keyboard_message_id and keyboard_chat_id:
+                await update_topics_keyboard_markup(
+                    context,
+                    keyboard_chat_id,
+                    keyboard_message_id,
+                    topics_mode,
+                    context.user_data["selected_topics"],
+                )
+            return
+
+    # Свободный текст
+    buffer: List[str] = context.user_data.get("profile_buffer", [])
+    buffer.append(text_raw)
+    context.user_data["profile_buffer"] = buffer
+
     logger.info(
-        "finish_onboarding: scheduled build_and_save_structured_profile for user_id=%s",
+        "Onboarding free-text from user %s: %s (buffer size now %d)",
         user.id,
+        text_raw,
+        len(buffer),
     )
-except Exception:
-    logger.exception("finish_onboarding: failed to schedule build_and_save_structured_profile")
-==========================
-Глобальный обработчик ошибок
-==========================
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-logger.exception("Exception while handling update: %s", context.error)
-try:
-    if isinstance(update, Update) and update.effective_chat:
-        await context.bot.send_message(
-            chat_id=update.effective_chat.id,
-            text="Что-то пошло не так, но мы уже смотрим в логи.",
+
+    await update.message.reply_text(
+        "Записал 👍\n\n"
+        "Можешь добавить ещё сообщения с интересами или деталями.\n"
+        "Когда всё опишешь — просто отправь команду /done или нажми «Начать читать»."
+    )
+
+
+async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /done — конец онбординга: сохраняем raw_interests и в фоне строим structured_profile.
+    После этого сразу показываем первую версию ленты (на основе fallback-профиля).
+    """
+    if not update.message:
+        return
+
+    user = update.effective_user
+    if not user:
+        await update.message.reply_text("Не получилось определить твой Telegram-профиль.")
+        return
+
+    if not context.user_data.get("awaiting_profile"):
+        await update.message.reply_text(
+            "Сейчас я не собираю описание интересов.\n"
+            "Если хочешь обновить профиль, напиши /start."
         )
-except Exception:
-    logger.exception("Failed to send error message to user")
-==========================
-Сборка и запуск приложения
-==========================
-def build_application() -> Application:
-application = ApplicationBuilder().token(BOT_TOKEN).build()
-application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("help", help_command))
-application.add_handler(CommandHandler("ping", ping))
-application.add_handler(CommandHandler("me", me))
-application.add_handler(CommandHandler("raw_profile", raw_profile_command))
-application.add_handler(CommandHandler("reset_profile", reset_profile_command))
-application.add_handler(CommandHandler("feed", feed))
-application.add_handler(CommandHandler("done", finish_onboarding))
+        return
 
-application.add_handler(
-    MessageHandler(
-        filters.TEXT & ~filters.COMMAND,
-        onboarding_message,
+    buffer: List[str] = context.user_data.get("profile_buffer", [])
+    selected_topics: List[str] = context.user_data.get("selected_topics", [])
+
+    parts: List[str] = []
+    if buffer:
+        parts.append("\n\n".join(buffer).strip())
+
+    if selected_topics:
+        unique_topics = sorted(set(selected_topics))
+        topics_block = "Выбранные темы:\n" + "\n".join(unique_topics)
+        parts.append(topics_block)
+
+    raw_interests = "\n\n".join(parts).strip()
+
+    if not raw_interests:
+        await update.message.reply_text(
+            "Похоже, ты ещё ничего не написал и не выбрал 🙈\n"
+            "Опиши, пожалуйста, в одном-двух сообщениях свои интересы и город "
+            "или выбери что-то из тем, а потом снова отправь /done или нажми «Начать читать»."
+        )
+        return
+
+    ok = await upsert_user_profile(user.id, raw_interests)
+
+    if not ok:
+        await update.message.reply_text(
+            "Не получилось сохранить профиль. Попробуй, пожалуйста, ещё раз чуть позже."
+        )
+        return
+
+    # Сбрасываем локальные флаги онбординга
+    context.user_data["awaiting_profile"] = False
+    context.user_data["profile_buffer"] = []
+    context.user_data["selected_topics"] = []
+    context.user_data["topics_mode"] = None
+    context.user_data["topics_keyboard_message_id"] = None
+    context.user_data["topics_keyboard_chat_id"] = None
+
+    await update.message.reply_text(
+        "Отлично, я запомнил твои интересы и выбранные темы 🙌\n\n"
+        "Собираю для тебя первую версию ленты.",
+        reply_markup=ReplyKeyboardRemove(),
     )
-)
 
-application.add_error_handler(error_handler)
+    # В фоне строим полноценный structured_profile (если есть Supabase + OpenAI)
+    if supabase and OPENAI_API_KEY:
+        application: Application = cast(Application, context.application)
+        try:
+            application.create_task(
+                asyncio.to_thread(build_and_save_structured_profile, user.id, raw_interests)
+            )
+            logger.info(
+                "finish_onboarding: scheduled build_and_save_structured_profile for user_id=%s",
+                user.id,
+            )
+        except Exception:
+            logger.exception("finish_onboarding: failed to schedule build_and_save_structured_profile")
 
-return application
+    # Для мгновенной отдачи ленты используем локальный fallback-профиль.
+    fallback_profile = _normalize_profile_dict(_build_fallback_profile_from_raw(raw_interests))
+
+    await _send_personalized_feed_from_profile(
+        chat_id=update.effective_chat.id,
+        user_id=user.id,
+        profile_dict=fallback_profile,
+        context=context,
+        reason="finish_onboarding",
+    )
+
+    if OPENAI_API_KEY:
+        await update.message.reply_text(
+            "Пока это черновая версия ленты по твоим выборам. "
+            "В фоне я донастрою профиль с помощью ИИ и следующие подборки будут точнее."
+        )
+
+
+# ==========================
+# Глобальный обработчик ошибок
+# ==========================
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Логируем любые неотловленные ошибки и пытаемся аккуратно сообщить пользователю.
+    """
+    logger.exception("Exception while handling update: %s", context.error)
+
+    try:
+        if isinstance(update, Update) and update.effective_chat:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="Что-то пошло не так, но мы уже смотрим в логи.",
+            )
+    except Exception:
+        logger.exception("Failed to send error message to user")
+
+
+# ==========================
+# Сборка и запуск приложения
+# ==========================
+
+def build_application() -> Application:
+    """
+    Регистрируем все хендлеры и собираем Application.
+    """
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Команды
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("ping", ping))
+    application.add_handler(CommandHandler("me", me))
+    application.add_handler(CommandHandler("feed", feed))
+    application.add_handler(CommandHandler("raw_profile", raw_profile_command))
+    application.add_handler(CommandHandler("reset_profile", reset_profile_command))
+    application.add_handler(CommandHandler("done", finish_onboarding))
+
+    # Любой текст во время онбординга
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            onboarding_message,
+        )
+    )
+
+    application.add_error_handler(error_handler)
+
+    return application
+
+
 def main() -> None:
-app = build_application()
-app.run_polling()
-if name == "main":
-main()
+    """
+    Точка входа — запускаем polling.
+    """
+    app = build_application()
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
 
