@@ -1087,7 +1087,10 @@ def _generate_cards_for_tags_via_openai_sync(
         "model": OPENAI_MODEL or "gpt-4.1-mini",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+            {
+                "role": "user",
+                "content": json.dumps(user_payload, ensure_ascii=False),
+            },
         ],
         "max_output_tokens": 1200,
         "temperature": 0.7,
@@ -1099,87 +1102,107 @@ def _generate_cards_for_tags_via_openai_sync(
     elapsed = time.monotonic() - started
     logger.info("OpenAI card generation call finished in %.2fs", elapsed)
 
-        if not resp_json:
+    # ----- проверка верхнего уровня ответа -----
+    if not resp_json:
         return []
 
     choices = resp_json.get("choices")
     if not isinstance(choices, list) or not choices:
-        raise ValueError("No choices in OpenAI response")
+        logger.error("No choices in OpenAI card generation response")
+        return []
 
     message = choices[0].get("message") or {}
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
-        raise ValueError("Empty content in OpenAI cards response")
+        logger.error("Empty content in OpenAI cards response")
+        return []
 
     logger.debug(
         "OpenAI cards raw content (first 200 chars): %s",
         content[:200].replace("\n", " "),
     )
 
-    # Пытаемся сначала строгий JSON
+    # ----- один try — только вокруг json.loads -----
+    raw_cards: List[Dict[str, Any]] = []
+
     try:
         parsed = json.loads(content)
-        if not isinstance(parsed, dict):
-            raise ValueError("Parsed card JSON is not an object")
-
-        items = parsed.get("items")
-        if not isinstance(items, list) or not items:
-            raise ValueError("No 'items' list in card JSON")
-
     except json.JSONDecodeError:
         # Кривой JSON — пробуем вытащить карточки вручную
         logger.exception(
             "Failed to parse OpenAI card generation response as JSON. "
             "Trying to salvage items from raw text."
         )
-        items = _parse_openai_cards_from_text(content)
-        if not items:
+        raw_cards = _parse_openai_cards_from_text(content)
+        if not raw_cards:
             logger.error("Salvage parser did not find any valid card items.")
             return []
+        logger.warning(
+            "Salvage parser recovered %d card items from broken JSON.",
+            len(raw_cards),
+        )
+    else:
+        if not isinstance(parsed, dict):
+            logger.error("Parsed card JSON is not an object")
+            return []
+
+        # Поддерживаем оба варианта: {'cards': [...]} и {'items': [...]}
+        items = parsed.get("cards") or parsed.get("items")
+        if not isinstance(items, list) or not items:
+            logger.error("No 'cards' or 'items' list in card JSON")
+            return []
+
+        raw_cards = items
+
+    # ----- нормализуем карточки в наш внутренний формат -----
+    result: List[Dict[str, Any]] = []
+    for c in raw_cards:
+        if not isinstance(c, dict):
+            continue
+
+        title = str(c.get("title", "")).strip()
+        # В salvage-режиме текст может лежать в поле 'summary'
+        body = str(c.get("body") or c.get("summary") or "").strip()
+        if not title or not body:
+            continue
+
+        card_tags = c.get("tags")
+        if isinstance(card_tags, list):
+            tags_list = card_tags
         else:
-            logger.warning(
-                "Salvage parser recovered %d card items from broken JSON.",
-                len(items),
-            )
+            # salvage-парсер может положить один тег в 'tag' или 'topic'
+            single_tag = c.get("tag") or c.get("topic")
+            if single_tag:
+                tags_list = [single_tag]
+            else:
+                tags_list = tags
 
-    # дальше оставляем всё как было: нормализуем items и т.д.
+        category = c.get("category") or c.get("topic") or None
 
-        result: List[Dict[str, Any]] = []
-        for c in raw_cards:
-            if not isinstance(c, dict):
-                continue
-            title = str(c.get("title", "")).strip()
-            body = str(c.get("body", "")).strip()
-            if not title or not body:
-                continue
+        importance_raw = c.get("importance_score", c.get("importance", 1.0))
+        try:
+            importance = float(importance_raw)
+        except (TypeError, ValueError):
+            importance = 1.0
 
-            card_tags = c.get("tags") or tags
-            if not isinstance(card_tags, list):
-                card_tags = tags
+        result.append(
+            {
+                "source_type": "llm",
+                "source_ref": None,
+                "title": title,
+                "body": body,
+                "tags": [str(t).strip() for t in tags_list if t],
+                "category": category,
+                "language": language,
+                "importance_score": importance,
+                "meta": {
+                    "generated_for_tags": tags,
+                },
+            }
+        )
 
-            category = c.get("category") or None
-            try:
-                importance = float(c.get("importance_score", 1.0))
-            except (TypeError, ValueError):
-                importance = 1.0
+    return result
 
-            result.append(
-                {
-                    "source_type": "llm",
-                    "source_ref": None,
-                    "title": title,
-                    "body": body,
-                    "tags": [str(t).strip() for t in card_tags if t],
-                    "category": category,
-                    "language": language,
-                    "importance_score": importance,
-                    "meta": {
-                        "generated_for_tags": tags,
-                    },
-                }
-            )
-
-        return result
     except Exception:
         logger.exception("Failed to parse OpenAI card generation response")
         return []
