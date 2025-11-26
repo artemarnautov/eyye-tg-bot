@@ -5,6 +5,7 @@ import asyncio
 import json
 import urllib.request
 import urllib.error
+import time
 from typing import Optional, Any, Dict, List, Tuple, cast
 from datetime import datetime, timezone, timedelta
 
@@ -49,6 +50,11 @@ OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
 
 # Простейший rate-limit для генерации ленты (в секундах)
 FEED_OPENAI_COOLDOWN_SECONDS = int(os.getenv("FEED_OPENAI_COOLDOWN_SECONDS", "60"))
+
+# === Новые константы для фида ===
+FEED_CARDS_LIMIT = 15          # сколько карточек отправляем за один показ ленты
+FEED_MAX_CARD_AGE_HOURS = 48   # насколько свежие карточки считаем актуальными
+DEFAULT_FEED_TAGS = ["world_news", "business", "tech", "uk_students"]
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN or TELEGRAM_BOT_TOKEN is not set in environment variables")
@@ -795,7 +801,7 @@ def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
 
 
 # ==========================
-# OpenAI: генерация новостной ленты
+# Лента: карточки из таблицы cards
 # ==========================
 
 # Память rate-limit для генерации ленты (в памяти процесса)
@@ -804,7 +810,7 @@ _last_feed_openai_call: Dict[int, datetime] = {}
 
 def _is_allowed_feed_openai_call(user_id: int) -> bool:
     """
-    Проверяем, не слишком ли часто мы дергаем OpenAI для генерации ленты.
+    Проверяем, не слишком ли часто мы дергаем OpenAI для генерации НОВЫХ карточек.
     """
     if FEED_OPENAI_COOLDOWN_SECONDS <= 0:
         return True
@@ -823,225 +829,333 @@ def _is_allowed_feed_openai_call(user_id: int) -> bool:
     return False
 
 
-def _build_fallback_feed_from_profile(profile: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]]:
+def get_user_topic_weights(user_id: int) -> Dict[str, float]:
     """
-    Простейший fallback, если OpenAI не ответил.
-    Строим карточки на основе тем профиля.
+    Читаем таблицу user_topic_weights и возвращаем {tag: weight}.
+    Если Supabase не настроен или запрос упал — возвращаем пустой словарь.
     """
-    topics = profile.get("topics") or []
-    if not isinstance(topics, list):
-        topics = []
+    if not supabase:
+        return {}
 
-    # сортируем по weight убыванию
-    sorted_topics: List[Dict[str, Any]] = []
-    for t in topics:
-        if not isinstance(t, dict):
+    try:
+        resp = (
+            supabase.table("user_topic_weights")
+            .select("tag, weight")
+            .eq("user_id", user_id)
+            .execute()
+        )
+    except Exception:
+        logger.exception("Error loading user_topic_weights for user_id=%s", user_id)
+        return {}
+
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+    if not data:
+        return {}
+
+    result: Dict[str, float] = {}
+    for row in data:
+        tag = row.get("tag")
+        if not tag:
             continue
         try:
-            w = float(t.get("weight", 1.0))
+            w = float(row.get("weight", 0.0))
         except (TypeError, ValueError):
-            w = 1.0
-        t_copy = dict(t)
-        t_copy["_weight"] = w
-        sorted_topics.append(t_copy)
-
-    sorted_topics.sort(key=lambda x: x.get("_weight", 1.0), reverse=True)
-
-    items: List[Dict[str, Any]] = []
-    if not sorted_topics:
-        items.append(
-            {
-                "id": "fallback-0",
-                "title": "Ещё мало данных о твоих интересах",
-                "summary": "Я уже запомнил твой профиль и дальше буду подбирать новости под тебя. "
-                "Продолжай пользоваться ботом, чтобы лента становилась точнее.",
-                "topic": None,
-                "tag": None,
-                "importance": 0.5,
-            }
-        )
-        return items
-
-    for idx, t in enumerate(sorted_topics[:limit]):
-        name = str(t.get("name") or "интересная тема")
-        cat = t.get("category")
-        tag = cat or name
-        items.append(
-            {
-                "id": f"fallback-{idx+1}",
-                "title": f"Свежие истории по теме: {name.capitalize()}",
-                "summary": (
-                    "Я буду подбирать для тебя новости и истории по этой теме. "
-                    "Чем больше ты будешь читать и взаимодействовать с лентой, тем точнее станет подбор."
-                ),
-                "topic": name,
-                "tag": tag,
-                "importance": float(t.get("_weight", 1.0)),
-            }
-        )
-
-    return items
+            w = 0.0
+        if w != 0.0:
+            result[str(tag)] = w
+    return result
 
 
-def _call_openai_generate_feed_sync(structured_profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _extract_interest_tags_from_profile(profile_dict: Dict[str, Any]) -> List[str]:
     """
-    Генерация массива карточек новостей на основе structured_profile.
-    Возвращает список словарей-элементов ленты.
+    Берём interests_as_tags из structured_profile / fallback-профиля.
+    """
+    tags = profile_dict.get("interests_as_tags") or []
+    if not isinstance(tags, list):
+        tags = []
+    normalized: List[str] = []
+    for t in tags:
+        s = str(t).strip()
+        if s:
+            normalized.append(s)
+    # Убираем дубликаты, сохраняя порядок
+    return list(dict.fromkeys(normalized))
+
+
+def fetch_candidate_cards(tags: List[str], limit: int) -> List[Dict[str, Any]]:
+    """
+    Берём кандидатов из таблицы cards.
+    - Если есть теги — берём карточки, у которых tags пересекаются с нашими тегами.
+    - Если тегов нет — просто свежие карточки.
+    """
+    if not supabase:
+        logger.warning("Supabase is not configured, fetch_candidate_cards -> []")
+        return []
+
+    try:
+        query = supabase.table("cards").select("*").eq("is_active", True)
+
+        if tags:
+            # overlaps(tags, tags_array) -> оператор && в Postgres
+            query = query.overlaps("tags", tags)
+
+        resp = query.order("created_at", desc=True).limit(limit).execute()
+    except Exception:
+        logger.exception("Error fetching candidate cards from Supabase")
+        return []
+
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+    return data or []
+
+
+def _score_cards_for_user(
+    cards: List[Dict[str, Any]],
+    base_tags: List[str],
+    topic_weights: Dict[str, float],
+) -> List[Dict[str, Any]]:
+    """
+    Присваиваем скор каждой карточке: важность + совпадение по тегам + динамические веса + свежесть.
+    """
+    now = datetime.now(timezone.utc)
+    base_tag_set = set(base_tags)
+
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+
+    for card in cards:
+        card_tags = card.get("tags") or []
+        if not isinstance(card_tags, list):
+            card_tags = []
+
+        try:
+            importance = float(card.get("importance_score") or 1.0)
+        except (TypeError, ValueError):
+            importance = 1.0
+
+        # бонус за совпадение с базовыми тегами из профиля
+        profile_bonus = 0.0
+        for t in card_tags:
+            if t in base_tag_set:
+                profile_bonus += 0.3
+
+        # бонус по динамическим весам
+        dyn_bonus = 0.0
+        for t in card_tags:
+            dyn_bonus += topic_weights.get(t, 0.0)
+
+        # бонус за свежесть
+        recency_bonus = 0.0
+        created_at = card.get("created_at")
+        if isinstance(created_at, str):
+            try:
+                dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+                age_hours = (now - dt).total_seconds() / 3600.0
+                if age_hours < FEED_MAX_CARD_AGE_HOURS:
+                    recency_bonus = (FEED_MAX_CARD_AGE_HOURS - age_hours) / FEED_MAX_CARD_AGE_HOURS
+            except Exception:
+                pass
+
+        score = importance + profile_bonus + dyn_bonus + recency_bonus
+        scored.append((score, card))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [c for score, c in scored]
+
+
+def _generate_cards_for_tags_via_openai_sync(
+    tags: List[str],
+    language: str,
+    count: int,
+) -> List[Dict[str, Any]]:
+    """
+    Синхронная генерация новых карточек через OpenAI в формате JSON.
+    Вызывается в отдельном потоке.
     """
     if not OPENAI_API_KEY:
-        logger.warning("OPENAI_API_KEY is not set, using fallback feed")
-        return _build_fallback_feed_from_profile(structured_profile)
+        logger.warning("OPENAI_API_KEY is not set, skip OpenAI card generation")
+        return []
 
-    system_prompt = """
-Ты помогаешь персональному новостному сервису EYYE.
-На основе профиля интересов пользователя тебе нужно придумать несколько (5–10) новостных карточек.
+    if not tags:
+        tags = DEFAULT_FEED_TAGS
 
-Это пока МАКЕТЫ карточек, не реальные новости, но:
-- они должны ощущаться как настоящие новости,
-- быть короткими, цепляющими и разнообразными,
-- соответствовать интересам пользователя.
+    system_prompt = (
+        "Ты – движок новостной ленты EYYE.\n"
+        "Твоя задача – сгенерировать короткие новостные карточки в одном стиле.\n"
+        "Каждая карточка: заголовок и 2–4 абзаца текста.\n"
+        "Пиши на языке, указанном в параметрах (ru или en).\n"
+        "Отвечай строго валидным JSON без лишнего текста."
+    )
 
-ФОРМАТ ОТВЕТА — СТРОГО JSON:
-
-{
-  "items": [
-    {
-      "id": "string",
-      "title": "string",
-      "summary": "string",
-      "topic": "string | null",
-      "tag": "string | null",
-      "importance": number
-    },
-    ...
-  ]
-}
-
-Где:
-- id — короткий стабильный идентификатор карточки (можешь использовать "item_1", "item_2", ...).
-- title — короткий заголовок (до ~80 символов).
-- summary — 1–2 предложения, чуть подробнее о сути.
-- topic — человекочитаемое название темы (можно на русском).
-- tag — короткий тег латиницей ("startups", "premier_league", "uk_universities").
-- importance — число от 0.0 до 1.0 (насколько эта карточка важна для пользователя).
-
-ТРЕБОВАНИЯ:
-- Никакого текста вне JSON.
-- От 5 до 10 элементов в массиве items.
-- Не дублируй одну и ту же идею; делай карточки разноформатными и по разным темам из профиля.
-"""
-
-    user_content = json.dumps(structured_profile, ensure_ascii=False)
+    user_payload = {
+        "language": language,
+        "count": count,
+        "tags": tags,
+        "requirements": [
+            "Карточки должны быть интересными и понятными.",
+            "Не выдумывай факты про конкретных людей, лучше обобщай тенденции.",
+            "Избегай кликбейта, но делай заголовки цепляющими.",
+        ],
+        "output_format": {
+            "cards": [
+                {
+                    "title": "string",
+                    "body": "string",
+                    "tags": ["string"],
+                    "category": "string",
+                    "importance_score": 1.0,
+                }
+            ]
+        },
+    }
 
     payload: Dict[str, Any] = {
         "model": OPENAI_MODEL or "gpt-4.1-mini",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ],
-        "max_output_tokens": 900,
+        "max_output_tokens": 1200,
         "temperature": 0.7,
         "response_format": {"type": "json_object"},
     }
 
+    started = time.monotonic()
     resp_json = call_openai_chat(payload)
+    elapsed = time.monotonic() - started
+    logger.info("OpenAI card generation call finished in %.2fs", elapsed)
+
     if not resp_json:
-        logger.warning("OpenAI did not return response JSON for feed. Using fallback feed.")
-        return _build_fallback_feed_from_profile(structured_profile)
+        return []
 
     try:
         choices = resp_json.get("choices")
         if not isinstance(choices, list) or not choices:
-            raise ValueError("No choices in OpenAI response for feed")
+            raise ValueError("No choices in OpenAI response")
 
         message = choices[0].get("message") or {}
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
-            raise ValueError("Empty content in OpenAI feed response")
-
-        logger.debug(
-            "OpenAI feed raw content (first 200 chars): %s",
-            content[:200].replace("\n", " "),
-        )
+            raise ValueError("Empty content in OpenAI card generation response")
 
         parsed = json.loads(content)
         if not isinstance(parsed, dict):
-            raise ValueError("Parsed feed JSON is not an object")
+            raise ValueError("Parsed JSON is not an object")
 
-        items = parsed.get("items")
-        if not isinstance(items, list) or not items:
-            raise ValueError("No 'items' list in feed JSON")
+        raw_cards = parsed.get("cards")
+        if not isinstance(raw_cards, list):
+            raise ValueError("No 'cards' list in JSON")
 
-        normalized_items: List[Dict[str, Any]] = []
-        for idx, it in enumerate(items):
-            if not isinstance(it, dict):
+        result: List[Dict[str, Any]] = []
+        for c in raw_cards:
+            if not isinstance(c, dict):
                 continue
-            item_id = str(it.get("id") or f"item_{idx+1}")
-            title = str(it.get("title") or "").strip()
-            summary = str(it.get("summary") or "").strip()
-            topic = it.get("topic")
-            tag = it.get("tag")
+            title = str(c.get("title", "")).strip()
+            body = str(c.get("body", "")).strip()
+            if not title or not body:
+                continue
+
+            card_tags = c.get("tags") or tags
+            if not isinstance(card_tags, list):
+                card_tags = tags
+
+            category = c.get("category") or None
             try:
-                importance = float(it.get("importance", 1.0))
+                importance = float(c.get("importance_score", 1.0))
             except (TypeError, ValueError):
                 importance = 1.0
 
-            if not title and not summary:
-                continue
-
-            normalized_items.append(
+            result.append(
                 {
-                    "id": item_id,
-                    "title": title or "Новость для тебя",
-                    "summary": summary or "Короткая новость по твоим интересам.",
-                    "topic": topic,
-                    "tag": tag,
-                    "importance": importance,
+                    "source_type": "llm",
+                    "source_ref": None,
+                    "title": title,
+                    "body": body,
+                    "tags": [str(t).strip() for t in card_tags if t],
+                    "category": category,
+                    "language": language,
+                    "importance_score": importance,
+                    "meta": {
+                        "generated_for_tags": tags,
+                    },
                 }
             )
 
-        if not normalized_items:
-            raise ValueError("All feed items were invalid after normalization")
-
-        return normalized_items
+        return result
     except Exception:
-        logger.exception("Failed to parse OpenAI feed response. Using fallback feed.")
-        return _build_fallback_feed_from_profile(structured_profile)
+        logger.exception("Failed to parse OpenAI card generation response")
+        return []
 
 
-def _format_feed_for_message(feed_items: List[Dict[str, Any]]) -> str:
+def _insert_cards_into_db(cards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
-    Собираем текстовое сообщение с несколькими карточками ленты.
+    Вставка карточек в таблицу cards. Возвращаем то, что вернул Supabase.
     """
-    if not feed_items:
-        return (
-            "Пока у меня нет достаточно данных, чтобы собрать ленту. "
-            "Попробуй ещё раз чуть позже или дополни профиль через /start."
+    if not cards:
+        return []
+    if not supabase:
+        logger.warning("Supabase is not configured, skip inserting cards into DB")
+        return []
+
+    try:
+        resp = supabase.table("cards").insert(cards).execute()
+    except Exception:
+        logger.exception("Error inserting cards into DB")
+        return []
+
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+    data = data or []
+    logger.info("Inserted %d cards into DB", len(data))
+    return data
+
+
+def _get_or_generate_personalized_cards_sync(
+    user_id: int,
+    profile_dict: Dict[str, Any],
+    allow_openai_generation: bool,
+    language: str = "ru",
+) -> List[Dict[str, Any]]:
+    """
+    Синхронная логика:
+    1) Берём теги интересов пользователя.
+    2) Берём динамические веса.
+    3) Берём кандидатов из cards.
+    4) Если карточек мало и не заблокирован rate-limit — генерируем новые и кладём в БД.
+    5) Считаем скор и возвращаем TOP-N.
+    """
+    if not supabase:
+        logger.warning("Supabase is not configured, cannot build personalized cards")
+        return []
+
+    base_tags = _extract_interest_tags_from_profile(profile_dict)
+    if not base_tags:
+        base_tags = DEFAULT_FEED_TAGS
+
+    topic_weights = get_user_topic_weights(user_id)
+
+    candidates = fetch_candidate_cards(base_tags, limit=FEED_CARDS_LIMIT * 3)
+
+    if allow_openai_generation and len(candidates) < FEED_CARDS_LIMIT:
+        need = max(FEED_CARDS_LIMIT * 2 - len(candidates), FEED_CARDS_LIMIT)
+        logger.info(
+            "Not enough cards in DB for user_id=%s (have %d). Generating ~%d new cards via OpenAI.",
+            user_id,
+            len(candidates),
+            need,
         )
+        new_cards = _generate_cards_for_tags_via_openai_sync(base_tags, language, need)
+        inserted = _insert_cards_into_db(new_cards)
+        candidates.extend(inserted)
 
-    lines: List[str] = []
-    lines.append("Готово! Вот твоя персональная лента 👇")
-    lines.append("")
+    if not candidates:
+        return []
 
-    for idx, item in enumerate(feed_items, start=1):
-        title = item.get("title") or "Новость для тебя"
-        summary = item.get("summary") or ""
-        topic = item.get("topic")
-        tag = item.get("tag")
-
-        lines.append(f"{idx}. {title}")
-        if summary:
-            lines.append(summary)
-        meta_parts: List[str] = []
-        if topic:
-            meta_parts.append(f"тема: {topic}")
-        if tag:
-            meta_parts.append(f"тег: {tag}")
-        if meta_parts:
-            lines.append(" · ".join(meta_parts))
-        lines.append("")  # пустая строка между карточками
-
-    return "\n".join(lines)
+    ranked = _score_cards_for_user(candidates, base_tags, topic_weights)
+    return ranked[:FEED_CARDS_LIMIT]
 
 
 async def _send_personalized_feed_from_profile(
@@ -1052,27 +1166,64 @@ async def _send_personalized_feed_from_profile(
     reason: str = "default",
 ) -> None:
     """
-    Генерация и отправка ленты из structured_profile (или fallback-профиля).
+    Отправка ленты карточек:
+    - берём/генерируем персональные карточки через таблицу cards;
+    - отправляем каждую отдельным сообщением.
     """
     logger.info(
-        "Sending personalized feed for user_id=%s (reason=%s)",
+        "Sending personalized feed (cards) for user_id=%s (reason=%s)",
         user_id,
         reason,
     )
 
-    # проверка rate-limit для OpenAI
-    if _is_allowed_feed_openai_call(user_id):
-        feed_items = await asyncio.to_thread(_call_openai_generate_feed_sync, profile_dict)
-    else:
-        logger.info("Feed OpenAI call is rate-limited for user_id=%s, using fallback feed only", user_id)
-        feed_items = _build_fallback_feed_from_profile(profile_dict)
+    allow_openai = _is_allowed_feed_openai_call(user_id)
 
-    text = _format_feed_for_message(feed_items)
+    cards = await asyncio.to_thread(
+        _get_or_generate_personalized_cards_sync,
+        user_id,
+        profile_dict,
+        allow_openai,
+        "ru",
+    )
 
-    try:
-        await context.bot.send_message(chat_id=chat_id, text=text)
-    except Exception:
-        logger.exception("Failed to send personalized feed to chat_id=%s", chat_id)
+    if not cards:
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "Пока не смог собрать для тебя ленту. "
+                    "Попробуй ещё раз чуть позже — я уже готовлю контент."
+                ),
+            )
+        except Exception:
+            logger.exception("Failed to send 'no cards' message to user_id=%s", user_id)
+        return
+
+    for card in cards:
+        title = (card.get("title") or "").strip()
+        body = (card.get("body") or "").strip()
+
+        parts: List[str] = []
+        if title:
+            parts.append(f"📰 <b>{_truncate(title, 200)}</b>")
+        if body:
+            parts.append("")
+            parts.append(_truncate(body, 2000))
+
+        text = "\n".join(parts).strip()
+        if not text:
+            continue
+
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode="HTML",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to send card id=%s to user_id=%s", card.get("id"), user_id
+            )
 
 
 async def _load_effective_profile(
@@ -1846,4 +1997,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
