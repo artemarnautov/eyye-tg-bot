@@ -1203,6 +1203,7 @@ def _generate_cards_for_tags_via_openai_sync(
 
     return result
 
+
     except Exception:
         logger.exception("Failed to parse OpenAI card generation response")
         return []
