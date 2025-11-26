@@ -6,6 +6,7 @@ import json
 import urllib.request
 import urllib.error
 import time
+import re
 from typing import Optional, Any, Dict, List, Tuple, cast
 from datetime import datetime, timezone, timedelta
 
@@ -963,6 +964,73 @@ def _score_cards_for_user(
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [c for score, c in scored]
+# ==========================
+# Разбор "кривого" JSON от OpenAI для карточек
+# ==========================
+
+# Ищем объекты вида { "id": "...", ... } в тексте,
+# даже если общий JSON наверху поломан.
+CARD_OBJECT_RE = re.compile(
+    r'\{\s*"id"\s*:\s*"(?P<id>[^"]+)"(?P<body>.*?)\}',
+    re.DOTALL,
+)
+
+
+def _parse_openai_cards_from_text(content: str) -> List[Dict[str, Any]]:
+    """
+    Пытаемся вытащить карточки из "кривого" JSON-текста.
+    Ищем отдельные объекты с полями id/title/summary/topic/tag/importance.
+    Если ничего не нашли — возвращаем пустой список.
+    """
+    if not content:
+        return []
+
+    cards: List[Dict[str, Any]] = []
+
+    def _extract_str(block: str, field: str) -> Optional[str]:
+        # "field": "значение"
+        m = re.search(rf'"{field}"\s*:\s*"([^"]*)"', block)
+        if m:
+            return m.group(1).strip() or None
+        return None
+
+    def _extract_float(block: str, field: str, default: float = 1.0) -> float:
+        # "field": 0.87
+        m = re.search(rf'"{field}"\s*:\s*([0-9]+(\.[0-9]+)?)', block)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return default
+        return default
+
+    for idx, m in enumerate(CARD_OBJECT_RE.finditer(content), start=1):
+        block = m.group(0)
+
+        card_id = m.group("id") or f"item_{idx}"
+
+        title = _extract_str(block, "title") or "Новость для тебя"
+        summary = _extract_str(block, "summary") or ""
+        topic = _extract_str(block, "topic")
+        tag = _extract_str(block, "tag")
+        importance = _extract_float(block, "importance", 1.0)
+
+        # если вообще нет содержания — пропускаем
+        if not title and not summary:
+            continue
+
+        cards.append(
+            {
+                "id": card_id,
+                "title": title,
+                "summary": summary,
+                "topic": topic,
+                "tag": tag,
+                "importance": importance,
+            }
+        )
+
+    return cards
 
 
 def _generate_cards_for_tags_via_openai_sync(
@@ -1040,13 +1108,43 @@ def _generate_cards_for_tags_via_openai_sync(
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Empty content in OpenAI card generation response")
 
+           # ...
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        raise ValueError("Empty content in OpenAI cards response")
+
+    logger.debug(
+        "OpenAI cards raw content (first 200 chars): %s",
+        content[:200].replace("\n", " "),
+    )
+
+    # Пытаемся сначала строгий JSON
+    try:
         parsed = json.loads(content)
         if not isinstance(parsed, dict):
-            raise ValueError("Parsed JSON is not an object")
+            raise ValueError("Parsed card JSON is not an object")
 
-        raw_cards = parsed.get("cards")
-        if not isinstance(raw_cards, list):
-            raise ValueError("No 'cards' list in JSON")
+        items = parsed.get("items")
+        if not isinstance(items, list) or not items:
+            raise ValueError("No 'items' list in card JSON")
+
+    except json.JSONDecodeError:
+        # Кривой JSON — пробуем вытащить карточки вручную
+        logger.exception(
+            "Failed to parse OpenAI card generation response as JSON. "
+            "Trying to salvage items from raw text."
+        )
+        items = _parse_openai_cards_from_text(content)
+        if not items:
+            logger.error("Salvage parser did not find any valid card items.")
+            return []
+        else:
+            logger.warning(
+                "Salvage parser recovered %d card items from broken JSON.",
+                len(items),
+            )
+    # дальше оставляем всё как было: нормализуем items и т.д.
 
         result: List[Dict[str, Any]] = []
         for c in raw_cards:
