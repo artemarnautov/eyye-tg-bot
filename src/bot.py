@@ -1087,10 +1087,7 @@ def _generate_cards_for_tags_via_openai_sync(
         "model": OPENAI_MODEL or "gpt-4.1-mini",
         "messages": [
             {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": json.dumps(user_payload, ensure_ascii=False),
-            },
+            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ],
         "max_output_tokens": 1200,
         "temperature": 0.7,
@@ -1102,7 +1099,8 @@ def _generate_cards_for_tags_via_openai_sync(
     elapsed = time.monotonic() - started
     logger.info("OpenAI card generation call finished in %.2fs", elapsed)
 
-    # ----- проверка верхнего уровня ответа -----
+    # ---- Дальше НЕТ лишних отступов и "висящих" try/except ----
+
     if not resp_json:
         return []
 
@@ -1122,11 +1120,20 @@ def _generate_cards_for_tags_via_openai_sync(
         content[:200].replace("\n", " "),
     )
 
-    # ----- один try — только вокруг json.loads -----
-    raw_cards: List[Dict[str, Any]] = []
-
+    # Пытаемся сначала строгий JSON
     try:
         parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            raise ValueError("Parsed card JSON is not an object")
+
+        # Пытаемся вытащить либо cards, либо items
+        raw_cards = parsed.get("cards")
+        if raw_cards is None:
+            raw_cards = parsed.get("items")
+
+        if not isinstance(raw_cards, list) or not raw_cards:
+            raise ValueError("No 'cards' or 'items' list in card JSON")
+
     except json.JSONDecodeError:
         # Кривой JSON — пробуем вытащить карточки вручную
         logger.exception(
@@ -1141,47 +1148,31 @@ def _generate_cards_for_tags_via_openai_sync(
             "Salvage parser recovered %d card items from broken JSON.",
             len(raw_cards),
         )
-    else:
-        if not isinstance(parsed, dict):
-            logger.error("Parsed card JSON is not an object")
-            return []
+    except Exception:
+        # Любая другая ошибка парсинга
+        logger.exception("Failed to parse OpenAI card generation response")
+        return []
 
-        # Поддерживаем оба варианта: {'cards': [...]} и {'items': [...]}
-        items = parsed.get("cards") or parsed.get("items")
-        if not isinstance(items, list) or not items:
-            logger.error("No 'cards' or 'items' list in card JSON")
-            return []
-
-        raw_cards = items
-
-    # ----- нормализуем карточки в наш внутренний формат -----
+    # Нормализуем карточки в внутренний формат
     result: List[Dict[str, Any]] = []
     for c in raw_cards:
         if not isinstance(c, dict):
             continue
 
         title = str(c.get("title", "")).strip()
-        # В salvage-режиме текст может лежать в поле 'summary'
+        # salvage-парсер может использовать summary вместо body
         body = str(c.get("body") or c.get("summary") or "").strip()
         if not title or not body:
             continue
 
-        card_tags = c.get("tags")
-        if isinstance(card_tags, list):
-            tags_list = card_tags
-        else:
-            # salvage-парсер может положить один тег в 'tag' или 'topic'
-            single_tag = c.get("tag") or c.get("topic")
-            if single_tag:
-                tags_list = [single_tag]
-            else:
-                tags_list = tags
+        # tags или одиночный tag
+        card_tags = c.get("tags") or c.get("tag") or tags
+        if not isinstance(card_tags, list):
+            card_tags = [str(card_tags)] if card_tags else tags
 
         category = c.get("category") or c.get("topic") or None
-
-        importance_raw = c.get("importance_score", c.get("importance", 1.0))
         try:
-            importance = float(importance_raw)
+            importance = float(c.get("importance_score", c.get("importance", 1.0)))
         except (TypeError, ValueError):
             importance = 1.0
 
@@ -1191,7 +1182,7 @@ def _generate_cards_for_tags_via_openai_sync(
                 "source_ref": None,
                 "title": title,
                 "body": body,
-                "tags": [str(t).strip() for t in tags_list if t],
+                "tags": [str(t).strip() for t in card_tags if t],
                 "category": category,
                 "language": language,
                 "importance_score": importance,
@@ -1202,6 +1193,7 @@ def _generate_cards_for_tags_via_openai_sync(
         )
 
     return result
+
 
 
     except Exception:
