@@ -727,6 +727,7 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Dict[str, Any]:
 
 
 
+
 def build_and_save_structured_profile(user_id: int, raw_interests: str) -> None:
     """
     Строит structured_profile (через OpenAI или fallback) и сохраняет в Supabase.
