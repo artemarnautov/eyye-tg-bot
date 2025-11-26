@@ -1099,14 +1099,13 @@ def _generate_cards_for_tags_via_openai_sync(
     elapsed = time.monotonic() - started
     logger.info("OpenAI card generation call finished in %.2fs", elapsed)
 
-    if not resp_json:
+        if not resp_json:
         return []
 
-    try:
-        choices = resp_json.get("choices")
-        if not isinstance(choices, list) or not choices:
-            raise ValueError("No choices in OpenAI response")
-            
+    choices = resp_json.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("No choices in OpenAI response")
+
     message = choices[0].get("message") or {}
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
@@ -1142,6 +1141,7 @@ def _generate_cards_for_tags_via_openai_sync(
                 "Salvage parser recovered %d card items from broken JSON.",
                 len(items),
             )
+
     # дальше оставляем всё как было: нормализуем items и т.д.
 
         result: List[Dict[str, Any]] = []
