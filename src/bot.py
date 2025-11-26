@@ -279,26 +279,50 @@ async def load_user_from_supabase(telegram_id: int) -> Optional[dict]:
 async def load_user_profile(telegram_id: int) -> Optional[Dict[str, Any]]:
     """
     Профиль пользователя из user_profiles.
+
+    Важно:
+    - Не используем .single(), чтобы не ловить PGRST116,
+      когда профиль ещё не создан (0 строк).
+    - Возвращаем либо dict с профилем, либо None.
     """
     if not supabase:
         logger.warning("Supabase client is not configured, skip load_user_profile")
         return None
 
     try:
-        result = (
+        resp = (
             supabase.table("user_profiles")
             .select("*")
             .eq("user_id", telegram_id)
-            .single()
+            .limit(1)
             .execute()
         )
-        data = getattr(result, "data", None)
-        if isinstance(data, list):
-            return data[0] if data else None
-        return data
     except Exception as e:
         logger.exception("Error loading user profile from Supabase: %s", e)
         return None
+
+    # В supabase-py результат обычно лежит в .data, иногда в .model
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+
+    if not data:
+        # Нормальная ситуация: пользователь ещё не проходил онбординг
+        logger.info("No user_profile row yet for user_id=%s", telegram_id)
+        return None
+
+    if isinstance(data, list):
+        return data[0]
+
+    if isinstance(data, dict):
+        return data
+
+    logger.warning(
+        "Unexpected response format from user_profiles for user_id=%s: %r",
+        telegram_id,
+        data,
+    )
+    return None
 
 
 async def upsert_user_profile(
