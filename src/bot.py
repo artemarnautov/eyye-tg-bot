@@ -703,7 +703,8 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Dict[str, Any]:
         if not isinstance(choices, list) or not choices:
             raise ValueError("No choices in OpenAI response")
 
-        message = choices[0].get("message") or {}
+        first_choice = choices[0] or {}
+        message = first_choice.get("message") or {}
         content = message.get("content")
         if not isinstance(content, str) or not content.strip():
             raise ValueError("Empty content in OpenAI response")
@@ -718,6 +719,7 @@ def _call_openai_structured_profile_sync(raw_interests: str) -> Dict[str, Any]:
             raise ValueError("Parsed JSON is not an object")
 
         return _normalize_profile_dict(parsed)
+
     except Exception:
         logger.exception("Failed to parse OpenAI structured_profile response. Using fallback.")
         fallback = _build_fallback_profile_from_raw(raw_interests)
