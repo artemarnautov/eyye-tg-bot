@@ -1106,13 +1106,7 @@ def _generate_cards_for_tags_via_openai_sync(
         choices = resp_json.get("choices")
         if not isinstance(choices, list) or not choices:
             raise ValueError("No choices in OpenAI response")
-
-        message = choices[0].get("message") or {}
-        content = message.get("content")
-        if not isinstance(content, str) or not content.strip():
-            raise ValueError("Empty content in OpenAI card generation response")
-
-           # ...
+            
     message = choices[0].get("message") or {}
     content = message.get("content")
     if not isinstance(content, str) or not content.strip():
