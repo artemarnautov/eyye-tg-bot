@@ -1099,8 +1099,7 @@ def _generate_cards_for_tags_via_openai_sync(
     elapsed = time.monotonic() - started
     logger.info("OpenAI card generation call finished in %.2fs", elapsed)
 
-    # ---- Дальше НЕТ лишних отступов и "висящих" try/except ----
-
+    # ----- проверка верхнего уровня ответа -----
     if not resp_json:
         return []
 
@@ -1120,13 +1119,15 @@ def _generate_cards_for_tags_via_openai_sync(
         content[:200].replace("\n", " "),
     )
 
-    # Пытаемся сначала строгий JSON
+    # ----- один try — только вокруг json.loads -----
+    raw_cards: List[Dict[str, Any]] = []
+
     try:
         parsed = json.loads(content)
         if not isinstance(parsed, dict):
             raise ValueError("Parsed card JSON is not an object")
 
-        # Пытаемся вытащить либо cards, либо items
+        # Поддерживаем оба варианта: {"cards": [...]} и {"items": [...]}
         raw_cards = parsed.get("cards")
         if raw_cards is None:
             raw_cards = parsed.get("items")
@@ -1149,23 +1150,21 @@ def _generate_cards_for_tags_via_openai_sync(
             len(raw_cards),
         )
     except Exception:
-        # Любая другая ошибка парсинга
         logger.exception("Failed to parse OpenAI card generation response")
         return []
 
-    # Нормализуем карточки в внутренний формат
+    # ----- нормализуем карточки в наш внутренний формат -----
     result: List[Dict[str, Any]] = []
     for c in raw_cards:
         if not isinstance(c, dict):
             continue
 
         title = str(c.get("title", "")).strip()
-        # salvage-парсер может использовать summary вместо body
+        # В salvage-режиме текст может лежать в поле summary
         body = str(c.get("body") or c.get("summary") or "").strip()
         if not title or not body:
             continue
 
-        # tags или одиночный tag
         card_tags = c.get("tags") or c.get("tag") or tags
         if not isinstance(card_tags, list):
             card_tags = [str(card_tags)] if card_tags else tags
