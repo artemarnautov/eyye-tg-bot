@@ -12,11 +12,16 @@ from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
+# file: src/bot.py
 from telegram import (
     Update,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    WebAppInfo,
 )
+
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -26,6 +31,7 @@ from telegram.ext import (
     filters,
 )
 
+# file: src/bot.py
 # ==========================
 # Инициализация окружения
 # ==========================
@@ -52,6 +58,9 @@ OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
 # Простейший rate-limit для генерации ленты (в секундах)
 FEED_OPENAI_COOLDOWN_SECONDS = int(os.getenv("FEED_OPENAI_COOLDOWN_SECONDS", "60"))
 
+# Базовый URL WebApp (например, http://45.66.163.7:8000 или https://app.eyye.com)
+WEBAPP_BASE_URL = os.getenv("WEBAPP_BASE_URL")
+
 # === Новые константы для фида ===
 FEED_CARDS_LIMIT = 15          # сколько карточек отправляем за один показ ленты
 FEED_MAX_CARD_AGE_HOURS = 48   # насколько свежие карточки считаем актуальными
@@ -59,6 +68,7 @@ DEFAULT_FEED_TAGS = ["world_news", "business", "tech", "uk_students"]
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN or TELEGRAM_BOT_TOKEN is not set in environment variables")
+
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -133,6 +143,72 @@ def _truncate(text: str, max_len: int = 1500) -> str:
         return text
     return text[: max_len - 3] + "..."
 
+# file: src/bot.py
+async def send_webapp_entry_point(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Отправляет пользователю кнопку для входа в WebApp EYYE.
+
+    Если WEBAPP_BASE_URL не задан, показываем мягкую заглушку.
+    Если URL https:// — используем WebApp-кнопку (WebAppInfo),
+    чтобы Telegram передавал initData в окно WebApp.
+    Если URL http:// (как сейчас с IP), используем обычную URL-кнопку,
+    чтобы можно было тестировать даже без HTTPS.
+    """
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+
+    if not chat or not user:
+        return
+
+    if not WEBAPP_BASE_URL:
+        if message:
+            await message.reply_text(
+                "WebApp EYYE пока не подключён. Как только он будет готов, "
+                "здесь появится кнопка для открытия ленты."
+            )
+        return
+
+    base_url = WEBAPP_BASE_URL.rstrip("/")
+    # Дополнительно передаём tg_id в query-параметре (на будущее для backend’а)
+    webapp_url = f"{base_url}/?tg_id={user.id}"
+
+    use_webapp_button = webapp_url.startswith("https://")
+
+    if use_webapp_button:
+        button = InlineKeyboardButton(
+            text="Открыть ленту EYYE",
+            web_app=WebAppInfo(url=webapp_url),
+        )
+    else:
+        # Временный режим без HTTPS: обычная URL-кнопка
+        button = InlineKeyboardButton(
+            text="Открыть ленту EYYE",
+            url=webapp_url,
+        )
+
+    keyboard = InlineKeyboardMarkup([[button]])
+
+    text_lines = [
+        "Можешь открыть свою ленту EYYE в виде WebApp 👇",
+        "Она запускается внутри Telegram и дальше будет работать как бесконечный канал.",
+    ]
+
+    await context.bot.send_message(
+        chat_id=chat.id,
+        text="\n".join(text_lines),
+        reply_markup=keyboard,
+    )
+
+async def webapp_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /webapp — отправить кнопку входа в WebApp EYYE.
+    Удобно для тестирования и быстрого доступа к ленте.
+    """
+    await send_webapp_entry_point(update, context)
 
 # ==========================
 # Клавиатуры
@@ -1420,6 +1496,7 @@ async def _load_effective_profile(
 # Команды
 # ==========================
 
+# file: src/bot.py
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /start — онбординг или мгновенная выдача ленты, если профиль уже есть.
@@ -1481,6 +1558,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(
                 "Пока использую черновой профиль, в фоне строю более точный вариант с помощью ИИ."
             )
+
+        # После готовой ленты предлагаем открыть WebApp
+        await send_webapp_entry_point(update, context)
         return
 
     # Профиля ещё нет — запускаем онбординг
@@ -1513,6 +1593,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+
+# file: src/bot.py
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /help — простая справка.
@@ -1524,12 +1606,14 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/me — показать, что бот знает о тебе",
         "/feed — черновой вывод тем/тегов профиля (для отладки)",
         "/raw_profile — показать сохранённые raw_interests и structured_profile (обрезано)",
+        "/webapp — открыть ленту EYYE в виде WebApp",
         "/done — закончить описание интересов во время онбординга",
-        "/help — эта справка",
         "/reset_profile — удалить профиль и пройти онбординг заново (для тестов)",
+        "/help — эта справка",
     ]
     if update.message:
         await update.message.reply_text("\n".join(text_lines))
+
 
 
 async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1944,10 +2028,12 @@ async def onboarding_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     )
 
 
+# file: src/bot.py
 async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /done — конец онбординга: сохраняем raw_interests и в фоне строим structured_profile.
-    После этого сразу показываем первую версию ленты (на основе fallback-профиля).
+    После этого сразу показываем первую версию ленты (на основе fallback-профиля)
+    и предлагаем открыть WebApp.
     """
     if not update.message:
         return
@@ -2039,6 +2125,10 @@ async def finish_onboarding(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             "В фоне я донастрою профиль с помощью ИИ и следующие подборки будут точнее."
         )
 
+    # И сразу предлагаем открыть WebApp с лентой
+    await send_webapp_entry_point(update, context)
+
+
 
 # ==========================
 # Глобальный обработчик ошибок
@@ -2064,6 +2154,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # Сборка и запуск приложения
 # ==========================
 
+# file: src/bot.py
 def build_application() -> Application:
     """
     Регистрируем все хендлеры и собираем Application.
@@ -2079,6 +2170,7 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("raw_profile", raw_profile_command))
     application.add_handler(CommandHandler("reset_profile", reset_profile_command))
     application.add_handler(CommandHandler("done", finish_onboarding))
+    application.add_handler(CommandHandler("webapp", webapp_command))
 
     # Любой текст во время онбординга
     application.add_handler(
@@ -2091,6 +2183,7 @@ def build_application() -> Application:
     application.add_error_handler(error_handler)
 
     return application
+
 
 
 def main() -> None:
