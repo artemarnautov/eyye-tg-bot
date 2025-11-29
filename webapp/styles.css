@@ -1,0 +1,32 @@
+/* file: webapp/styles.css */
+
+body {
+    margin: 0;
+    padding: 0;
+    background: #050810;
+    color: #f5f5f5;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+      sans-serif;
+  }
+  
+  .root {
+    min-height: 100vh;
+    padding: 20px;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  
+  .title {
+    font-size: 24px;
+    font-weight: 700;
+    margin: 0 0 8px;
+  }
+  
+  .text {
+    margin: 0 0 4px;
+    line-height: 1.4;
+    font-size: 15px;
+  }
+  
