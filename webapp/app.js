@@ -1,168 +1,366 @@
 // file: webapp/app.js
 (function () {
-  const feedEl = document.getElementById("feed");
-  const loadingEl = document.getElementById("feed-loading");
-  const errorEl = document.getElementById("feed-error");
-  const footerStatusEl = document.getElementById("footer-status");
+  const mainEl = document.getElementById("main");
 
-  function setFooter(text) {
-    if (footerStatusEl) {
-      footerStatusEl.textContent = text;
-    }
+  const TOPICS = [
+    { tag: "world_news", label: "Главные новости" },
+    { tag: "business", label: "Бизнес и экономика" },
+    { tag: "finance", label: "Финансы и крипто" },
+    { tag: "tech", label: "Технологии и гаджеты" },
+    { tag: "science", label: "Наука" },
+    { tag: "history", label: "История" },
+    { tag: "politics", label: "Политика" },
+    { tag: "society", label: "Общество и культура" },
+    { tag: "entertainment", label: "Кино и сериалы" },
+    { tag: "gaming", label: "Игры и киберспорт" },
+    { tag: "sports", label: "Спорт" },
+    { tag: "lifestyle", label: "Жизнь и лайфстайл" },
+    { tag: "education", label: "Образование и карьера" },
+    { tag: "city", label: "Город и локальные новости" },
+    { tag: "uk_students", label: "Студенческая жизнь в Великобритании" },
+  ];
+
+  const state = {
+    userId: null,
+    step: "city", // city | topics | feed
+    selectedTags: new Set(),
+    feedItems: [],
+  };
+
+  const tg =
+    window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+
+  function escapeHtml(str) {
+    if (!str) return "";
+    return String(str)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
   }
 
-  function getTgId() {
-    // 1) Пытаемся взять tg_id из URL: ?tg_id=...
-    try {
-      const params = new URLSearchParams(window.location.search);
-      const fromUrl = params.get("tg_id");
-      if (fromUrl) {
-        const n = Number(fromUrl);
-        if (!Number.isNaN(n) && n > 0) {
-          return n;
-        }
-      }
-    } catch (e) {
-      console.warn("Failed to read tg_id from URL", e);
+  function getUserId() {
+    if (
+      tg &&
+      tg.initDataUnsafe &&
+      tg.initDataUnsafe.user &&
+      tg.initDataUnsafe.user.id
+    ) {
+      return tg.initDataUnsafe.user.id;
     }
-
-    // 2) Пытаемся взять из Telegram WebApp, если есть
-    try {
-      const tgUser = window.Telegram?.WebApp?.initDataUnsafe?.user;
-      if (tgUser && tgUser.id) {
-        return tgUser.id;
-      }
-    } catch (e) {
-      console.warn("Failed to read Telegram WebApp user", e);
+    const params = new URLSearchParams(window.location.search);
+    const fromQuery = params.get("tg_id");
+    if (fromQuery) {
+      const n = Number(fromQuery);
+      if (!Number.isNaN(n)) return n;
+      return fromQuery;
     }
-
     return null;
   }
 
-  function showError(message) {
-    if (loadingEl) {
-      loadingEl.classList.add("hidden");
-    }
-    if (errorEl) {
-      errorEl.textContent = message || "Something went wrong.";
-      errorEl.classList.remove("hidden");
-    }
-    setFooter("Error loading feed");
+  function apiFetch(path, options) {
+    return fetch(path, {
+      headers: {
+        "Content-Type": "application/json",
+      },
+      ...options,
+    });
   }
 
-  function renderEmpty() {
-    if (!feedEl) return;
-    feedEl.innerHTML = "";
+  function renderCityScreen() {
+    state.step = "city";
+    mainEl.innerHTML = `
+      <section class="screen screen-city">
+        <h1 class="screen-title">Где ты живёшь?</h1>
+        <p class="screen-subtitle">
+          Это нужно, чтобы подмешивать в ленту локальные новости и контекст.
+          Можно пропустить — тогда лента будет глобальной.
+        </p>
+        <div class="city-form">
+          <input
+            id="city-input"
+            class="input"
+            type="text"
+            placeholder="Например: Москва, Лондон, Дубай"
+            autocomplete="off"
+          />
+        </div>
+        <div class="buttons-row">
+          <button id="city-continue" class="btn btn-primary">
+            Продолжить
+          </button>
+          <button id="city-skip" class="btn btn-secondary">
+            Пропустить
+          </button>
+        </div>
+      </section>
+    `;
 
-    const emptyEl = document.createElement("div");
-    emptyEl.className = "feed-status";
-    emptyEl.textContent =
-      "No posts yet. We are preparing your personal EYYE feed.";
-    feedEl.appendChild(emptyEl);
+    const cityInput = document.getElementById("city-input");
+    const continueBtn = document.getElementById("city-continue");
+    const skipBtn = document.getElementById("city-skip");
 
-    if (loadingEl) {
-      loadingEl.classList.add("hidden");
-    }
-    if (errorEl) {
-      errorEl.classList.add("hidden");
-    }
-    setFooter("Feed is empty for now");
-  }
-
-  function renderFeedItems(items) {
-    if (!feedEl) return;
-
-    feedEl.innerHTML = "";
-
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      renderEmpty();
-      return;
-    }
-
-    items.forEach((item) => {
-      const card = document.createElement("article");
-      card.className = "feed-item";
-
-      const titleEl = document.createElement("h3");
-      titleEl.className = "feed-item-title";
-      titleEl.textContent = item.title || "Untitled";
-
-      const bodyEl = document.createElement("p");
-      bodyEl.className = "feed-item-body";
-      bodyEl.textContent = item.body || "";
-
-      const metaEl = document.createElement("div");
-      metaEl.className = "feed-item-meta";
-
-      const tags = Array.isArray(item.tags) ? item.tags : [];
-      if (tags.length > 0) {
-        const tagsEl = document.createElement("div");
-        tagsEl.className = "feed-item-tags";
-        tags.forEach((t) => {
-          const tagSpan = document.createElement("span");
-          tagSpan.className = "feed-item-tag";
-          tagSpan.textContent = String(t);
-          tagsEl.appendChild(tagSpan);
-        });
-        metaEl.appendChild(tagsEl);
-      }
-
-      card.appendChild(titleEl);
-      card.appendChild(bodyEl);
-      if (metaEl.childNodes.length > 0) {
-        card.appendChild(metaEl);
-      }
-
-      feedEl.appendChild(card);
+    continueBtn.addEventListener("click", function () {
+      const city = (cityInput.value || "").trim();
+      saveCityAndGoNext(city);
     });
 
-    if (loadingEl) {
-      loadingEl.classList.add("hidden");
-    }
-    if (errorEl) {
-      errorEl.classList.add("hidden");
-    }
-    setFooter("Feed is up to date");
+    cityInput.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") {
+        const city = (cityInput.value || "").trim();
+        saveCityAndGoNext(city);
+      }
+    });
+
+    skipBtn.addEventListener("click", function () {
+      saveCityAndGoNext("");
+    });
+
+    cityInput.focus();
   }
 
-  async function loadFeedOnce() {
-    const tgId = getTgId();
-    console.log("EYYE WebApp: tg_id =", tgId);
-
-    if (!tgId) {
-      showError("Telegram user id is missing. Open this from the EYYE bot.");
+  function saveCityAndGoNext(city) {
+    if (!state.userId) {
+      renderError(
+        "Не удалось получить твой Telegram ID. Открой WebApp через кнопку в боте и попробуй снова."
+      );
       return;
     }
 
-    try {
-      if (loadingEl) {
-        loadingEl.classList.remove("hidden");
-        loadingEl.textContent = "Loading your feed...";
-      }
-      if (errorEl) {
-        errorEl.classList.add("hidden");
-      }
-      setFooter("Loading feed...");
-
-      const resp = await fetch(
-        `/api/feed?tg_id=${encodeURIComponent(tgId)}&limit=20`
-      );
-      if (!resp.ok) {
-        throw new Error("HTTP " + resp.status);
-      }
-
-      const data = await resp.json();
-      const items = data && Array.isArray(data.items) ? data.items : [];
-      console.log("EYYE WebApp: received items =", items.length);
-      renderFeedItems(items);
-    } catch (err) {
-      console.error("EYYE WebApp: loadFeed error", err);
-      showError("Could not load feed. Please try again later.");
-    }
+    apiFetch("/api/profile/city", {
+      method: "POST",
+      body: JSON.stringify({
+        user_id: state.userId,
+        city: city || null,
+      }),
+    })
+      .then(function (resp) {
+        if (!resp.ok) {
+          console.warn("Failed to save city", resp.status);
+        }
+      })
+      .catch(function (err) {
+        console.warn("Error saving city", err);
+      })
+      .finally(function () {
+        renderTopicsScreen();
+      });
   }
 
-  document.addEventListener("DOMContentLoaded", () => {
-    console.log("EYYE WebApp front started");
-    loadFeedOnce();
-  });
+  function renderTopicsScreen() {
+    state.step = "topics";
+
+    const topicHtml = TOPICS.map(function (t) {
+      const active = state.selectedTags.has(t.tag);
+      return `
+        <button
+          class="topic-pill ${active ? "topic-pill--selected" : ""}"
+          data-tag="${t.tag}"
+        >
+          <span class="topic-pill-label">${escapeHtml(t.label)}</span>
+        </button>
+      `;
+    }).join("");
+
+    mainEl.innerHTML = `
+      <section class="screen screen-topics">
+        <h1 class="screen-title">Что тебе интересно читать?</h1>
+        <p class="screen-subtitle">
+          Выбери несколько тем — лента будет под тебя. Можно изменить выбор позже.
+        </p>
+        <div class="topics-grid">
+          ${topicHtml}
+        </div>
+        <div class="buttons-row">
+          <button id="topics-continue" class="btn btn-primary">
+            Сформировать ленту
+          </button>
+        </div>
+      </section>
+    `;
+
+    Array.prototype.forEach.call(
+      document.querySelectorAll(".topic-pill"),
+      function (el) {
+        el.addEventListener("click", function () {
+          const tag = el.getAttribute("data-tag");
+          if (!tag) return;
+          if (state.selectedTags.has(tag)) {
+            state.selectedTags.delete(tag);
+            el.classList.remove("topic-pill--selected");
+          } else {
+            state.selectedTags.add(tag);
+            el.classList.add("topic-pill--selected");
+          }
+        });
+      }
+    );
+
+    const continueBtn = document.getElementById("topics-continue");
+    continueBtn.addEventListener("click", function () {
+      saveTopicsAndLoadFeed();
+    });
+  }
+
+  function saveTopicsAndLoadFeed() {
+    if (!state.userId) {
+      renderError(
+        "Не удалось получить твой Telegram ID. Открой WebApp через кнопку в боте и попробуй снова."
+      );
+      return;
+    }
+
+    const tags = Array.from(state.selectedTags);
+
+    apiFetch("/api/profile/topics", {
+      method: "POST",
+      body: JSON.stringify({
+        user_id: state.userId,
+        tags: tags,
+      }),
+    })
+      .then(function (resp) {
+        if (!resp.ok) {
+          console.warn("Failed to save topics", resp.status);
+        }
+      })
+      .catch(function (err) {
+        console.warn("Error saving topics", err);
+      })
+      .finally(function () {
+        loadFeed();
+      });
+  }
+
+  function loadFeed() {
+    if (!state.userId) {
+      renderError(
+        "Не удалось получить твой Telegram ID. Открой WebApp через кнопку в боте и попробуй снова."
+      );
+      return;
+    }
+
+    state.step = "feed";
+
+    mainEl.innerHTML = `
+      <section class="screen screen-feed screen-feed--loading">
+        <p class="screen-subtitle">
+          Собираю для тебя персональную ленту…
+        </p>
+      </section>
+    `;
+
+    const params = new URLSearchParams({
+      tg_id: String(state.userId),
+      limit: "25",
+    });
+
+    apiFetch("/api/feed?" + params.toString(), {
+      method: "GET",
+    })
+      .then(function (resp) {
+        if (!resp.ok) {
+          throw new Error("Feed HTTP " + resp.status);
+        }
+        return resp.json();
+      })
+      .then(function (data) {
+        const items = (data && data.items) || [];
+        state.feedItems = items;
+        renderFeedScreen();
+      })
+      .catch(function (err) {
+        console.error("Failed to load feed", err);
+        renderError(
+          "Не получилось загрузить ленту. Попробуй вернуться в WebApp через пару минут."
+        );
+      });
+  }
+
+  function renderFeedScreen() {
+    state.step = "feed";
+
+    if (!state.feedItems || state.feedItems.length === 0) {
+      mainEl.innerHTML = `
+        <section class="screen screen-feed">
+          <p class="screen-subtitle">
+            Пока для тебя нет готовых карточек. Я уже готовлю контент —
+            загляни сюда чуть позже.
+          </p>
+        </section>
+      `;
+      return;
+    }
+
+    const cardsHtml = state.feedItems
+      .map(function (item) {
+        const title = escapeHtml(item.title || "");
+        const body = escapeHtml(item.body || "").replace(/\n/g, "<br />");
+        const createdAt = item.created_at || item.createdAt;
+
+        let meta = "";
+        if (createdAt) {
+          meta = `<div class="feed-card-meta">Опубликовано: ${escapeHtml(
+            String(createdAt)
+          )}</div>`;
+        }
+
+        return `
+          <article class="feed-card">
+            <h2 class="feed-card-title">${title}</h2>
+            <div class="feed-card-body">${body}</div>
+            ${meta}
+          </article>
+        `;
+      })
+      .join("");
+
+    mainEl.innerHTML = `
+      <section class="screen screen-feed">
+        ${cardsHtml}
+        <div class="feed-footer">
+          <span class="feed-footer-text">Лента обновлена только что</span>
+        </div>
+      </section>
+    `;
+  }
+
+  function renderError(message) {
+    mainEl.innerHTML = `
+      <section class="screen screen-error">
+        <p class="screen-subtitle">
+          ${escapeHtml(message)}
+        </p>
+      </section>
+    `;
+  }
+
+  function init() {
+    state.userId = getUserId();
+
+    if (tg) {
+      try {
+        tg.expand();
+        tg.ready();
+      } catch (e) {
+        console.warn("Telegram WebApp init error", e);
+      }
+    }
+
+    if (!state.userId) {
+      renderError(
+        "Не удалось получить твой Telegram ID. Открой WebApp через кнопку в боте и попробуй снова."
+      );
+      return;
+    }
+
+    renderCityScreen();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
 })();

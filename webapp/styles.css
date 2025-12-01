@@ -1,6 +1,19 @@
 /* file: webapp/styles.css */
+:root {
+  --bg-color: #050910;
+  --bg-elevated: #0b111a;
+  --bg-pill: #111827;
+  --bg-pill-selected: #1f2937;
+  --accent: #32a9ff;
+  --accent-soft: rgba(50, 169, 255, 0.2);
+  --text-primary: #f9fafb;
+  --text-secondary: #9ca3af;
+  --border-subtle: rgba(156, 163, 175, 0.24);
+  --radius-lg: 16px;
+  --radius-pill: 999px;
+  --shadow-soft: 0 18px 40px rgba(0, 0, 0, 0.45);
+}
 
-/* базовый ресет */
 *,
 *::before,
 *::after {
@@ -15,135 +28,282 @@ body {
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui,
-    -system-ui, sans-serif;
-  background-color: #0f1013;
-  color: #ffffff;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "Segoe UI", sans-serif;
+  background-color: var(--bg-color);
+  color: var(--text-primary);
+}
+
+.app {
+  min-height: 100vh;
+  background: radial-gradient(circle at top left, #111827 0, #020617 55%);
+  color: var(--text-primary);
   display: flex;
   flex-direction: column;
+  padding-bottom: env(safe-area-inset-bottom, 12px);
 }
 
-/* скрытие элементов */
-.hidden {
-  display: none !important;
-}
+/* "Телеграм-канал" шапка */
 
-/* шапка "канала" */
-.app-header {
+.channel-header {
   display: flex;
   align-items: center;
-  gap: 12px;
-  padding: 10px 14px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  padding: 12px 14px 10px;
+  border-bottom: 1px solid rgba(15, 23, 42, 0.9);
   background: linear-gradient(
-    to bottom,
-    rgba(15, 16, 19, 0.98),
-    rgba(15, 16, 19, 0.92)
-  );
+      135deg,
+      rgba(15, 23, 42, 0.95),
+      rgba(8, 47, 73, 0.9)
+    ),
+    radial-gradient(circle at top left, rgba(59, 130, 246, 0.25), transparent);
   position: sticky;
   top: 0;
   z-index: 10;
+  backdrop-filter: blur(18px);
 }
 
-.channel-avatar {
-  width: 36px;
-  height: 36px;
+.avatar {
+  width: 34px;
+  height: 34px;
   border-radius: 50%;
-  background: radial-gradient(circle at 30% 20%, #5cf0ff, #2563eb);
+  background: radial-gradient(circle at 30% 30%, #fbbf24, #f97316);
   display: flex;
   align-items: center;
   justify-content: center;
   font-weight: 700;
-  font-size: 18px;
-  color: #ffffff;
+  color: #020617;
+  margin-right: 10px;
+  box-shadow: 0 0 0 2px rgba(15, 23, 42, 0.8),
+    0 10px 20px rgba(0, 0, 0, 0.45);
 }
 
-.channel-info {
+.channel-meta {
   display: flex;
   flex-direction: column;
 }
 
 .channel-title {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
 }
 
 .channel-subtitle {
-  font-size: 12px;
-  color: rgba(255, 255, 255, 0.6);
+  font-size: 11px;
+  color: var(--text-secondary);
 }
 
-/* основная лента */
-.feed {
+/* Основной контент */
+
+.main {
   flex: 1;
-  padding: 8px 10px 56px;
-  overflow-y: auto;
+  padding: 10px 10px 16px;
 }
 
-/* статусы */
-.feed-status {
-  margin-top: 16px;
+.screen {
+  max-width: 640px;
+  margin: 0 auto;
+}
+
+.screen-title {
+  font-size: 20px;
+  font-weight: 650;
+  margin: 10px 0 6px;
+}
+
+.screen-subtitle {
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  margin: 4px 0 14px;
+}
+
+/* Формы */
+
+.city-form {
+  margin-top: 10px;
+  margin-bottom: 12px;
+}
+
+.input {
+  width: 100%;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: radial-gradient(circle at top left, #020617, #020617);
+  color: var(--text-primary);
+  padding: 10px 14px;
   font-size: 14px;
-  color: rgba(255, 255, 255, 0.6);
+  outline: none;
+  box-shadow: 0 14px 35px rgba(15, 23, 42, 0.8);
 }
 
-.feed-status-error {
-  color: #ff6b6b;
+.input::placeholder {
+  color: rgba(156, 163, 175, 0.8);
 }
 
-/* карточка поста */
-.feed-item {
-  background: #18191f;
+.input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px rgba(50, 169, 255, 0.6),
+    0 18px 40px rgba(15, 23, 42, 0.9);
+}
+
+/* Кнопки */
+
+.buttons-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.btn {
+  flex: 1;
+  border-radius: var(--radius-pill);
+  border: none;
+  padding: 10px 14px;
+  font-size: 14px;
+  font-weight: 550;
+  cursor: pointer;
+  transition: transform 0.08s ease, box-shadow 0.08s ease,
+    background 0.12s ease;
+  box-shadow: var(--shadow-soft);
+}
+
+.btn-primary {
+  background: linear-gradient(135deg, #38bdf8, #2563eb);
+  color: #0b1120;
+}
+
+.btn-primary:active {
+  transform: translateY(1px) scale(0.99);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.9);
+}
+
+.btn-secondary {
+  background: rgba(15, 23, 42, 0.9);
+  color: var(--text-secondary);
+  border: 1px solid rgba(148, 163, 184, 0.4);
+}
+
+.btn-secondary:active {
+  transform: translateY(1px) scale(0.99);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.9);
+}
+
+/* Темы */
+
+.topics-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 10px 0 6px;
+}
+
+.topic-pill {
+  border-radius: var(--radius-pill);
+  border: 1px solid rgba(148, 163, 184, 0.5);
+  background: radial-gradient(circle at top left, #020617, #020617);
+  color: var(--text-secondary);
+  padding: 7px 12px;
+  font-size: 13px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 14px 30px rgba(15, 23, 42, 0.85);
+  transition: transform 0.08s ease, box-shadow 0.08s ease,
+    border-color 0.08s ease, background 0.12s ease, color 0.12s ease;
+}
+
+.topic-pill-label {
+  white-space: nowrap;
+}
+
+.topic-pill--selected {
+  border-color: rgba(56, 189, 248, 0.9);
+  background: radial-gradient(circle at top left, #0ea5e9, #1d4ed8);
+  color: #0b1120;
+  box-shadow: 0 18px 40px rgba(56, 189, 248, 0.5);
+}
+
+/* Лента */
+
+.screen-feed {
+  padding-top: 4px;
+}
+
+.screen-feed--loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40vh;
+}
+
+.feed-card {
+  background: linear-gradient(135deg, rgba(15, 23, 42, 0.98), #020617);
   border-radius: 18px;
+  border: 1px solid rgba(15, 23, 42, 1);
   padding: 10px 12px;
-  margin-top: 8px;
-  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+  margin-bottom: 10px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.8);
+  position: relative;
+  overflow: hidden;
 }
 
-.feed-item-title {
+.feed-card::before {
+  content: "";
+  position: absolute;
+  inset: -40%;
+  background: radial-gradient(
+    circle at top left,
+    rgba(59, 130, 246, 0.16),
+    transparent 60%
+  );
+  opacity: 0.9;
+  pointer-events: none;
+}
+
+.feed-card-title {
+  position: relative;
   font-size: 15px;
-  font-weight: 600;
-  margin: 0 0 4px 0;
+  font-weight: 650;
+  margin: 2px 0 6px;
 }
 
-.feed-item-body {
-  font-size: 14px;
-  line-height: 1.45;
-  margin: 0;
+.feed-card-body {
+  position: relative;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text-secondary);
   white-space: pre-wrap;
 }
 
-/* теги */
-.feed-item-meta {
-  margin-top: 6px;
-}
-
-.feed-item-tags {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-}
-
-.feed-item-tag {
+.feed-card-meta {
+  position: relative;
+  margin-top: 7px;
   font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 999px;
-  background: rgba(148, 163, 184, 0.16);
-  color: rgba(226, 232, 240, 0.9);
+  color: rgba(148, 163, 184, 0.9);
 }
 
-/* футер */
-.app-footer {
-  height: 40px;
-  padding: 0 12px;
-  display: flex;
-  align-items: center;
-  border-top: 1px solid rgba(148, 163, 184, 0.18);
-  background: linear-gradient(
-    to top,
-    rgba(15, 16, 19, 0.97),
-    rgba(15, 16, 19, 0.9)
-  );
-  font-size: 12px;
-  color: rgba(148, 163, 184, 0.9);
+.feed-footer {
+  margin-top: 12px;
+  padding: 6px 4px 2px;
+  text-align: center;
+}
+
+.feed-footer-text {
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+/* Ошибки */
+
+.screen-error {
+  padding-top: 16px;
+}
+
+/* Мелкая адаптация */
+
+@media (min-width: 720px) {
+  .main {
+    padding-top: 16px;
+  }
 }
