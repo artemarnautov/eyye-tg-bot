@@ -1,27 +1,6 @@
 /* file: webapp/styles.css */
-/* Базовая минималистичная тёмная тема под Telegram-канал */
 
-:root {
-  color-scheme: dark;
-  --bg-main: #101013;
-  --bg-header: #16161a;
-  --bg-footer: #16161a;
-  --bg-card: #18181f;
-  --bg-card-hover: #1f1f28;
-  --text-main: #edf0f7;
-  --text-secondary: #8f96a8;
-  --accent: #5c8dff;
-  --border-subtle: rgba(255, 255, 255, 0.06);
-  --shadow-soft: 0 4px 12px rgba(0, 0, 0, 0.35);
-  --radius-lg: 14px;
-  --radius-md: 10px;
-  --radius-pill: 999px;
-  --space-xs: 4px;
-  --space-sm: 8px;
-  --space-md: 12px;
-  --space-lg: 16px;
-}
-
+/* базовый ресет */
 *,
 *::before,
 *::after {
@@ -33,36 +12,34 @@ body {
   margin: 0;
   padding: 0;
   height: 100%;
-  font-family: system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Text",
-    "Segoe UI", sans-serif;
-  background: radial-gradient(circle at top left, #202232 0, #101013 45%, #050509 100%);
-  color: var(--text-main);
 }
 
 body {
-  display: flex;
-  justify-content: center;
-}
-
-/* Корень приложения */
-
-.app-root {
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui,
+    -system-ui, sans-serif;
+  background-color: #0f1013;
+  color: #ffffff;
   display: flex;
   flex-direction: column;
-  width: 100%;
-  max-width: 720px;
-  min-height: 100vh;
-  background: transparent;
 }
 
-/* Шапка "как канал" */
+/* скрытие элементов */
+.hidden {
+  display: none !important;
+}
 
+/* шапка "канала" */
 .app-header {
   display: flex;
   align-items: center;
-  padding: var(--space-md) var(--space-lg);
-  background: linear-gradient(90deg, #16161a, #181a22);
-  border-bottom: 1px solid var(--border-subtle);
+  gap: 12px;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  background: linear-gradient(
+    to bottom,
+    rgba(15, 16, 19, 0.98),
+    rgba(15, 16, 19, 0.92)
+  );
   position: sticky;
   top: 0;
   z-index: 10;
@@ -72,21 +49,18 @@ body {
   width: 36px;
   height: 36px;
   border-radius: 50%;
-  background: radial-gradient(circle at 30% 20%, #8aa4ff, #4256c8);
+  background: radial-gradient(circle at 30% 20%, #5cf0ff, #2563eb);
   display: flex;
   align-items: center;
   justify-content: center;
   font-weight: 700;
-  color: #ffffff;
-  margin-right: var(--space-md);
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.06), var(--shadow-soft);
   font-size: 18px;
+  color: #ffffff;
 }
 
 .channel-info {
   display: flex;
   flex-direction: column;
-  gap: 2px;
 }
 
 .channel-title {
@@ -96,130 +70,80 @@ body {
 
 .channel-subtitle {
   font-size: 12px;
-  color: var(--text-secondary);
+  color: rgba(255, 255, 255, 0.6);
 }
 
-/* Лента */
-
+/* основная лента */
 .feed {
   flex: 1;
-  padding: var(--space-md) var(--space-lg) var(--space-lg);
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-sm);
+  padding: 8px 10px 56px;
+  overflow-y: auto;
 }
 
-/* Статусы */
-
+/* статусы */
 .feed-status {
-  padding: var(--space-md) var(--space-lg);
-  border-radius: var(--radius-md);
-  background: rgba(24, 24, 31, 0.85);
-  color: var(--text-secondary);
-  font-size: 13px;
-  border: 1px dashed var(--border-subtle);
+  margin-top: 16px;
+  font-size: 14px;
+  color: rgba(255, 255, 255, 0.6);
 }
 
 .feed-status-error {
-  border-style: solid;
-  border-color: #ff6b81;
-  color: #ff9ba8;
-  background: rgba(40, 12, 18, 0.9);
+  color: #ff6b6b;
 }
 
-.feed-status-empty {
-  text-align: center;
-}
-
-/* Карточка как сообщение в канале */
-
+/* карточка поста */
 .feed-item {
-  position: relative;
-  padding: 10px 12px 10px 12px;
-  border-radius: 12px;
-  background: var(--bg-card);
-  border: 1px solid rgba(255, 255, 255, 0.03);
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-  transition: background 0.12s ease-out, transform 0.12s ease-out,
-    box-shadow 0.12s ease-out, border-color 0.12s ease-out;
-}
-
-.feed-item:hover {
-  background: var(--bg-card-hover);
-  transform: translateY(-1px);
-  border-color: rgba(114, 144, 255, 0.35);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.65);
+  background: #18191f;
+  border-radius: 18px;
+  padding: 10px 12px;
+  margin-top: 8px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
 }
 
 .feed-item-title {
-  margin: 0 0 4px;
   font-size: 15px;
   font-weight: 600;
-  line-height: 1.25;
+  margin: 0 0 4px 0;
 }
 
 .feed-item-body {
-  margin: 0;
   font-size: 14px;
-  line-height: 1.4;
-  color: var(--text-main);
-  white-space: pre-line;
+  line-height: 1.45;
+  margin: 0;
+  white-space: pre-wrap;
 }
 
-/* Мета-информация под постом */
-
+/* теги */
 .feed-item-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
   margin-top: 6px;
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-.feed-item-date {
-  opacity: 0.9;
 }
 
 .feed-item-tags {
-  padding: 3px 8px;
-  border-radius: var(--radius-pill);
-  background: rgba(92, 141, 255, 0.12);
-  color: #b4c5ff;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
 }
 
-/* Футер */
-
-.app-footer {
-  padding: 8px var(--space-lg) 10px;
-  background: var(--bg-footer);
-  border-top: 1px solid var(--border-subtle);
+.feed-item-tag {
   font-size: 11px;
-  color: var(--text-secondary);
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+  color: rgba(226, 232, 240, 0.9);
+}
+
+/* футер */
+.app-footer {
+  height: 40px;
+  padding: 0 12px;
   display: flex;
   align-items: center;
-  justify-content: flex-start;
-}
-
-/* Утилиты */
-
-.hidden {
-  display: none !important;
-}
-
-/* Мобильные */
-
-@media (max-width: 600px) {
-  .app-header {
-    padding: var(--space-md) var(--space-md);
-  }
-
-  .feed {
-    padding: var(--space-md);
-  }
-
-  .app-footer {
-    padding: 6px var(--space-md) 8px;
-  }
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+  background: linear-gradient(
+    to top,
+    rgba(15, 16, 19, 0.97),
+    rgba(15, 16, 19, 0.9)
+  );
+  font-size: 12px;
+  color: rgba(148, 163, 184, 0.9);
 }

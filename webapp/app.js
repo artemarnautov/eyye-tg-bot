@@ -1,117 +1,81 @@
 // file: webapp/app.js
-// Минимальный фронт без выбора тем:
-// - Берём tg_id из URL (?tg_id=123)
-// - Если tg_id валиден — грузим ленту из /api/feed
-// - Рендерим карточки в тёмной теме
-
 (function () {
   const feedEl = document.getElementById("feed");
-  const feedLoadingEl = document.getElementById("feed-loading");
-  const feedErrorEl = document.getElementById("feed-error");
+  const loadingEl = document.getElementById("feed-loading");
+  const errorEl = document.getElementById("feed-error");
   const footerStatusEl = document.getElementById("footer-status");
 
-  if (!feedEl) {
-    console.error("EYYE: #feed element not found");
-    return;
-  }
-
-  function log(msg, extra) {
-    try {
-      console.log("[EYYE]", msg, extra || "");
-    } catch (e) {}
-  }
-
-  // --- Читаем tg_id из URL ---
-  const params = new URLSearchParams(window.location.search);
-  const tgIdRaw = params.get("tg_id");
-  const tgId = tgIdRaw ? parseInt(tgIdRaw, 10) : null;
-
-  if (!tgId || Number.isNaN(tgId)) {
-    // Если tg_id нет или он не число — просто показываем ошибку
-    if (feedLoadingEl) feedLoadingEl.classList.add("hidden");
-    if (feedErrorEl) {
-      feedErrorEl.textContent =
-        "No Telegram user id. Open this WebApp from the EYYE bot.";
-      feedErrorEl.classList.remove("hidden");
-    }
+  function setFooter(text) {
     if (footerStatusEl) {
-      footerStatusEl.textContent = "Missing tg_id in URL";
+      footerStatusEl.textContent = text;
     }
-    log("No valid tg_id in URL, stopping");
-    return;
   }
 
-  // --- Нормализация ответа от API ---
-  function normalizeItems(data) {
-    if (!data) return [];
-    if (Array.isArray(data)) return data;
-    if (Array.isArray(data.items)) return data.items;
-    if (Array.isArray(data.cards)) return data.cards;
-    if (Array.isArray(data.data)) return data.data;
-    return [];
-  }
-
-  // --- Загрузка фида ---
-  async function loadFeed() {
-    log("Loading feed for tg_id=" + tgId);
-
-    if (feedErrorEl) {
-      feedErrorEl.classList.add("hidden");
-      feedErrorEl.textContent = "";
-    }
-    if (feedLoadingEl) {
-      feedLoadingEl.classList.remove("hidden");
-    }
-    if (footerStatusEl) {
-      footerStatusEl.textContent = "Loading feed...";
-    }
-
+  function getTgId() {
+    // 1) Пытаемся взять tg_id из URL: ?tg_id=...
     try {
-      const resp = await fetch(
-        "/api/feed?tg_id=" + encodeURIComponent(tgId) + "&limit=20",
-        { method: "GET" }
-      );
-
-      if (!resp.ok) {
-        throw new Error("HTTP " + resp.status);
+      const params = new URLSearchParams(window.location.search);
+      const fromUrl = params.get("tg_id");
+      if (fromUrl) {
+        const n = Number(fromUrl);
+        if (!Number.isNaN(n) && n > 0) {
+          return n;
+        }
       }
-
-      const data = await resp.json();
-      const items = normalizeItems(data);
-      log("Feed loaded, items:", items.length);
-
-      renderFeed(items);
-
-      if (footerStatusEl) {
-        footerStatusEl.textContent = "Loaded " + items.length + " posts";
-      }
-    } catch (err) {
-      console.error("EYYE: failed to load feed", err);
-      if (feedErrorEl) {
-        feedErrorEl.textContent =
-          "Could not load feed. Please try again later.";
-        feedErrorEl.classList.remove("hidden");
-      }
-      if (footerStatusEl) {
-        footerStatusEl.textContent = "Error loading feed";
-      }
-    } finally {
-      if (feedLoadingEl) {
-        feedLoadingEl.classList.add("hidden");
-      }
+    } catch (e) {
+      console.warn("Failed to read tg_id from URL", e);
     }
+
+    // 2) Пытаемся взять из Telegram WebApp, если есть
+    try {
+      const tgUser = window.Telegram?.WebApp?.initDataUnsafe?.user;
+      if (tgUser && tgUser.id) {
+        return tgUser.id;
+      }
+    } catch (e) {
+      console.warn("Failed to read Telegram WebApp user", e);
+    }
+
+    return null;
   }
 
-  // --- Рендер карточек ---
-  function renderFeed(items) {
+  function showError(message) {
+    if (loadingEl) {
+      loadingEl.classList.add("hidden");
+    }
+    if (errorEl) {
+      errorEl.textContent = message || "Something went wrong.";
+      errorEl.classList.remove("hidden");
+    }
+    setFooter("Error loading feed");
+  }
+
+  function renderEmpty() {
+    if (!feedEl) return;
     feedEl.innerHTML = "";
 
-    if (!items || items.length === 0) {
-      const emptyEl = document.createElement("div");
-      emptyEl.className = "feed-status feed-status-empty";
-      emptyEl.textContent =
-        "No posts yet for your profile. Come back a bit later ✨";
-      feedEl.appendChild(emptyEl);
+    const emptyEl = document.createElement("div");
+    emptyEl.className = "feed-status";
+    emptyEl.textContent =
+      "No posts yet. We are preparing your personal EYYE feed.";
+    feedEl.appendChild(emptyEl);
+
+    if (loadingEl) {
+      loadingEl.classList.add("hidden");
+    }
+    if (errorEl) {
+      errorEl.classList.add("hidden");
+    }
+    setFooter("Feed is empty for now");
+  }
+
+  function renderFeedItems(items) {
+    if (!feedEl) return;
+
+    feedEl.innerHTML = "";
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+      renderEmpty();
       return;
     }
 
@@ -119,61 +83,86 @@
       const card = document.createElement("article");
       card.className = "feed-item";
 
-      const title =
-        item.title ||
-        item.headline ||
-        (item.meta && item.meta.title) ||
-        "Untitled";
-
-      const bodyText =
-        item.body ||
-        item.text ||
-        item.content ||
-        (item.meta && item.meta.summary) ||
-        "";
-
-      const tags =
-        item.tags ||
-        item.topics ||
-        (item.meta && item.meta.tags) ||
-        [];
-
-      const createdAt = item.created_at || item.published_at || null;
-
       const titleEl = document.createElement("h3");
       titleEl.className = "feed-item-title";
-      titleEl.textContent = title;
+      titleEl.textContent = item.title || "Untitled";
 
       const bodyEl = document.createElement("p");
       bodyEl.className = "feed-item-body";
-      bodyEl.textContent = bodyText;
+      bodyEl.textContent = item.body || "";
 
       const metaEl = document.createElement("div");
       metaEl.className = "feed-item-meta";
 
-      if (createdAt) {
-        const dt = new Date(createdAt);
-        const dateSpan = document.createElement("span");
-        dateSpan.className = "feed-item-date";
-        dateSpan.textContent = dt.toLocaleString();
-        metaEl.appendChild(dateSpan);
-      }
-
-      if (tags && tags.length) {
-        const tagsSpan = document.createElement("span");
-        tagsSpan.className = "feed-item-tags";
-        tagsSpan.textContent = "#" + tags.slice(0, 3).join(" #");
-        metaEl.appendChild(tagsSpan);
+      const tags = Array.isArray(item.tags) ? item.tags : [];
+      if (tags.length > 0) {
+        const tagsEl = document.createElement("div");
+        tagsEl.className = "feed-item-tags";
+        tags.forEach((t) => {
+          const tagSpan = document.createElement("span");
+          tagSpan.className = "feed-item-tag";
+          tagSpan.textContent = String(t);
+          tagsEl.appendChild(tagSpan);
+        });
+        metaEl.appendChild(tagsEl);
       }
 
       card.appendChild(titleEl);
       card.appendChild(bodyEl);
-      card.appendChild(metaEl);
+      if (metaEl.childNodes.length > 0) {
+        card.appendChild(metaEl);
+      }
 
       feedEl.appendChild(card);
     });
+
+    if (loadingEl) {
+      loadingEl.classList.add("hidden");
+    }
+    if (errorEl) {
+      errorEl.classList.add("hidden");
+    }
+    setFooter("Feed is up to date");
   }
 
-  // Старт
-  loadFeed();
+  async function loadFeedOnce() {
+    const tgId = getTgId();
+    console.log("EYYE WebApp: tg_id =", tgId);
+
+    if (!tgId) {
+      showError("Telegram user id is missing. Open this from the EYYE bot.");
+      return;
+    }
+
+    try {
+      if (loadingEl) {
+        loadingEl.classList.remove("hidden");
+        loadingEl.textContent = "Loading your feed...";
+      }
+      if (errorEl) {
+        errorEl.classList.add("hidden");
+      }
+      setFooter("Loading feed...");
+
+      const resp = await fetch(
+        `/api/feed?tg_id=${encodeURIComponent(tgId)}&limit=20`
+      );
+      if (!resp.ok) {
+        throw new Error("HTTP " + resp.status);
+      }
+
+      const data = await resp.json();
+      const items = data && Array.isArray(data.items) ? data.items : [];
+      console.log("EYYE WebApp: received items =", items.length);
+      renderFeedItems(items);
+    } catch (err) {
+      console.error("EYYE WebApp: loadFeed error", err);
+      showError("Could not load feed. Please try again later.");
+    }
+  }
+
+  document.addEventListener("DOMContentLoaded", () => {
+    console.log("EYYE WebApp front started");
+    loadFeedOnce();
+  });
 })();

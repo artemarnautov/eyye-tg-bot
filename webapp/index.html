@@ -5,35 +5,29 @@
   <meta charset="UTF-8" />
   <title>EYYE Feed</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <link rel="stylesheet" href="/webapp/styles.css" />
+  <link rel="stylesheet" href="/webapp/styles.css?v=4" />
 </head>
 <body>
-  <div class="app-root">
-    <!-- "Шапка канала" -->
-    <header class="app-header">
-      <div class="channel-avatar">E</div>
-      <div class="channel-info">
-        <div class="channel-title">EYYE Feed</div>
-        <div class="channel-subtitle">
-          Personal Telegram-style feed for you
-        </div>
-      </div>
-    </header>
+  <!-- "Шапка канала" -->
+  <header class="app-header">
+    <div class="channel-avatar">E</div>
+    <div class="channel-info">
+      <div class="channel-title">EYYE Feed</div>
+      <div class="channel-subtitle">Personal Telegram-style feed for you</div>
+    </div>
+  </header>
 
-    <!-- Тело ленты -->
-    <main id="feed" class="feed">
-      <div id="feed-loading" class="feed-status">
-        Loading your feed...
-      </div>
-      <div id="feed-error" class="feed-status feed-status-error hidden"></div>
-    </main>
+  <!-- Тело ленты -->
+  <main id="feed" class="feed">
+    <div id="feed-loading" class="feed-status">Loading your feed...</div>
+    <div id="feed-error" class="feed-status feed-status-error hidden"></div>
+  </main>
 
-    <!-- Футер / статус -->
-    <footer class="app-footer">
-      <span id="footer-status">Connected to EYYE</span>
-    </footer>
-  </div>
+  <!-- Футер / статус -->
+  <footer class="app-footer">
+    <span id="footer-status">Connected to EYYE</span>
+  </footer>
 
-  <script src="/webapp/app.js" defer></script>
+  <script src="/webapp/app.js?v=4" defer></script>
 </body>
 </html>
