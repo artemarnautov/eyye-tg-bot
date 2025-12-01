@@ -1,11 +1,12 @@
-// file: src/webapp/app.js
+// file: webapp/app.js
 
-const THEME_KEY = "eyye_theme";
 const FOOTER_STATUS = document.getElementById("footer-status");
 const feedEl = document.getElementById("feed");
 const feedLoadingEl = document.getElementById("feed-loading");
 const feedErrorEl = document.getElementById("feed-error");
 const themeOnboardingEl = document.getElementById("theme-onboarding");
+
+const THEME_KEY_PREFIX = "eyye_theme_";
 
 // ===========================
 // Утилиты
@@ -16,30 +17,16 @@ function getQueryParam(name) {
   return url.searchParams.get(name);
 }
 
-function setTheme(theme) {
-  document.body.dataset.theme = theme;
-  localStorage.setItem(THEME_KEY, theme);
+function themeStorageKey(tgId) {
+  return `${THEME_KEY_PREFIX}${tgId}`;
 }
 
-function initTheme() {
-  const saved = localStorage.getItem(THEME_KEY);
-  if (saved) {
-    setTheme(saved);
-    themeOnboardingEl.classList.add("hidden");
-    return;
-  }
+function applyTheme(theme) {
+  document.body.dataset.theme = theme;
+}
 
-  // Нет сохранённой темы — показываем онбординг
-  themeOnboardingEl.classList.remove("hidden");
-
-  const buttons = themeOnboardingEl.querySelectorAll(".theme-btn");
-  buttons.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const theme = btn.dataset.theme || "classic";
-      setTheme(theme);
-      themeOnboardingEl.classList.add("hidden");
-    });
-  });
+function setFooter(text) {
+  if (FOOTER_STATUS) FOOTER_STATUS.textContent = text;
 }
 
 function formatDateTime(isoString) {
@@ -57,8 +44,42 @@ function formatDateTime(isoString) {
   }
 }
 
-function setFooter(text) {
-  if (FOOTER_STATUS) FOOTER_STATUS.textContent = text;
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+// ===========================
+// Тема: выбор один раз на пользователя
+// ===========================
+
+function initThemeForUser(tgId) {
+  if (!themeOnboardingEl) return;
+
+  const key = themeStorageKey(tgId);
+  const saved = localStorage.getItem(key);
+  const buttons = themeOnboardingEl.querySelectorAll(".theme-btn");
+
+  // Клики по кнопкам — сохраняем тему **под этим tg_id**
+  buttons.forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const theme = btn.dataset.theme || "classic";
+      localStorage.setItem(key, theme);
+      applyTheme(theme);
+      themeOnboardingEl.classList.add("hidden");
+    });
+  });
+
+  if (saved) {
+    // Пользователь уже выбрал: применяем и убираем онбординг
+    applyTheme(saved);
+    themeOnboardingEl.classList.add("hidden");
+  } else {
+    // Первый заход этого tg_id: просим выбрать стиль
+    themeOnboardingEl.classList.remove("hidden");
+  }
 }
 
 // ===========================
@@ -89,7 +110,6 @@ async function sendTelemetry(tgId, eventType, cardId, meta = {}) {
       body: JSON.stringify(payload),
     });
   } catch (e) {
-    // На MVP можно молча проглатывать
     console.debug("Telemetry send failed", e);
   }
 }
@@ -129,7 +149,6 @@ function createPostCard(tgId, card) {
     </div>
   `;
 
-  // Теги
   const tagsEl = wrapper.querySelector(".post-tags");
   const tags = Array.isArray(card.tags) ? card.tags : [];
   tags.slice(0, 4).forEach((t) => {
@@ -139,16 +158,13 @@ function createPostCard(tgId, card) {
     tagsEl.appendChild(tag);
   });
 
-  // Телеметрия: клик по карточке = "card_click"
   wrapper.addEventListener("click", (event) => {
-    // Не дублируем клик, если нажали на конкретные кнопки — они обработают сами
     const isActionButton = event.target.closest(".post-action");
     if (!isActionButton) {
       sendTelemetry(tgId, "card_click", card.id, { source: "card_body" });
     }
   });
 
-  // Телеметрия: лайк
   const likeBtn = wrapper.querySelector(".post-action-like");
   likeBtn.addEventListener("click", (event) => {
     event.stopPropagation();
@@ -156,45 +172,22 @@ function createPostCard(tgId, card) {
     sendTelemetry(tgId, "card_like", card.id, {});
   });
 
-  // Телеметрия: "прочитал до конца" — условно по клику на "⋯"
   const moreBtn = wrapper.querySelector(".post-action-more");
   moreBtn.addEventListener("click", (event) => {
     event.stopPropagation();
     sendTelemetry(tgId, "card_read_full", card.id, {});
   });
 
-  // При первом рендеринге считаем, что был view
   sendTelemetry(tgId, "card_view", card.id, { position: card.position });
 
   return wrapper;
 }
 
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
-
 // ===========================
-// Инициализация приложения
+// Инициализация фида
 // ===========================
 
-async function initApp() {
-  const tgId = getQueryParam("tg_id");
-
-  if (!tgId) {
-    if (feedLoadingEl) feedLoadingEl.classList.add("hidden");
-    if (feedErrorEl) {
-      feedErrorEl.textContent = "Missing tg_id in URL. Launch this WebApp from Telegram bot.";
-      feedErrorEl.classList.remove("hidden");
-    }
-    setFooter("tg_id missing");
-    return;
-  }
-
-  initTheme();
-
+async function initFeedForUser(tgId) {
   document.body.classList.add("loading");
   setFooter("Loading feed...");
 
@@ -232,4 +225,27 @@ async function initApp() {
   }
 }
 
-document.addEventListener("DOMContentLoaded", initApp);
+// ===========================
+// Точка входа
+// ===========================
+
+document.addEventListener("DOMContentLoaded", () => {
+  const tgId = getQueryParam("tg_id");
+
+  if (!tgId) {
+    if (feedLoadingEl) feedLoadingEl.classList.add("hidden");
+    if (feedErrorEl) {
+      feedErrorEl.textContent =
+        "Missing tg_id in URL. Launch this WebApp from Telegram bot.";
+      feedErrorEl.classList.remove("hidden");
+    }
+    setFooter("tg_id missing");
+    return;
+  }
+
+  // 1) выбор темы — привязан к этому tg_id
+  initThemeForUser(tgId);
+
+  // 2) загрузка ленты для этого tg_id
+  initFeedForUser(tgId);
+});
