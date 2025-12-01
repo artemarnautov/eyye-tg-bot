@@ -1,18 +1,49 @@
-<!-- file: webapp/index.html -->
+<!-- file: src/webapp/index.html -->
 <!DOCTYPE html>
-<html lang="ru">
-  <head>
-    <meta charset="UTF-8" />
-    <title>EYYE WebApp</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <!-- Telegram WebApp SDK -->
-    <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <!-- Подключаем стили из статик-пути backend'а -->
-    <link rel="stylesheet" href="/webapp/styles.css" />
-  </head>
-  <body>
-    <div id="app" class="root">Loading EYYE feed...</div>
-    <!-- Скрипт тоже берём из статик-пути -->
-    <script src="/webapp/app.js"></script>
-  </body>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>EYYE Feed</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Стили фронта -->
+  <link rel="stylesheet" href="/webapp/styles.css" />
+</head>
+<body>
+  <!-- Экран выбора темы -->
+  <div id="theme-onboarding" class="theme-onboarding hidden">
+    <div class="theme-onboarding-inner">
+      <h2>Choose your feed style</h2>
+      <p>We’ll make your EYYE feed feel like your Telegram.</p>
+      <div class="theme-buttons">
+        <button data-theme="light" class="theme-btn">Light</button>
+        <button data-theme="dark" class="theme-btn">Dark</button>
+        <button data-theme="glass" class="theme-btn">Glass</button>
+        <button data-theme="classic" class="theme-btn">Telegram classic</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- "Шапка канала" -->
+  <header class="app-header">
+    <div class="channel-avatar">E</div>
+    <div class="channel-info">
+      <div class="channel-title">EYYE Feed</div>
+      <div class="channel-subtitle">Personal Telegram-style feed for you</div>
+    </div>
+  </header>
+
+  <!-- Тело ленты -->
+  <main id="feed" class="feed">
+    <div id="feed-loading" class="feed-status">Loading your feed...</div>
+    <div id="feed-error" class="feed-status feed-status-error hidden"></div>
+  </main>
+
+  <!-- Небольшой футер/статус -->
+  <footer class="app-footer">
+    <span id="footer-status">Connected to EYYE</span>
+  </footer>
+
+  <!-- Логика фронта -->
+  <script src="/webapp/app.js" defer></script>
+</body>
 </html>
