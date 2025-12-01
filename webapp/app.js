@@ -1,251 +1,209 @@
 // file: webapp/app.js
+(function () {
+  'use strict';
 
-const FOOTER_STATUS = document.getElementById("footer-status");
-const feedEl = document.getElementById("feed");
-const feedLoadingEl = document.getElementById("feed-loading");
-const feedErrorEl = document.getElementById("feed-error");
-const themeOnboardingEl = document.getElementById("theme-onboarding");
-
-const THEME_KEY_PREFIX = "eyye_theme_";
-
-// ===========================
-// Утилиты
-// ===========================
-
-function getQueryParam(name) {
-  const url = new URL(window.location.href);
-  return url.searchParams.get(name);
-}
-
-function themeStorageKey(tgId) {
-  return `${THEME_KEY_PREFIX}${tgId}`;
-}
-
-function applyTheme(theme) {
-  document.body.dataset.theme = theme;
-}
-
-function setFooter(text) {
-  if (FOOTER_STATUS) FOOTER_STATUS.textContent = text;
-}
-
-function formatDateTime(isoString) {
-  if (!isoString) return "";
   try {
-    const d = new Date(isoString);
-    return d.toLocaleString(undefined, {
-      hour: "2-digit",
-      minute: "2-digit",
-      day: "2-digit",
-      month: "short",
-    });
-  } catch (e) {
-    return "";
-  }
-}
+    console.log('[EYYE] app.js starting');
 
-function escapeHtml(str) {
-  return String(str)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-}
+    const feedEl = document.getElementById('feed');
+    const feedLoadingEl = document.getElementById('feed-loading');
+    const feedErrorEl = document.getElementById('feed-error');
+    const footerStatusEl = document.getElementById('footer-status');
+    const onboardingEl = document.getElementById('theme-onboarding');
+    const themeButtons = document.querySelectorAll('.theme-btn');
 
-// ===========================
-// Тема: выбор один раз на пользователя
-// ===========================
-
-function initThemeForUser(tgId) {
-  if (!themeOnboardingEl) return;
-
-  const key = themeStorageKey(tgId);
-  const saved = localStorage.getItem(key);
-  const buttons = themeOnboardingEl.querySelectorAll(".theme-btn");
-
-  // Клики по кнопкам — сохраняем тему **под этим tg_id**
-  buttons.forEach((btn) => {
-    btn.addEventListener("click", () => {
-      const theme = btn.dataset.theme || "classic";
-      localStorage.setItem(key, theme);
-      applyTheme(theme);
-      themeOnboardingEl.classList.add("hidden");
-    });
-  });
-
-  if (saved) {
-    // Пользователь уже выбрал: применяем и убираем онбординг
-    applyTheme(saved);
-    themeOnboardingEl.classList.add("hidden");
-  } else {
-    // Первый заход этого tg_id: просим выбрать стиль
-    themeOnboardingEl.classList.remove("hidden");
-  }
-}
-
-// ===========================
-// API
-// ===========================
-
-async function fetchFeed(tgId, limit = 20) {
-  const url = `/api/feed?tg_id=${encodeURIComponent(tgId)}&limit=${limit}`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    throw new Error(`Feed request failed: ${res.status}`);
-  }
-  const data = await res.json();
-  return data.items || [];
-}
-
-async function sendTelemetry(tgId, eventType, cardId, meta = {}) {
-  const payload = {
-    tg_id: Number(tgId),
-    event_type: eventType,
-    card_id: cardId,
-    meta,
-  };
-  try {
-    await fetch("/api/telemetry", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-  } catch (e) {
-    console.debug("Telemetry send failed", e);
-  }
-}
-
-// ===========================
-// Рендер карточек
-// ===========================
-
-function createPostCard(tgId, card) {
-  const wrapper = document.createElement("article");
-  wrapper.className = "post-card";
-  wrapper.dataset.cardId = card.id;
-
-  const createdAt = formatDateTime(card.created_at);
-
-  wrapper.innerHTML = `
-    <div class="post-header">
-      <div class="post-header-avatar">E</div>
-      <div class="post-header-main">
-        <div class="post-header-title">EYYE · ${card.category || "News"}</div>
-        <div class="post-header-meta">${createdAt}</div>
-      </div>
-    </div>
-    <div class="post-title">${escapeHtml(card.title || "")}</div>
-    <div class="post-body">${escapeHtml(card.body || "")}</div>
-    <div class="post-footer">
-      <div class="post-tags"></div>
-      <div class="post-actions">
-        <button class="post-action post-action-like">
-          <span class="post-action-icon">👍</span>
-          <span>Like</span>
-        </button>
-        <button class="post-action post-action-more">
-          <span class="post-action-icon">⋯</span>
-        </button>
-      </div>
-    </div>
-  `;
-
-  const tagsEl = wrapper.querySelector(".post-tags");
-  const tags = Array.isArray(card.tags) ? card.tags : [];
-  tags.slice(0, 4).forEach((t) => {
-    const tag = document.createElement("span");
-    tag.className = "post-tag";
-    tag.textContent = String(t);
-    tagsEl.appendChild(tag);
-  });
-
-  wrapper.addEventListener("click", (event) => {
-    const isActionButton = event.target.closest(".post-action");
-    if (!isActionButton) {
-      sendTelemetry(tgId, "card_click", card.id, { source: "card_body" });
+    if (!feedEl || !feedLoadingEl || !feedErrorEl || !footerStatusEl || !onboardingEl) {
+      console.error('[EYYE] Missing some DOM elements', {
+        feedEl: !!feedEl,
+        feedLoadingEl: !!feedLoadingEl,
+        feedErrorEl: !!feedErrorEl,
+        footerStatusEl: !!footerStatusEl,
+        onboardingEl: !!onboardingEl,
+      });
     }
-  });
 
-  const likeBtn = wrapper.querySelector(".post-action-like");
-  likeBtn.addEventListener("click", (event) => {
-    event.stopPropagation();
-    likeBtn.classList.add("active");
-    sendTelemetry(tgId, "card_like", card.id, {});
-  });
+    const params = new URLSearchParams(window.location.search);
+    const tgId = params.get('tg_id');
 
-  const moreBtn = wrapper.querySelector(".post-action-more");
-  moreBtn.addEventListener("click", (event) => {
-    event.stopPropagation();
-    sendTelemetry(tgId, "card_read_full", card.id, {});
-  });
+    if (!tgId) {
+      console.error('[EYYE] Missing tg_id in URL');
+      if (feedLoadingEl) feedLoadingEl.classList.add('hidden');
+      if (feedErrorEl) {
+        feedErrorEl.textContent = 'Missing tg_id. Please open EYYE from Telegram bot.';
+        feedErrorEl.classList.remove('hidden');
+      }
+      if (footerStatusEl) footerStatusEl.textContent = 'Error: no tg_id';
+      return;
+    }
 
-  sendTelemetry(tgId, "card_view", card.id, { position: card.position });
+    const THEME_KEY = 'eyye_theme_' + tgId;
 
-  return wrapper;
-}
+    function setFooter(text) {
+      if (footerStatusEl) {
+        footerStatusEl.textContent = text;
+      }
+    }
 
-// ===========================
-// Инициализация фида
-// ===========================
+    function clearThemes() {
+      ['theme-light', 'theme-dark', 'theme-glass', 'theme-classic'].forEach((cls) => {
+        document.body.classList.remove(cls);
+      });
+    }
 
-async function initFeedForUser(tgId) {
-  document.body.classList.add("loading");
-  setFooter("Loading feed...");
+    function applyTheme(theme) {
+      clearThemes();
+      const cls = 'theme-' + theme;
+      document.body.classList.add(cls);
+      setFooter('Theme: ' + theme);
+      console.log('[EYYE] Applied theme', cls);
+    }
 
-  try {
-    const items = await fetchFeed(tgId, 25);
+    function saveTheme(theme) {
+      try {
+        localStorage.setItem(THEME_KEY, theme);
+        console.log('[EYYE] Saved theme', theme, 'for', THEME_KEY);
+      } catch (e) {
+        console.warn('[EYYE] Failed to save theme', e);
+      }
+    }
 
-    if (feedLoadingEl) feedLoadingEl.classList.add("hidden");
-    if (feedErrorEl) feedErrorEl.classList.add("hidden");
+    function getSavedTheme() {
+      try {
+        return localStorage.getItem(THEME_KEY);
+      } catch (e) {
+        console.warn('[EYYE] Failed to read theme from localStorage', e);
+        return null;
+      }
+    }
 
-    if (!items.length) {
-      const emptyEl = document.createElement("div");
-      emptyEl.className = "feed-status";
-      emptyEl.textContent =
-        "No posts yet for your profile. Come back a bit later, we’re generating content for you.";
-      feedEl.appendChild(emptyEl);
-      setFooter("No items in feed");
-    } else {
-      items.forEach((item, index) => {
-        item.position = index;
-        const card = createPostCard(tgId, item);
+    function renderFeed(items) {
+      if (!feedEl) return;
+
+      // Удаляем все карточки, но не статусы
+      const statusIds = new Set(['feed-loading', 'feed-error']);
+      Array.from(feedEl.children).forEach((child) => {
+        if (child.id && statusIds.has(child.id)) return;
+        feedEl.removeChild(child);
+      });
+
+      if (!items || !items.length) {
+        if (feedErrorEl) {
+          feedErrorEl.textContent = 'No posts yet for your profile. Come back later ✨';
+          feedErrorEl.classList.remove('hidden');
+        }
+        return;
+      }
+
+      items.forEach((item) => {
+        const card = document.createElement('article');
+        card.className = 'feed-item';
+
+        const titleEl = document.createElement('h3');
+        titleEl.className = 'feed-item-title';
+        titleEl.textContent = item.title || '';
+
+        const bodyEl = document.createElement('p');
+        bodyEl.className = 'feed-item-body';
+        bodyEl.textContent = item.body || '';
+
+        const metaEl = document.createElement('div');
+        metaEl.className = 'feed-item-meta';
+        const category = item.category || '';
+        const created = item.created_at || '';
+        metaEl.textContent = [category, created].filter(Boolean).join(' • ');
+
+        card.appendChild(titleEl);
+        card.appendChild(bodyEl);
+        card.appendChild(metaEl);
+
         feedEl.appendChild(card);
       });
-      setFooter(`Loaded ${items.length} posts`);
     }
-  } catch (e) {
-    console.error(e);
-    if (feedLoadingEl) feedLoadingEl.classList.add("hidden");
-    if (feedErrorEl) {
-      feedErrorEl.textContent = "Failed to load feed. Please try again.";
-      feedErrorEl.classList.remove("hidden");
+
+    async function loadFeed() {
+      console.log('[EYYE] loadFeed() called for tg_id=', tgId);
+
+      if (feedErrorEl) {
+        feedErrorEl.classList.add('hidden');
+        feedErrorEl.textContent = '';
+      }
+      if (feedLoadingEl) {
+        feedLoadingEl.classList.remove('hidden');
+        feedLoadingEl.textContent = 'Loading your feed...';
+      }
+      setFooter('Loading feed...');
+
+      try {
+        const resp = await fetch(`/api/feed?tg_id=${encodeURIComponent(tgId)}&limit=20`);
+        console.log('[EYYE] /api/feed response status', resp.status);
+
+        if (!resp.ok) {
+          throw new Error(`HTTP ${resp.status}`);
+        }
+
+        const data = await resp.json();
+        const items = data && Array.isArray(data.items) ? data.items : [];
+        console.log('[EYYE] Loaded items count', items.length);
+
+        if (feedLoadingEl) {
+          feedLoadingEl.classList.add('hidden');
+        }
+
+        renderFeed(items);
+
+        setFooter(
+          items.length
+            ? `Loaded ${items.length} posts`
+            : 'No posts yet for your profile. Come back later ✨'
+        );
+      } catch (err) {
+        console.error('[EYYE] loadFeed error', err);
+        if (feedLoadingEl) {
+          feedLoadingEl.classList.add('hidden');
+        }
+        if (feedErrorEl) {
+          feedErrorEl.textContent = 'Failed to load feed. Please try again.';
+          feedErrorEl.classList.remove('hidden');
+        }
+        setFooter('Error loading feed');
+      }
     }
-    setFooter("Error loading feed");
-  } finally {
-    document.body.classList.remove("loading");
+
+    // Навешиваем обработчики на кнопки выбора темы
+    themeButtons.forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const theme = btn.dataset.theme;
+        console.log('[EYYE] Theme button clicked', theme);
+        if (!theme) return;
+
+        applyTheme(theme);
+        saveTheme(theme);
+
+        if (onboardingEl) {
+          onboardingEl.classList.add('hidden');
+        }
+
+        // Сразу загружаем ленту после выбора темы
+        loadFeed();
+      });
+    });
+
+    const savedTheme = getSavedTheme();
+    if (savedTheme) {
+      console.log('[EYYE] Found saved theme', savedTheme);
+      if (onboardingEl) {
+        onboardingEl.classList.add('hidden');
+      }
+      applyTheme(savedTheme);
+      loadFeed();
+    } else {
+      console.log('[EYYE] No saved theme, show onboarding');
+      if (onboardingEl) {
+        onboardingEl.classList.remove('hidden');
+      }
+      setFooter('Choose your theme to start');
+    }
+  } catch (err) {
+    console.error('[EYYE] Fatal init error in app.js', err);
   }
-}
-
-// ===========================
-// Точка входа
-// ===========================
-
-document.addEventListener("DOMContentLoaded", () => {
-  const tgId = getQueryParam("tg_id");
-
-  if (!tgId) {
-    if (feedLoadingEl) feedLoadingEl.classList.add("hidden");
-    if (feedErrorEl) {
-      feedErrorEl.textContent =
-        "Missing tg_id in URL. Launch this WebApp from Telegram bot.";
-      feedErrorEl.classList.remove("hidden");
-    }
-    setFooter("tg_id missing");
-    return;
-  }
-
-  // 1) выбор темы — привязан к этому tg_id
-  initThemeForUser(tgId);
-
-  // 2) загрузка ленты для этого tg_id
-  initFeedForUser(tgId);
-});
+})();
