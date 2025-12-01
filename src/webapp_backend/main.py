@@ -1,278 +1,262 @@
-# file: webapp_backend/main.py
+# file: src/webapp_backend/main.py
+import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
-from supabase import Client, create_client
-
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from supabase import Client, create_client
+
+from .cards_service import get_personalized_cards_for_user, DEFAULT_FEED_TAGS
+from .profile_service import (
+    build_and_save_structured_profile,
+    get_or_build_profile_for_feed,
+)
 
 load_dotenv()
-
-logger = logging.getLogger("eyye.webapp_backend")
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("Supabase client initialized in webapp_backend")
-    except Exception:
-        logger.exception("Failed to initialize Supabase client in webapp_backend")
-        supabase = None
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    logger.info("Supabase client initialized in webapp_backend")
 else:
-    logger.warning("SUPABASE_URL / SUPABASE_KEY are not set. API will run in degraded mode.")
+    logger.warning("Supabase credentials are not set; backend will run without DB")
 
-# Базовые настройки ленты
-DEFAULT_FEED_TAGS: List[str] = ["world_news", "business", "tech", "uk_students"]
-DEFAULT_FEED_LIMIT: int = 20
-
-# Пути к статике
-BASE_DIR = Path(__file__).resolve().parents[2]  # /root/eyye-tg-bot
-WEBAPP_DIR = BASE_DIR / "webapp"
+# ===== FastAPI и статика =====
 
 app = FastAPI(title="EYYE WebApp Backend", version="0.1.0")
 
+# WebApp крутится в том же origin, так что CORS почти не нужен,
+# но оставим минимальные настройки.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # при желании можно зажать до конкретного домена
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+ROOT_DIR = Path(__file__).resolve().parents[2]  # .../eyye-tg-bot/
+WEBAPP_DIR = ROOT_DIR / "webapp"
+
 if WEBAPP_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(WEBAPP_DIR), html=False), name="static")
+    app.mount(
+        "/webapp",
+        StaticFiles(directory=str(WEBAPP_DIR), html=True),
+        name="webapp",
+    )
 else:
-    logger.warning("WEBAPP_DIR %s does not exist; static files will not be served", WEBAPP_DIR)
+    logger.warning("WEBAPP_DIR %s does not exist; static files not mounted", WEBAPP_DIR)
 
-
-# ==========================
-# Pydantic-модели
-# ==========================
-
-class CityUpdate(BaseModel):
-    user_id: int
-    city: Optional[str] = None
-
-
-class TopicsUpdate(BaseModel):
-    user_id: int
-    tags: List[str]
-
-
-# ==========================
-# Вспомогательные функции
-# ==========================
-
-def _require_supabase() -> Client:
-    if not supabase:
-        raise HTTPException(status_code=500, detail="Supabase is not configured")
-    return supabase
-
-
-def _load_user_topic_tags(user_id: int) -> Dict[str, float]:
-    client = _require_supabase()
-    try:
-        resp = (
-            client.table("user_topic_weights")
-            .select("tag, weight")
-            .eq("user_id", user_id)
-            .execute()
-        )
-    except Exception:
-        logger.exception("Error loading user_topic_weights for user_id=%s", user_id)
-        return {}
-
-    data = getattr(resp, "data", None)
-    if data is None:
-        data = getattr(resp, "model", None)
-    if not data:
-        return {}
-
-    result: Dict[str, float] = {}
-    for row in data:
-        tag = row.get("tag")
-        if not tag:
-            continue
-        try:
-            weight = float(row.get("weight", 0.0))
-        except (TypeError, ValueError):
-            weight = 0.0
-        if weight != 0.0:
-            result[str(tag)] = weight
-    return result
-
-
-def _fetch_cards_for_tags(tags: List[str], limit: int) -> List[Dict[str, Any]]:
-    client = _require_supabase()
-
-    try:
-        query = (
-            client.table("cards")
-            .select("id, title, body, tags, importance_score, created_at")
-            .eq("is_active", True)
-        )
-
-        if tags:
-            query = query.overlaps("tags", tags)
-
-        resp = query.order("created_at", desc=True).limit(limit).execute()
-    except Exception:
-        logger.exception("Error fetching cards from Supabase")
-        return []
-
-    data = getattr(resp, "data", None)
-    if data is None:
-        data = getattr(resp, "model", None)
-    return data or []
-
-
-# ==========================
-# Роуты
-# ==========================
 
 @app.get("/ping")
-async def ping() -> Dict[str, Any]:
+async def ping() -> Dict[str, str]:
     return {"status": "ok", "service": "eyye-webapp-backend"}
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index() -> HTMLResponse:
+@app.get("/")
+async def index() -> FileResponse:
     """
     Отдаём index.html WebApp.
+    Внутри Telegram WebApp будет открываться этот роут с ?tg_id=...
     """
-    index_path = WEBAPP_DIR / "index.html"
-    if not index_path.exists():
-        raise HTTPException(status_code=404, detail="index.html not found")
-    try:
-        html = index_path.read_text(encoding="utf-8")
-    except Exception:
-        logger.exception("Failed to read index.html from %s", index_path)
-        raise HTTPException(status_code=500, detail="Failed to load WebApp")
-    return HTMLResponse(content=html)
+    index_file = WEBAPP_DIR / "index.html"
+    if not index_file.exists():
+        raise HTTPException(status_code=500, detail="index.html not found")
+    return FileResponse(str(index_file))
 
+
+# ===== Модели запросов =====
+
+class CityUpdate(BaseModel):
+    tg_id: int
+    city: str
+
+
+class TopicsUpdate(BaseModel):
+    tg_id: int
+    topics: List[str]
+
+
+# ===== API профиля =====
 
 @app.post("/api/profile/city")
-async def update_city(payload: CityUpdate) -> JSONResponse:
+async def update_city(payload: CityUpdate) -> Dict[str, Any]:
     """
-    Обновляем город пользователя в user_profiles.
-    Если записи нет — создаём.
+    Сохраняем/обновляем город пользователя в user_profiles.
     """
-    client = _require_supabase()
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase is not configured")
 
-    data: Dict[str, Any] = {
-        "user_id": payload.user_id,
-        "location_city": payload.city or None,
+    data = {
+        "user_id": payload.tg_id,
+        "location_city": payload.city.strip() or None,
     }
 
     try:
         resp = (
-            client.table("user_profiles")
+            supabase.table("user_profiles")
             .upsert(data, on_conflict="user_id")
             .execute()
         )
-        logger.info("Upsert user_profiles city for user_id=%s: %s", payload.user_id, resp)
-    except Exception:
-        logger.exception("Failed to upsert user_profiles.city for user_id=%s", payload.user_id)
-        raise HTTPException(status_code=500, detail="Failed to update city")
+        logger.info(
+            "Upsert user_profiles city for user_id=%s: %s",
+            payload.tg_id,
+            getattr(resp, "data", None),
+        )
+    except Exception as e:
+        logger.exception("Error updating city for user_id=%s", payload.tg_id)
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return JSONResponse({"status": "ok"})
+    return {"status": "ok"}
 
 
 @app.post("/api/profile/topics")
-async def update_topics(payload: TopicsUpdate) -> JSONResponse:
+async def update_topics(payload: TopicsUpdate) -> Dict[str, Any]:
     """
-    Обновляем веса тем пользователя:
-    - удаляем старые записи в user_topic_weights
-    - создаём новые (weight = 1.0) для переданных тегов
+    Сохраняем выбранные темы пользователя в user_topic_weights.
+    Параллельно в фоне запускаем построение structured_profile через OpenAI.
     """
-    client = _require_supabase()
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase is not configured")
 
-    tags = [t.strip() for t in payload.tags if t.strip()]
+    user_id = payload.tg_id
+    topics = [t.strip() for t in payload.topics if t.strip()]
+
     try:
-        # Удаляем старые веса
-        resp_del = (
-            client.table("user_topic_weights")
-            .delete()
-            .eq("user_id", payload.user_id)
-            .execute()
-        )
-        logger.info(
-            "Deleted old user_topic_weights for user_id=%s: %s",
-            payload.user_id,
-            resp_del,
-        )
+        # Сначала очищаем старые веса
+        supabase.table("user_topic_weights").delete().eq("user_id", user_id).execute()
 
-        if tags:
+        if topics:
             rows = [
-                {"user_id": payload.user_id, "tag": tag, "weight": 1.0}
-                for tag in tags
+                {"user_id": user_id, "tag": tag, "weight": 1.0}
+                for tag in topics
             ]
-            resp_ins = client.table("user_topic_weights").insert(rows).execute()
-            logger.info(
-                "Inserted %d user_topic_weights rows for user_id=%s: %s",
-                len(rows),
-                payload.user_id,
-                resp_ins,
-            )
+            supabase.table("user_topic_weights").insert(rows).execute()
+
+        logger.info("Updated user_topic_weights for user_id=%s: %s", user_id, topics)
     except Exception:
-        logger.exception("Failed to update user_topic_weights for user_id=%s", payload.user_id)
+        logger.exception("Error updating user_topic_weights for user_id=%s", user_id)
         raise HTTPException(status_code=500, detail="Failed to update topics")
 
-    return JSONResponse({"status": "ok"})
+    # Вытащим город из user_profiles (если есть),
+    # чтобы построить structured_profile с учётом города.
+    city: Optional[str] = None
+    try:
+        resp = (
+            supabase.table("user_profiles")
+            .select("location_city")
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        data = getattr(resp, "data", None) or getattr(resp, "model", None) or []
+        if data:
+            city = data[0].get("location_city")
+    except Exception:
+        logger.exception("Error loading city for structured_profile, user_id=%s", user_id)
 
+    # В фоне строим structured_profile (через OpenAI или fallback).
+    # Это не блокирует ответ фронту.
+    asyncio.create_task(
+        asyncio.to_thread(
+            build_and_save_structured_profile,
+            supabase,
+            user_id,
+            topics or DEFAULT_FEED_TAGS,
+            "ru",
+        )
+    )
+
+    return {"status": "ok"}
+
+
+# ===== API ленты =====
 
 @app.get("/api/feed")
-async def get_feed(
+async def api_feed(
     tg_id: int = Query(..., description="Telegram user id"),
-    limit: int = Query(DEFAULT_FEED_LIMIT, ge=1, le=100),
+    limit: int = Query(15, ge=1, le=50),
 ) -> JSONResponse:
     """
     Главный эндпоинт ленты для WebApp.
 
     Логика:
-    - читаем теги интересов пользователя из user_topic_weights;
-    - если тегов нет — используем DEFAULT_FEED_TAGS;
-    - достаём карточки из cards с пересечением по tags;
-    - сортируем по importance_score + перекрытию тегов;
-    - возвращаем JSON с массивом items.
+    1) Берём веса интересов пользователя (user_topic_weights).
+    2) Из них и/или из DEFAULT_FEED_TAGS строим base_tags.
+    3) Загружаем structured_profile (если есть) или fallback-профиль.
+    4) cards_service:
+       - берёт кандидатов из cards по тегам,
+       - при нехватке генерирует новые карточки через OpenAI,
+       - ранжирует и возвращает TOP-N.
     """
-    _ = _require_supabase()
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase is not configured")
 
-    topic_weights = _load_user_topic_tags(tg_id)
-    tags: List[str] = list(topic_weights.keys())
+    # 1) Извлекаем динамические веса интересов пользователя
+    from .cards_service import get_user_topic_weights  # локальный импорт, чтобы избежать циклов
 
-    if not tags:
-        tags = DEFAULT_FEED_TAGS
+    topic_weights = get_user_topic_weights(supabase, tg_id)
+    base_tags = list(topic_weights.keys()) or DEFAULT_FEED_TAGS
 
-    cards = _fetch_cards_for_tags(tags, limit=limit * 2)
+    # 2) Строим профиль для ленты (structured_profile или fallback)
+    profile_dict = get_or_build_profile_for_feed(supabase, tg_id, base_tags)
 
-    ranked: List[Dict[str, Any]] = []
+    # 3) Берём персональные карточки
+    cards = await asyncio.to_thread(
+        get_personalized_cards_for_user,
+        supabase,
+        tg_id,
+        profile_dict,
+        "ru",
+        limit,
+    )
+
+    if not cards:
+        return JSONResponse(
+            {
+                "items": [],
+                "debug": {
+                    "reason": "no_cards",
+                    "base_tags": base_tags,
+                },
+            }
+        )
+
+    # Отдаём только те поля, которые нужны фронту (можно расширить по мере надобности).
+    items: List[Dict[str, Any]] = []
     for card in cards:
-        try:
-            importance = float(card.get("importance_score") or 1.0)
-        except (TypeError, ValueError):
-            importance = 1.0
+        items.append(
+            {
+                "id": card.get("id"),
+                "title": card.get("title"),
+                "body": card.get("body"),
+                "tags": card.get("tags") or [],
+                "category": card.get("category"),
+                "importance_score": card.get("importance_score"),
+                "created_at": card.get("created_at"),
+                "source_type": card.get("source_type"),
+                "source_ref": card.get("source_ref"),
+            }
+        )
 
-        card_tags = card.get("tags") or []
-        if not isinstance(card_tags, list):
-            card_tags = []
-
-        overlap = len(set(card_tags) & set(tags))
-        score = importance + 0.3 * overlap
-
-        card_copy = dict(card)
-        card_copy["_score"] = score
-        ranked.append(card_copy)
-
-    ranked.sort(key=lambda c: c.get("_score", 0.0), reverse=True)
-    for c in ranked:
-        c.pop("_score", None)
-
-    items = ranked[:limit]
-
-    return JSONResponse({"items": items})
+    return JSONResponse(
+        {
+            "items": items,
+            "debug": {
+                "base_tags": base_tags,
+                "used_structured_profile": bool(profile_dict),
+            },
+        }
+    )
