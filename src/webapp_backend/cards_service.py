@@ -1,117 +1,48 @@
 # file: src/webapp_backend/cards_service.py
-import json
 import logging
 import os
-import re
-import time
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Tuple
 
 from supabase import Client
 
-from .openai_client import call_openai_chat
+from .profile_service import get_interest_tags_for_user
+from .openai_client import generate_cards_for_tags, is_configured as openai_is_configured
 
 logger = logging.getLogger(__name__)
 
-FEED_CARDS_LIMIT = int(os.getenv("FEED_CARDS_LIMIT", "15"))
-FEED_MAX_CARD_AGE_HOURS = float(os.getenv("FEED_MAX_CARD_AGE_HOURS", "48"))
-FEED_OPENAI_COOLDOWN_SECONDS = int(os.getenv("FEED_OPENAI_COOLDOWN_SECONDS", "60"))
+FEED_CARDS_LIMIT_DEFAULT = int(os.getenv("FEED_CARDS_LIMIT", "20"))
+FEED_MAX_CARD_AGE_HOURS = int(os.getenv("FEED_MAX_CARD_AGE_HOURS", "48"))
 
-DEFAULT_FEED_TAGS: List[str] = [
-    "world_news",
-    "business",
-    "tech",
-    "uk_students",
-]
+LLM_CARD_GENERATION_ENABLED = (
+    os.getenv("LLM_CARD_GENERATION_ENABLED", "true").lower() in ("1", "true", "yes")
+)
 
-_last_feed_openai_call: Dict[int, datetime] = {}
+DEFAULT_FEED_TAGS: List[str] = ["world_news", "business", "tech", "uk_students"]
 
 
-def _is_allowed_feed_openai_call(user_id: int) -> bool:
-    """
-    Простейший rate-limit для генерации НОВЫХ карточек через OpenAI.
-    """
-    if FEED_OPENAI_COOLDOWN_SECONDS <= 0:
-        return True
-
-    now = datetime.now(timezone.utc)
-    last = _last_feed_openai_call.get(user_id)
-    if not last:
-        _last_feed_openai_call[user_id] = now
-        return True
-
-    delta = (now - last).total_seconds()
-    if delta >= FEED_OPENAI_COOLDOWN_SECONDS:
-        _last_feed_openai_call[user_id] = now
-        return True
-
-    return False
-
-
-def get_user_topic_weights(supabase: Optional[Client], user_id: int) -> Dict[str, float]:
-    """
-    Читаем user_topic_weights и возвращаем {tag: weight}.
-    """
-    if not supabase:
-        return {}
-
-    try:
-        resp = (
-            supabase.table("user_topic_weights")
-            .select("tag, weight")
-            .eq("user_id", user_id)
-            .execute()
-        )
-    except Exception:
-        logger.exception("Error loading user_topic_weights for user_id=%s", user_id)
-        return {}
-
-    data = getattr(resp, "data", None) or getattr(resp, "model", None) or []
-    result: Dict[str, float] = {}
-    for row in data:
-        tag = row.get("tag")
-        if not tag:
-            continue
-        try:
-            w = float(row.get("weight", 0.0))
-        except (TypeError, ValueError):
-            w = 0.0
-        if w != 0.0:
-            result[str(tag)] = w
-    return result
-
-
-def _extract_interest_tags_from_profile(profile_dict: Dict[str, Any]) -> List[str]:
-    """
-    Берём interests_as_tags из structured_profile / fallback-профиля.
-    """
-    tags = profile_dict.get("interests_as_tags") or []
-    if not isinstance(tags, list):
-        tags = []
-    normalized: List[str] = []
-    for t in tags:
-        s = str(t).strip()
-        if s:
-            normalized.append(s)
-    return list(dict.fromkeys(normalized))
-
-
-def fetch_candidate_cards(
-    supabase: Optional[Client],
+def _fetch_candidate_cards(
+    supabase: Client,
     tags: List[str],
     limit: int,
 ) -> List[Dict[str, Any]]:
     """
-    Кандидаты из таблицы cards:
-    - если есть теги — берём карточки, у которых tags пересекаются с нашими тегами;
-    - если тегов нет — свежие карточки по created_at.
+    Берём кандидатов из таблицы cards:
+    - только is_active = true
+    - только достаточно свежие (created_at >= now - FEED_MAX_CARD_AGE_HOURS)
+    - если есть теги, используем overlaps(tags, tags_array).
     """
-    if not supabase:
-        logger.warning("Supabase is not configured, fetch_candidate_cards -> []")
-        return []
+    now = datetime.now(timezone.utc)
+    min_created_at = now - timedelta(hours=FEED_MAX_CARD_AGE_HOURS)
+    min_created_at_str = min_created_at.isoformat()
 
     try:
-        query = supabase.table("cards").select("*").eq("is_active", True)
+        query = (
+            supabase.table("cards")
+            .select("id,title,body,tags,importance_score,created_at")
+            .eq("is_active", True)
+            .gte("created_at", min_created_at_str)
+        )
 
         if tags:
             query = query.overlaps("tags", tags)
@@ -121,21 +52,19 @@ def fetch_candidate_cards(
         logger.exception("Error fetching candidate cards from Supabase")
         return []
 
-    data = getattr(resp, "data", None) or getattr(resp, "model", None) or []
-    return data
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+    return data or []
 
 
 def _score_cards_for_user(
     cards: List[Dict[str, Any]],
     base_tags: List[str],
-    topic_weights: Dict[str, float],
 ) -> List[Dict[str, Any]]:
     """
-    Скоринг карточек:
-    - importance_score,
-    - совпадение по тегам профиля,
-    - динамические веса,
-    - свежесть.
+    Простейший скор для карточек:
+    importance_score + бонус за совпадение тегов + бонус за свежесть.
     """
     now = datetime.now(timezone.utc)
     base_tag_set = set(base_tags)
@@ -157,10 +86,6 @@ def _score_cards_for_user(
             if t in base_tag_set:
                 profile_bonus += 0.3
 
-        dyn_bonus = 0.0
-        for t in card_tags:
-            dyn_bonus += topic_weights.get(t, 0.0)
-
         recency_bonus = 0.0
         created_at = card.get("created_at")
         if isinstance(created_at, str):
@@ -172,281 +97,128 @@ def _score_cards_for_user(
             except Exception:
                 pass
 
-        score = importance + profile_bonus + dyn_bonus + recency_bonus
+        score = importance + profile_bonus + recency_bonus
         scored.append((score, card))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [c for score, c in scored]
 
 
-# -------- Работа с "кривым" JSON от OpenAI (по мотивам старого бота) --------
-
-CARD_OBJECT_RE = re.compile(
-    r'\{\s*"id"\s*:\s*"(?P<id>[^"]+)"(?P<body>.*?)\}',
-    re.DOTALL,
-)
-
-
-def _parse_openai_cards_from_text(content: str) -> List[Dict[str, Any]]:
-    if not content:
-        return []
-
-    cards: List[Dict[str, Any]] = []
-
-    def _extract_str(block: str, field: str) -> Optional[str]:
-        m = re.search(rf'"{field}"\s*:\s*"([^"]*)"', block)
-        if m:
-            return m.group(1).strip() or None
-        return None
-
-    def _extract_float(block: str, field: str, default: float = 1.0) -> float:
-        m = re.search(rf'"{field}"\s*:\s*([0-9]+(\.[0-9]+)?)', block)
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                return default
-        return default
-
-    for idx, m in enumerate(CARD_OBJECT_RE.finditer(content), start=1):
-        block = m.group(0)
-
-        card_id = m.group("id") or f"item_{idx}"
-
-        title = _extract_str(block, "title") or "Новость для тебя"
-        summary = _extract_str(block, "summary") or ""
-        topic = _extract_str(block, "topic")
-        tag = _extract_str(block, "tag")
-        importance = _extract_float(block, "importance", 1.0)
-
-        if not title and not summary:
-            continue
-
-        cards.append(
-            {
-                "id": card_id,
-                "title": title,
-                "summary": summary,
-                "topic": topic,
-                "tag": tag,
-                "importance": importance,
-            }
-        )
-
-    return cards
-
-
-def _generate_cards_for_tags_via_openai_sync(
-    tags: List[str],
-    language: str,
-    count: int,
+def _insert_cards_into_db(
+    supabase: Client,
+    cards: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     """
-    Генерация новых карточек через OpenAI.
-    Сейчас это «искусственные» карточки, но архитектурно
-    это то же звено пайплайна, что будет переписывать
-    реальные новости из Telegram / Wikipedia.
+    Вставляем сгенерированные карточки в таблицу cards.
+    Отправляем только очевидные поля, чтобы не упереться в несовпадение схемы.
     """
-    if not tags:
-        tags = DEFAULT_FEED_TAGS
-
-    system_prompt = (
-        "Ты – движок новостной ленты EYYE.\n"
-        "Твоя задача – сгенерировать короткие новостные карточки в одном стиле.\n"
-        "Каждая карточка: заголовок и 2–4 абзаца текста.\n"
-        "Пиши на языке, указанном в параметрах (ru или en).\n"
-        "Отвечай строго валидным JSON без лишнего текста."
-    )
-
-    user_payload = {
-        "language": language,
-        "count": count,
-        "tags": tags,
-        "requirements": [
-            "Карточки должны быть интересными и понятными.",
-            "Не выдумывай факты про конкретных людей, лучше обобщай тенденции.",
-            "Избегай кликбейта, но делай заголовки цепляющими.",
-        ],
-        "output_format": {
-            "cards": [
-                {
-                    "title": "string",
-                    "body": "string",
-                    "tags": ["string"],
-                    "category": "string",
-                    "importance_score": 1.0,
-                }
-            ]
-        },
-    }
-
-    payload: Dict[str, Any] = {
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
-        ],
-        "max_output_tokens": 1200,
-        "temperature": 0.7,
-        "response_format": {"type": "json_object"},
-    }
-
-    started = time.monotonic()
-    resp_json = call_openai_chat(payload)
-    elapsed = time.monotonic() - started
-    logger.info("OpenAI card generation call finished in %.2fs", elapsed)
-
-    if not resp_json:
+    if not cards:
         return []
 
-    choices = resp_json.get("choices")
-    if not isinstance(choices, list) or not choices:
-        logger.error("No choices in OpenAI card generation response")
-        return []
+    payload: List[Dict[str, Any]] = []
+    for c in cards:
+        title = (c.get("title") or "").strip()
+        body = (c.get("body") or "").strip()
+        tags = c.get("tags") or []
+        if not isinstance(tags, list):
+            tags = [str(tags)]
 
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    if not isinstance(content, str) or not content.strip():
-        logger.error("Empty content in OpenAI cards response")
-        return []
-
-    logger.debug(
-        "OpenAI cards raw content (first 200 chars): %s",
-        content[:200].replace("\n", " "),
-    )
-
-    raw_cards: List[Dict[str, Any]] = []
-
-    try:
-        parsed = json.loads(content)
-        if not isinstance(parsed, dict):
-            raise ValueError("Parsed card JSON is not an object")
-
-        raw_cards = parsed.get("cards") or parsed.get("items")
-        if not isinstance(raw_cards, list) or not raw_cards:
-            raise ValueError("No 'cards' or 'items' list in card JSON")
-
-    except json.JSONDecodeError:
-        logger.exception(
-            "Failed to parse OpenAI card generation response as JSON. "
-            "Trying to salvage items from raw text."
-        )
-        raw_cards = _parse_openai_cards_from_text(content)
-        if not raw_cards:
-            logger.error("Salvage parser did not find any valid card items.")
-            return []
-        logger.warning(
-            "Salvage parser recovered %d card items from broken JSON.",
-            len(raw_cards),
-        )
-    except Exception:
-        logger.exception("Failed to parse OpenAI card generation response")
-        return []
-
-    result: List[Dict[str, Any]] = []
-    for c in raw_cards:
-        if not isinstance(c, dict):
-            continue
-
-        title = str(c.get("title", "")).strip()
-        body = str(c.get("body") or c.get("summary") or "").strip()
         if not title or not body:
             continue
 
-        card_tags = c.get("tags") or c.get("tag") or tags
-        if not isinstance(card_tags, list):
-            card_tags = [str(card_tags)] if card_tags else tags
-
-        category = c.get("category") or c.get("topic") or None
         try:
-            importance = float(c.get("importance_score", c.get("importance", 1.0)))
+            importance = float(c.get("importance_score", 1.0))
         except (TypeError, ValueError):
             importance = 1.0
 
-        result.append(
+        payload.append(
             {
-                "source_type": "llm",
-                "source_ref": None,
                 "title": title,
                 "body": body,
-                "tags": [str(t).strip() for t in card_tags if t],
-                "category": category,
-                "language": language,
+                "tags": [str(t).strip() for t in tags if t],
                 "importance_score": importance,
-                "meta": {
-                    # в будущем сюда будут добавляться ссылки на Telegram / Wikipedia,
-                    # которые мы переписываем.
-                    "generated_for_tags": tags,
-                },
+                "is_active": True,
             }
         )
 
-    return result
-
-
-def _insert_cards_into_db(
-    supabase: Optional[Client],
-    cards: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    if not cards:
-        return []
-    if not supabase:
-        logger.warning("Supabase is not configured, skip inserting cards into DB")
+    if not payload:
         return []
 
     try:
-        resp = supabase.table("cards").insert(cards).execute()
+        resp = supabase.table("cards").insert(payload).execute()
     except Exception:
-        logger.exception("Error inserting cards into DB")
+        logger.exception("Error inserting generated cards into Supabase")
         return []
 
-    data = getattr(resp, "data", None) or getattr(resp, "model", None) or []
-    logger.info("Inserted %d cards into DB", len(data))
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+    data = data or []
+    logger.info("Inserted %d generated cards into DB", len(data))
     return data
 
 
-def get_personalized_cards_for_user(
-    supabase: Optional[Client],
+def build_feed_for_user(
+    supabase: Client | None,
     user_id: int,
-    profile_dict: Dict[str, Any],
-    language: str = "ru",
-    limit: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+    limit: int | None = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Основная функция для /api/feed:
-    - берём интересы пользователя (interests_as_tags + user_topic_weights),
-    - вытаскиваем кандидатов из cards,
-    - при нехватке карт генерируем новые через OpenAI,
-    - возвращаем TOP-N с учётом скоринга.
+    Основная точка входа для /api/feed.
+
+    Возвращает:
+    - items: список карточек для пользователя
+    - debug: отладочная информация (reason, base_tags и т.п.)
     """
-    if not supabase:
-        logger.warning("Supabase is not configured, cannot build personalized cards")
-        return []
+    debug: Dict[str, Any] = {}
 
-    if limit is None:
-        limit = FEED_CARDS_LIMIT
+    if supabase is None:
+        debug["reason"] = "no_supabase"
+        debug["base_tags"] = []
+        return [], debug
 
-    base_tags = _extract_interest_tags_from_profile(profile_dict)
+    if limit is None or limit <= 0:
+        limit = FEED_CARDS_LIMIT_DEFAULT
+    limit = min(max(limit, 1), 50)
+
+    # 1. Теги интересов пользователя
+    base_tags = get_interest_tags_for_user(supabase, user_id)
     if not base_tags:
         base_tags = DEFAULT_FEED_TAGS
+    debug["base_tags"] = base_tags
 
-    topic_weights = get_user_topic_weights(supabase, user_id)
+    # 2. Пробуем взять карточки из БД
+    candidates = _fetch_candidate_cards(
+        supabase, base_tags, limit=limit * 3
+    )
 
-    candidates = fetch_candidate_cards(supabase, base_tags, limit=limit * 3)
+    if candidates:
+        ranked = _score_cards_for_user(candidates, base_tags)
+        debug["reason"] = "cards_from_db"
+        debug["candidates"] = len(candidates)
+        return ranked[:limit], debug
 
-    if len(candidates) < limit and _is_allowed_feed_openai_call(user_id):
-        need = max(limit * 2 - len(candidates), limit)
+    # 3. В БД пусто — пробуем сгенерировать через OpenAI
+    if LLM_CARD_GENERATION_ENABLED and openai_is_configured():
+        need_count = max(limit * 2, 20)
         logger.info(
-            "Not enough cards in DB for user_id=%s (have %d). Generating ~%d new cards via OpenAI.",
+            "No cards in DB for user_id=%s. Generating ~%d cards via OpenAI.",
             user_id,
-            len(candidates),
-            need,
+            need_count,
         )
-        new_cards = _generate_cards_for_tags_via_openai_sync(base_tags, language, need)
-        inserted = _insert_cards_into_db(supabase, new_cards)
-        candidates.extend(inserted)
+        generated = generate_cards_for_tags(
+            tags=base_tags,
+            language="ru",
+            count=need_count,
+        )
+        if generated:
+            inserted = _insert_cards_into_db(supabase, generated)
+            if inserted:
+                ranked = _score_cards_for_user(inserted, base_tags)
+                debug["reason"] = "generated_via_openai"
+                debug["generated"] = len(inserted)
+                return ranked[:limit], debug
 
-    if not candidates:
-        return []
-
-    ranked = _score_cards_for_user(candidates, base_tags, topic_weights)
-    return ranked[:limit]
+    # 4. Не удалось ничего добыть
+    debug["reason"] = "no_cards"
+    return [], debug
