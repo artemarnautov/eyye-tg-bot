@@ -20,6 +20,10 @@ LLM_CARD_GENERATION_ENABLED = (
 
 DEFAULT_FEED_TAGS: List[str] = ["world_news", "business", "tech", "uk_students"]
 
+# Дефолтный источник только для чисто LLM-карточек,
+# когда у нас нет реального канала/СМИ.
+DEFAULT_SOURCE_NAME = os.getenv("DEFAULT_SOURCE_NAME", "EYYE • AI-подборка")
+
 
 def _fetch_candidate_cards(
     supabase: Client,
@@ -39,7 +43,10 @@ def _fetch_candidate_cards(
     try:
         query = (
             supabase.table("cards")
-            .select("id,title,body,tags,importance_score,created_at")
+            .select(
+                "id,source_type,source_ref,title,body,tags,category,"
+                "language,importance_score,created_at,is_active,meta"
+            )
             .eq("is_active", True)
             .gte("created_at", min_created_at_str)
         )
@@ -107,10 +114,24 @@ def _score_cards_for_user(
 def _insert_cards_into_db(
     supabase: Client,
     cards: List[Dict[str, Any]],
+    *,
+    language: str = "ru",
+    source_type: str = "llm",
+    fallback_source_name: str | None = None,
+    source_ref: str | None = None,
 ) -> List[Dict[str, Any]]:
     """
-    Вставляем сгенерированные карточки в таблицу cards.
-    Отправляем только очевидные поля, чтобы не упереться в несовпадение схемы.
+    Вставляем сгенерированные/переформатированные карточки в таблицу cards.
+
+    Приоритет источника:
+    1) c["source_name"] / c["source"] / c["channel_name"], если модель вернула.
+    2) fallback_source_name (например, название телеграм-канала, из которого мы спарсили пост).
+    3) DEFAULT_SOURCE_NAME ("EYYE • AI-подборка") — только если нет реального источника.
+
+    language / source_type / source_ref:
+    - language: язык карточки ("ru", "en", ...)
+    - source_type: "telegram", "rss", "llm" и т.п.
+    - source_ref: например, ссылка или message_id канала.
     """
     if not cards:
         return []
@@ -131,6 +152,32 @@ def _insert_cards_into_db(
         except (TypeError, ValueError):
             importance = 1.0
 
+        # 1) Пытаемся взять источник из ответа модели / препроцессора
+        raw_source_name = (
+            c.get("source_name")
+            or c.get("source")
+            or c.get("channel_name")
+            or c.get("channel_title")
+        )
+
+        # 2) Если модель ничего не дала — используем fallback_source_name
+        if not raw_source_name and fallback_source_name:
+            raw_source_name = fallback_source_name
+
+        # 3) Если вообще ничего нет — используем дефолтный источник для чистого LLM
+        if not raw_source_name:
+            raw_source_name = DEFAULT_SOURCE_NAME
+
+        source_name = str(raw_source_name).strip()
+
+        # Если у самой карточки есть source_ref/url — используем его как референс
+        card_source_ref = c.get("source_ref") or c.get("url") or c.get("link")
+        final_source_ref = source_ref or card_source_ref
+
+        meta: Dict[str, Any] = {
+            "source_name": source_name,
+        }
+
         payload.append(
             {
                 "title": title,
@@ -138,6 +185,10 @@ def _insert_cards_into_db(
                 "tags": [str(t).strip() for t in tags if t],
                 "importance_score": importance,
                 "is_active": True,
+                "source_type": source_type,
+                "source_ref": final_source_ref,
+                "language": language,
+                "meta": meta,
             }
         )
 
@@ -212,7 +263,14 @@ def build_feed_for_user(
             count=need_count,
         )
         if generated:
-            inserted = _insert_cards_into_db(supabase, generated)
+            # Для чисто LLM-карточек у нас пока нет реального канала,
+            # поэтому fallback_source_name не передаём — дальше сработает DEFAULT_SOURCE_NAME.
+            inserted = _insert_cards_into_db(
+                supabase,
+                generated,
+                language="ru",
+                source_type="llm",
+            )
             if inserted:
                 ranked = _score_cards_for_user(inserted, base_tags)
                 debug["reason"] = "generated_via_openai"
