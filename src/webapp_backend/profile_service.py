@@ -151,9 +151,12 @@ def save_onboarding(
     structured["interests_as_tags"] = tags or []
 
     # Если строки нет — вставляем, иначе обновляем
+        # Если строки нет — вставляем, иначе обновляем
     if not row:
+        # raw_interests у тебя в БД NOT NULL, поэтому кладём пустую строку
         payload = {
             "user_id": user_id,
+            "raw_interests": "",
             "structured_profile": structured,
         }
         try:
@@ -162,6 +165,7 @@ def save_onboarding(
             logger.exception(
                 "Failed to insert user_profile for user_id=%s", user_id
             )
+
     else:
         try:
             supabase.table("user_profiles").update(

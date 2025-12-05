@@ -213,6 +213,7 @@ def build_feed_for_user(
     supabase: Client | None,
     user_id: int,
     limit: int | None = None,
+    offset: int = 0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Основная точка входа для /api/feed.
@@ -220,13 +221,19 @@ def build_feed_for_user(
     Возвращает:
     - items: список карточек для пользователя
     - debug: отладочная информация (reason, base_tags и т.п.)
+
+    offset — сколько карточек пропустить (для "следующих" порций ленты).
     """
     debug: Dict[str, Any] = {}
+    debug["offset"] = offset
 
     if supabase is None:
         debug["reason"] = "no_supabase"
         debug["base_tags"] = []
         return [], debug
+
+    if offset < 0:
+        offset = 0
 
     if limit is None or limit <= 0:
         limit = FEED_CARDS_LIMIT_DEFAULT
@@ -239,19 +246,30 @@ def build_feed_for_user(
     debug["base_tags"] = base_tags
 
     # 2. Пробуем взять карточки из БД
+    # Берём с запасом: (limit + offset) * 3, чтоб хватило на пропуск offset
+    fetch_limit = (limit + offset) * 3
+
     candidates = _fetch_candidate_cards(
-        supabase, base_tags, limit=limit * 3
+        supabase, base_tags, limit=fetch_limit
     )
 
     if candidates:
         ranked = _score_cards_for_user(candidates, base_tags)
+        total = len(ranked)
+
+        start = min(offset, total)
+        end = min(start + limit, total)
+        page = ranked[start:end]
+
         debug["reason"] = "cards_from_db"
-        debug["candidates"] = len(candidates)
-        return ranked[:limit], debug
+        debug["candidates"] = total
+        debug["returned"] = len(page)
+        return page, debug
 
     # 3. В БД пусто — пробуем сгенерировать через OpenAI
     if LLM_CARD_GENERATION_ENABLED and openai_is_configured():
-        need_count = max(limit * 2, 20)
+        # Берём побольше, с учётом offset, на всякий случай
+        need_count = max((limit + offset) * 2, 20)
         logger.info(
             "No cards in DB for user_id=%s. Generating ~%d cards via OpenAI.",
             user_id,
@@ -273,13 +291,22 @@ def build_feed_for_user(
             )
             if inserted:
                 ranked = _score_cards_for_user(inserted, base_tags)
+                total = len(ranked)
+
+                start = min(offset, total)
+                end = min(start + limit, total)
+                page = ranked[start:end]
+
                 debug["reason"] = "generated_via_openai"
-                debug["generated"] = len(inserted)
-                return ranked[:limit], debug
+                debug["generated"] = total
+                debug["returned"] = len(page)
+                return page, debug
 
     # 4. Не удалось ничего добыть
     debug["reason"] = "no_cards"
+    debug["returned"] = 0
     return [], debug
+
 
 
 def build_feed_for_user_paginated(
