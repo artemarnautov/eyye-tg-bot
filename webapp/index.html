@@ -7,51 +7,62 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     />
-    <title>EYYE — AI лента</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <title>EYYE Feed</title>
+    <link rel="stylesheet" href="/static/styles.css?v=2" />
   </head>
   <body>
     <div id="app" class="app">
-      <!-- Экран онбординга (город + темы) -->
-      <div id="onboarding-screen" class="screen hidden">
-        <div class="onboarding-step" id="onboarding-step-city">
-          <h1 class="title">Где ты сейчас?</h1>
+      <!-- Экран онбординга -->
+      <section id="onboarding-screen" class="screen">
+        <!-- Шаг 1: город -->
+        <div id="onboarding-step-city" class="onboarding-step">
+          <h1 class="title">Где ты живёшь?</h1>
           <p class="subtitle">
-            Введи город, чтобы мы могли подмешивать локальные новости.
+            Это нужно, чтобы подмешивать в ленту локальные новости и контекст.
+            Можно пропустить — тогда лента будет глобальной.
           </p>
+
           <input
             id="city-input"
-            type="text"
-            placeholder="Например: London, Dubai"
             class="input"
+            type="text"
+            placeholder="Например: Москва, Лондон, Дубай"
+            autocomplete="off"
           />
+
           <div class="buttons-row">
-            <button id="city-skip-btn" class="btn secondary">Пропустить</button>
-            <button id="city-next-btn" class="btn primary">Далее</button>
+            <button id="city-next-btn" class="btn primary">
+              Продолжить
+            </button>
+            <button id="city-skip-btn" class="btn secondary">
+              Пропустить
+            </button>
           </div>
         </div>
 
-        <div class="onboarding-step hidden" id="onboarding-step-topics">
-          <h1 class="title">Выбери темы</h1>
+        <!-- Шаг 2: темы -->
+        <div id="onboarding-step-topics" class="onboarding-step hidden">
+          <h1 class="title">Что тебе интересно читать?</h1>
           <p class="subtitle">
-            Можно несколько — потом всегда можно изменить.
+            Выбери несколько тем — лента будет под тебя. Можно изменить выбор позже.
           </p>
+
           <div id="topics-container" class="topics-container"></div>
+
           <button id="topics-submit-btn" class="btn primary full-width">
-            Продолжить
+            Сформировать ленту
           </button>
         </div>
-      </div>
+      </section>
 
-      <!-- Экран ленты (одна карточка на весь экран, свайпы/скролл) -->
-      <div id="feed-screen" class="screen hidden">
-        <div id="feed-card-container" class="feed-card-container">
-          <!-- сюда через JS будет рендериться текущая карточка -->
-        </div>
-      </div>
+      <!-- Экран ленты -->
+      <section id="feed-screen" class="screen hidden">
+        <div id="feed-card-container" class="feed-card-container"></div>
+      </section>
     </div>
 
     <script src="https://telegram.org/js/telegram-web-app.js"></script>
-    <script src="/static/app.js"></script>
+    <!-- v=2 — чтобы пробить кэш JS -->
+    <script src="/static/app.js?v=2"></script>
   </body>
 </html>
