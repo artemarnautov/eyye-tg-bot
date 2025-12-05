@@ -1,9 +1,9 @@
 # file: src/webapp_backend/cards_service.py
 import logging
 import os
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple, Set
-import hashlib
 
 from supabase import Client
 
@@ -11,6 +11,8 @@ from .profile_service import get_interest_tags_for_user
 from .openai_client import generate_cards_for_tags, is_configured as openai_is_configured
 
 logger = logging.getLogger(__name__)
+
+# ===================== Базовые настройки фида =====================
 
 FEED_CARDS_LIMIT_DEFAULT = int(os.getenv("FEED_CARDS_LIMIT", "20"))
 FEED_MAX_CARD_AGE_HOURS = int(os.getenv("FEED_MAX_CARD_AGE_HOURS", "48"))
@@ -31,35 +33,92 @@ FEED_WIDE_AGE_HOURS = int(os.getenv("FEED_WIDE_AGE_HOURS", "240"))  # 10 дне�
 # когда у нас нет реального канала/СМИ.
 DEFAULT_SOURCE_NAME = os.getenv("DEFAULT_SOURCE_NAME", "EYYE • AI-подборка")
 
-# Ограничения диверсификации
-FEED_MAX_TOPIC_RUN = int(os.getenv("FEED_MAX_TOPIC_RUN", "3"))
-FEED_MAX_SOURCE_RUN = int(os.getenv("FEED_MAX_SOURCE_RUN", "2"))
+# ===================== Память о просмотренных карточках =====================
 
-# Настройки "памяти" о просмотренных карточках
+# Через сколько дней мы перестаём учитывать просмотренные карточки
 FEED_SEEN_EXCLUDE_DAYS = int(os.getenv("FEED_SEEN_EXCLUDE_DAYS", "7"))
-FEED_SEEN_SESSION_GRACE_MINUTES = int(os.getenv("FEED_SEEN_SESSION_GRACE_MINUTES", "30"))
+
+# Грейс-период на "текущую сессию" (минуты)
+FEED_SEEN_SESSION_GRACE_MINUTES = int(
+    os.getenv("FEED_SEEN_SESSION_GRACE_MINUTES", "30")
+)
+
+# Максимум строк просмотренных карточек, которые мы тащим за раз
 FEED_SEEN_MAX_ROWS = int(os.getenv("FEED_SEEN_MAX_ROWS", "5000"))
 
-# Сколько шума добавляем в скор для "рандома"
-FEED_RANDOMNESS_STRENGTH = float(os.getenv("FEED_RANDOMNESS_STRENGTH", "0.15"))
+# Сила рандома в скоре (0.0–0.5; 0.15 — комфортно)
+try:
+    FEED_RANDOMNESS_STRENGTH = float(os.getenv("FEED_RANDOMNESS_STRENGTH", "0.15"))
+except ValueError:
+    FEED_RANDOMNESS_STRENGTH = 0.15
+
+# ===================== Вспомогательные функции =====================
 
 
-def _normalize_title_for_dedup(title: str) -> str:
+def _safe_int_id(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_title_for_duplicate(title: str) -> str:
     """
-    Канонизация заголовка для анти-дублей:
-    - нижний регистр
-    - убираем знаки пунктуации
-    - схлопываем пробелы
-    - обрезаем до 120 символов
+    Нормализуем заголовок для дедупликации:
+    - нижний регистр;
+    - убираем пунктуацию;
+    - схлопываем пробелы.
     """
     if not title:
         return ""
-    import re
-
     t = title.lower()
-    t = re.sub(r"[^\w\s]", " ", t, flags=re.UNICODE)  # только буквы/цифры/пробелы
-    t = re.sub(r"\s+", " ", t).strip()
-    return t[:120]
+    # выкидываем простую пунктуацию
+    for ch in ",.!?;:«»\"'()[]{}—–-":
+        t = t.replace(ch, " ")
+    t = " ".join(t.split())
+    return t
+
+
+def _extract_source_key(card: Dict[str, Any]) -> str:
+    """
+    Ключ источника для диверсификации – в идеале название медиа/канала.
+    """
+    meta = card.get("meta") or {}
+    source_name = (meta.get("source_name") or "").strip()
+    if source_name:
+        return source_name
+
+    # Фоллбек – тип источника + ссылка
+    src_type = (card.get("source_type") or "").strip()
+    src_ref = (card.get("source_ref") or "").strip()
+    if src_type and src_ref:
+        return f"{src_type}:{src_ref}"
+    if src_type:
+        return src_type
+    if src_ref:
+        return src_ref
+    return "unknown"
+
+
+def _extract_main_tag(card: Dict[str, Any], base_tags: List[str]) -> str:
+    """
+    Основной тег карточки – для диверсификации по темам.
+    Сначала ищем пересечение с интересами пользователя, потом первый тег.
+    """
+    tags = card.get("tags") or []
+    if not isinstance(tags, list):
+        tags = []
+
+    base_set = set(base_tags)
+    for t in tags:
+        if t in base_set:
+            return t
+    return tags[0] if tags else "unknown"
+
+
+# ===================== Работа с таблицей cards =====================
 
 
 def _fetch_candidate_cards(
@@ -68,27 +127,17 @@ def _fetch_candidate_cards(
     limit: int,
     *,
     max_age_hours: int,
-    exclude_card_ids: Set[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Берём кандидатов из таблицы cards:
     - только is_active = true
     - только достаточно свежие (created_at >= now - max_age_hours)
     - если есть теги, используем overlaps(tags, tags_array).
-    - exclude_card_ids: жёстко исключаем карточки, которые юзер уже давно видел.
-      (свежие просмотры из текущей сессии не исключаем, чтобы не ломать offset-пагинацию)
     """
     if limit <= 0:
         return []
 
     now = datetime.now(timezone.utc)
-
-    # Делаем небольшой оверсемплинг, чтобы после фильтрации по exclude_card_ids
-    # у нас оставалось примерно limit карточек.
-    oversample = limit
-    if exclude_card_ids:
-        oversample += min(limit, len(exclude_card_ids))
-    query_limit = min(oversample, FEED_MAX_FETCH_LIMIT)
 
     query = (
         supabase.table("cards")
@@ -107,7 +156,7 @@ def _fetch_candidate_cards(
         query = query.overlaps("tags", tags)
 
     try:
-        resp = query.order("created_at", desc=True).limit(query_limit).execute()
+        resp = query.order("created_at", desc=True).limit(limit).execute()
     except Exception:
         logger.exception("Error fetching candidate cards from Supabase")
         return []
@@ -115,42 +164,161 @@ def _fetch_candidate_cards(
     data = getattr(resp, "data", None)
     if data is None:
         data = getattr(resp, "model", None)
-    cards = data or []
+    return data or []
 
-    if not exclude_card_ids:
-        return cards
 
-    exclude_card_ids = set(str(cid) for cid in exclude_card_ids)
-    filtered: List[Dict[str, Any]] = []
-    for card in cards:
-        cid = card.get("id")
+# ===================== Память о просмотренных карточках =====================
+
+
+def _load_seen_cards_for_user(
+    supabase: Client,
+    user_id: int,
+) -> Dict[str, Any]:
+    """
+    Загружаем из user_seen_cards всё, что пользователь видел за последние FEED_SEEN_EXCLUDE_DAYS.
+    Возвращаем:
+    {
+      "rows": int,
+      "exclude_ids": set[int],
+      "recent_ids": set[int],
+      "window_days": int,
+      "grace_minutes": int,
+      "error": Optional[str],
+    }
+    """
+    result: Dict[str, Any] = {
+        "rows": 0,
+        "exclude_ids": set(),  # type: ignore[dict-item]
+        "recent_ids": set(),  # type: ignore[dict-item]
+        "window_days": FEED_SEEN_EXCLUDE_DAYS,
+        "grace_minutes": FEED_SEEN_SESSION_GRACE_MINUTES,
+        "error": None,
+    }
+
+    if supabase is None:
+        result["error"] = "no_supabase"
+        return result
+
+    now = datetime.now(timezone.utc)
+    window_cutoff = now - timedelta(days=FEED_SEEN_EXCLUDE_DAYS)
+    grace_cutoff = now - timedelta(minutes=FEED_SEEN_SESSION_GRACE_MINUTES)
+
+    try:
+        resp = (
+            supabase.table("user_seen_cards")
+            .select("card_id, seen_at")
+            .eq("user_id", user_id)
+            .gte("seen_at", window_cutoff.isoformat())
+            .limit(FEED_SEEN_MAX_ROWS)
+            .execute()
+        )
+    except Exception:
+        logger.exception("Error loading seen cards for user_id=%s", user_id)
+        result["error"] = "load_failed"
+        return result
+
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+    rows = data or []
+
+    exclude_ids: Set[int] = set()
+    recent_ids: Set[int] = set()
+
+    for row in rows:
+        cid = _safe_int_id(row.get("card_id"))
         if cid is None:
             continue
-        if str(cid) in exclude_card_ids:
-            continue
-        filtered.append(card)
+        exclude_ids.add(cid)
 
-    return filtered
+        seen_at = row.get("seen_at")
+        dt: datetime | None = None
+        if isinstance(seen_at, str):
+            try:
+                dt = datetime.fromisoformat(seen_at.replace("Z", "+00:00"))
+            except Exception:
+                dt = None
+        if dt and dt >= grace_cutoff:
+            recent_ids.add(cid)
+
+    result["rows"] = len(rows)
+    result["exclude_ids"] = exclude_ids
+    result["recent_ids"] = recent_ids
+    return result
+
+
+def _mark_cards_as_seen(
+    supabase: Client | None,
+    user_id: int,
+    cards: List[Dict[str, Any]],
+) -> int:
+    """
+    Записываем факт просмотра карточек пользователем в user_seen_cards.
+    Возвращаем количество вставленных строк (по данным Supabase).
+    """
+    if supabase is None or not cards:
+        return 0
+
+    now = datetime.now(timezone.utc).isoformat()
+    payload: List[Dict[str, Any]] = []
+
+    for card in cards:
+        cid = _safe_int_id(card.get("id"))
+        if cid is None:
+            continue
+        payload.append(
+            {
+                "user_id": user_id,
+                "card_id": cid,
+                "seen_at": now,
+            }
+        )
+
+    if not payload:
+        return 0
+
+    try:
+        # Обычно Supabase возвращает вставленные строки,
+        # но на всякий случай обрабатываем оба варианта.
+        resp = supabase.table("user_seen_cards").insert(payload).execute()
+    except Exception:
+        logger.exception("Error inserting user_seen_cards for user_id=%s", user_id)
+        return 0
+
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+
+    if isinstance(data, list):
+        inserted = len(data)
+    else:
+        # если вернули что-то иное (или returning=minimal) – считаем по payload
+        inserted = len(payload)
+
+    logger.info(
+        "Marked %d cards as seen for user_id=%s (payload=%d)",
+        inserted,
+        user_id,
+        len(payload),
+    )
+    return inserted
+
+
+# ===================== Скоринг и постобработка =====================
 
 
 def _score_cards_for_user(
     cards: List[Dict[str, Any]],
     base_tags: List[str],
-    *,
     user_id: int | None = None,
-    recent_seen_ids: Set[str] | None = None,
 ) -> List[Dict[str, Any]]:
     """
-    Скор карточек:
-    - importance_score
-    - бонус за совпадение тегов
-    - бонус за свежесть
-    - небольшая детерминированная "рандомизация" по user_id+card_id
-    - небольшой штраф за совсем свежие просмотры (в рамках текущей сессии)
+    Скор для карточек:
+    importance_score + бонус за совпадение тегов + бонус за свежесть + лёгкий рандом.
     """
     now = datetime.now(timezone.utc)
     base_tag_set = set(base_tags)
-    recent_seen_ids = {str(cid) for cid in (recent_seen_ids or set())}
+    today_str = now.strftime("%Y-%m-%d")
 
     scored: List[Tuple[float, Dict[str, Any]]] = []
 
@@ -164,11 +332,13 @@ def _score_cards_for_user(
         except (TypeError, ValueError):
             importance = 1.0
 
+        # Бонус за совпадение тегов с профилем
         profile_bonus = 0.0
         for t in card_tags:
             if t in base_tag_set:
                 profile_bonus += 0.3
 
+        # Бонус за свежесть
         recency_bonus = 0.0
         created_at = card.get("created_at")
         if isinstance(created_at, str):
@@ -176,32 +346,133 @@ def _score_cards_for_user(
                 dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
                 age_hours = (now - dt).total_seconds() / 3600.0
                 if age_hours < FEED_MAX_CARD_AGE_HOURS:
-                    recency_bonus = (FEED_MAX_CARD_AGE_HOURS - age_hours) / FEED_MAX_CARD_AGE_HOURS
+                    recency_bonus = (
+                        FEED_MAX_CARD_AGE_HOURS - age_hours
+                    ) / FEED_MAX_CARD_AGE_HOURS
             except Exception:
-                # Не ломаем весь скор, если одна карточка с кривой датой
                 pass
 
-        # Небольшой штраф, если карточку только что видел (в рамках текущей сессии)
-        card_id_str = str(card.get("id"))
-        seen_penalty = 0.0
-        if card_id_str in recent_seen_ids:
-            seen_penalty = 0.3
+        # Лёгкий детерминированный рандом для этого пользователя и карточки
+        rand_bonus = 0.0
+        if FEED_RANDOMNESS_STRENGTH > 0.0:
+            cid = _safe_int_id(card.get("id")) or 0
+            uid = int(user_id or 0)
+            seed_str = f"{uid}:{cid}:{today_str}"
+            h = hashlib.sha256(seed_str.encode("utf-8")).digest()
+            # Значение в диапазоне [0, 1]
+            value = int.from_bytes(h[:4], "big") / float(2**32 - 1)
+            # Преобразуем в [-1, 1] и масштабируем
+            rand_bonus = (value * 2.0 - 1.0) * FEED_RANDOMNESS_STRENGTH
 
-        # Детерминированный "рандом" на основе user_id + card_id
-        random_bonus = 0.0
-        if user_id is not None and FEED_RANDOMNESS_STRENGTH > 0:
-            key = f"{user_id}:{card_id_str}"
-            h = hashlib.sha256(key.encode("utf-8")).hexdigest()
-            # Берём первые 8 символов -> int -> [0,1)
-            rnd01 = int(h[:8], 16) / 0xFFFFFFFF
-            rnd_centered = rnd01 - 0.5  # в диапазоне [-0.5, 0.5]
-            random_bonus = rnd_centered * FEED_RANDOMNESS_STRENGTH
-
-        score = importance + profile_bonus + recency_bonus + random_bonus - seen_penalty
+        score = importance + profile_bonus + recency_bonus + rand_bonus
         scored.append((score, card))
 
     scored.sort(key=lambda x: x[0], reverse=True)
     return [c for score, c in scored]
+
+
+def _apply_dedup_and_diversity(
+    ranked: List[Dict[str, Any]],
+    base_tags: List[str],
+    max_consecutive_source: int = 2,
+    max_consecutive_tag: int = 2,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Постобработка уже отсортированного списка:
+    - убираем дубли по заголовкам;
+    - разводим карточки по источникам и основным тегам.
+
+    Возвращаем:
+    (список карточек, debug_postprocess)
+    """
+    if not ranked:
+        return [], {
+            "initial": 0,
+            "after_dedup_and_diversity": 0,
+            "removed_as_duplicates": 0,
+            "deferred_count": 0,
+            "used_deferred": 0,
+            "total_ranked_raw": 0,
+        }
+
+    total_ranked_raw = len(ranked)
+
+    seen_titles: Set[str] = set()
+    selected: List[Dict[str, Any]] = []
+    deferred: List[Dict[str, Any]] = []
+    removed_duplicates = 0
+
+    def violates_diversity(
+        current: List[Dict[str, Any]],
+        source_key: str,
+        main_tag: str,
+    ) -> bool:
+        # Смотрим на последние 4 карточки
+        window = current[-4:]
+        same_source = 0
+        same_tag = 0
+        for c in window:
+            if _extract_source_key(c) == source_key:
+                same_source += 1
+            if _extract_main_tag(c, base_tags) == main_tag:
+                same_tag += 1
+        if same_source >= max_consecutive_source or same_tag >= max_consecutive_tag:
+            return True
+        return False
+
+    # Первый проход: выбираем всё, что не ломает диверсификацию
+    for card in ranked:
+        title = (card.get("title") or "").strip()
+        norm_title = _normalize_title_for_duplicate(title)
+        if norm_title and norm_title in seen_titles:
+            removed_duplicates += 1
+            continue
+
+        source_key = _extract_source_key(card)
+        main_tag = _extract_main_tag(card, base_tags)
+
+        if violates_diversity(selected, source_key, main_tag):
+            deferred.append(card)
+            continue
+
+        selected.append(card)
+        if norm_title:
+            seen_titles.add(norm_title)
+
+    deferred_count = len(deferred)
+    used_deferred = 0
+
+    # Второй проход: пытаемся домешать отложенные карточки
+    for card in deferred:
+        source_key = _extract_source_key(card)
+        main_tag = _extract_main_tag(card, base_tags)
+        if violates_diversity(selected, source_key, main_tag):
+            continue
+
+        title = (card.get("title") or "").strip()
+        norm_title = _normalize_title_for_duplicate(title)
+        if norm_title and norm_title in seen_titles:
+            removed_duplicates += 1
+            continue
+
+        selected.append(card)
+        if norm_title:
+            seen_titles.add(norm_title)
+        used_deferred += 1
+
+    debug_postprocess = {
+        "initial": total_ranked_raw,
+        "after_dedup_and_diversity": len(selected),
+        "removed_as_duplicates": removed_duplicates,
+        "deferred_count": deferred_count,
+        "used_deferred": used_deferred,
+        "total_ranked_raw": total_ranked_raw,
+    }
+
+    return selected, debug_postprocess
+
+
+# ===================== Вставка LLM-карточек в DB =====================
 
 
 def _insert_cards_into_db(
@@ -319,258 +590,7 @@ def _insert_cards_into_db(
     return data
 
 
-def _get_seen_card_ids_for_user(
-    supabase: Client,
-    user_id: int,
-) -> Tuple[Set[str], Set[str], Dict[str, Any]]:
-    """
-    Достаём из user_seen_cards карточки, которые пользователь уже видел.
-
-    Возвращаем:
-    - exclude_ids: карточки, которые видели ДАВНО (старше grace-периода) и которые
-      мы вообще не хотим показывать (в рамках окна FEED_SEEN_EXCLUDE_DAYS).
-    - recent_ids: карточки, которые пользователь видел только что (в рамках grace-периода),
-      их не исключаем из кандидатов, чтобы не ломать пагинацию с offset.
-    - debug: немного статистики.
-    """
-    exclude_ids: Set[str] = set()
-    recent_ids: Set[str] = set()
-    debug: Dict[str, Any] = {}
-
-    if FEED_SEEN_EXCLUDE_DAYS <= 0:
-        return exclude_ids, recent_ids, debug
-
-    now = datetime.now(timezone.utc)
-    min_seen_at = now - timedelta(days=FEED_SEEN_EXCLUDE_DAYS)
-    grace_delta = timedelta(minutes=FEED_SEEN_SESSION_GRACE_MINUTES)
-
-    try:
-        resp = (
-            supabase.table("user_seen_cards")
-            .select("card_id,last_seen_at")
-            .eq("user_id", user_id)
-            .gte("last_seen_at", min_seen_at.isoformat())
-            .order("last_seen_at", desc=True)
-            .limit(FEED_SEEN_MAX_ROWS)
-            .execute()
-        )
-    except Exception:
-        logger.exception("Error fetching user_seen_cards from Supabase")
-        return exclude_ids, recent_ids, debug
-
-    data = getattr(resp, "data", None)
-    if data is None:
-        data = getattr(resp, "model", None)
-    rows = data or []
-
-    for row in rows:
-        cid = row.get("card_id")
-        if not cid:
-            continue
-        cid_str = str(cid)
-        ts_raw = row.get("last_seen_at")
-        ts: datetime | None = None
-        if isinstance(ts_raw, str):
-            try:
-                ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
-            except Exception:
-                ts = None
-
-        if ts is None:
-            exclude_ids.add(cid_str)
-            continue
-
-        if now - ts <= grace_delta:
-            recent_ids.add(cid_str)
-        else:
-            exclude_ids.add(cid_str)
-
-    debug["rows"] = len(rows)
-    debug["exclude_ids"] = len(exclude_ids)
-    debug["recent_ids"] = len(recent_ids)
-    debug["window_days"] = FEED_SEEN_EXCLUDE_DAYS
-    debug["grace_minutes"] = FEED_SEEN_SESSION_GRACE_MINUTES
-
-    return exclude_ids, recent_ids, debug
-
-
-def _mark_cards_as_seen(
-    supabase: Client,
-    user_id: int,
-    cards: List[Dict[str, Any]],
-) -> None:
-    """
-    Записываем выданные карточки в user_seen_cards.
-    Для MVP — просто insert, дубликаты фильтруем на уровне Python при чтении.
-    """
-    if not cards:
-        return
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-    payload: List[Dict[str, Any]] = []
-    for card in cards:
-        cid = card.get("id")
-        if cid is None:
-            continue
-        payload.append(
-            {
-                "user_id": user_id,
-                "card_id": cid,
-                "last_seen_at": now_iso,
-            }
-        )
-
-    if not payload:
-        return
-
-    try:
-        supabase.table("user_seen_cards").insert(payload).execute()
-    except Exception:
-        logger.exception("Error inserting into user_seen_cards")
-
-
-def _extract_source_and_topic(
-    card: Dict[str, Any],
-    base_tags: List[str],
-) -> Tuple[str, str]:
-    """
-    Вытаскиваем "источник" (по возможности человекочитаемый) и "основную тему" карточки.
-    Это нужно для диверсификации.
-    """
-    meta = card.get("meta") or {}
-    if not isinstance(meta, dict):
-        meta = {}
-
-    source = (
-        meta.get("source_name")
-        or card.get("source_ref")
-        or card.get("source_type")
-        or "unknown"
-    )
-    source = str(source)
-
-    card_tags = card.get("tags") or []
-    if not isinstance(card_tags, list):
-        card_tags = []
-
-    base_tag_set = set(base_tags)
-    primary_topic = "other"
-    for t in card_tags:
-        if t in base_tag_set:
-            primary_topic = t
-            break
-    if primary_topic == "other" and card_tags:
-        primary_topic = str(card_tags[0])
-
-    return source, primary_topic
-
-
-def _apply_dedup_and_diversity(
-    ranked: List[Dict[str, Any]],
-    base_tags: List[str],
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Постобработка ранжированного списка:
-    - удаляем дубли по заголовкам
-    - ограничиваем длину "пробега" по одному источнику и теме
-    - откладываем конфликтующие карточки в deferred и пытаемся воткнуть их позже
-    """
-    used_titles: Set[str] = set()
-    result: List[Dict[str, Any]] = []
-    deferred: List[Dict[str, Any]] = []
-
-    last_source: str | None = None
-    last_topic: str | None = None
-    source_run = 0
-    topic_run = 0
-
-    removed_duplicates = 0
-    deferred_count = 0
-
-    for card in ranked:
-        title = (card.get("title") or "").strip()
-        title_norm = _normalize_title_for_dedup(title)
-        if title_norm in used_titles:
-            removed_duplicates += 1
-            continue
-
-        source, topic = _extract_source_and_topic(card, base_tags)
-
-        if last_source == source:
-            source_run += 1
-        else:
-            last_source = source
-            source_run = 1
-
-        if last_topic == topic:
-            topic_run += 1
-        else:
-            last_topic = topic
-            topic_run = 1
-
-        if source_run > FEED_MAX_SOURCE_RUN or topic_run > FEED_MAX_TOPIC_RUN:
-            deferred.append(card)
-            deferred_count += 1
-            # откатываем счётчики к предыдущему состоянию (карточка как бы не вставилась)
-            if source_run > FEED_MAX_SOURCE_RUN:
-                source_run -= 1
-            if topic_run > FEED_MAX_TOPIC_RUN:
-                topic_run -= 1
-            continue
-
-        used_titles.add(title_norm)
-        result.append(card)
-
-    # Вторая попытка: пытаемся аккуратно домешать deferred в хвост,
-    # не нарушая лимитов по пробегам.
-    used_titles_tail = set(used_titles)
-    last_source_tail = last_source
-    last_topic_tail = last_topic
-    source_run_tail = source_run
-    topic_run_tail = topic_run
-
-    used_deferred = 0
-
-    for card in deferred:
-        title = (card.get("title") or "").strip()
-        title_norm = _normalize_title_for_dedup(title)
-        if title_norm in used_titles_tail:
-            continue
-
-        source, topic = _extract_source_and_topic(card, base_tags)
-
-        if last_source_tail == source:
-            sr = source_run_tail + 1
-        else:
-            sr = 1
-
-        if last_topic_tail == topic:
-            tr = topic_run_tail + 1
-        else:
-            tr = 1
-
-        if sr > FEED_MAX_SOURCE_RUN or tr > FEED_MAX_TOPIC_RUN:
-            continue
-
-        used_titles_tail.add(title_norm)
-        result.append(card)
-        used_deferred += 1
-
-        last_source_tail = source
-        last_topic_tail = topic
-        source_run_tail = sr
-        topic_run_tail = tr
-
-    debug = {
-        "initial": len(ranked),
-        "after_dedup_and_diversity": len(result),
-        "removed_as_duplicates": removed_duplicates,
-        "deferred_count": deferred_count,
-        "used_deferred": used_deferred,
-        "total_ranked_raw": len(ranked),
-    }
-
-    return result, debug
+# ===================== Основная логика фида =====================
 
 
 def build_feed_for_user(
@@ -584,24 +604,7 @@ def build_feed_for_user(
 
     Возвращает:
     - items: список карточек для пользователя (страница с учётом offset/limit)
-    - debug: отладочная информация:
-        {
-          "reason": "...",
-          "base_tags": [...],
-          "offset": int,
-          "limit": int,
-          "total_candidates": int,
-          "returned": int,
-          "has_more": bool,
-          "next_offset": int | None,
-          "phases": [
-            {"stage": "...", "tags_count": int, "age_hours": int, "fetched": int},
-            ...
-          ],
-          ...
-        }
-
-    offset — сколько карточек пропустить (для "следующих" порций ленты).
+    - debug: отладочная информация.
     """
     debug: Dict[str, Any] = {
         "offset": offset,
@@ -615,6 +618,13 @@ def build_feed_for_user(
         debug["returned"] = 0
         debug["has_more"] = False
         debug["next_offset"] = None
+        debug["seen"] = {
+            "rows": 0,
+            "exclude_ids": 0,
+            "recent_ids": 0,
+            "window_days": FEED_SEEN_EXCLUDE_DAYS,
+            "grace_minutes": FEED_SEEN_SESSION_GRACE_MINUTES,
+        }
         return [], debug
 
     if offset < 0:
@@ -637,20 +647,22 @@ def build_feed_for_user(
     debug["base_tags"] = base_tags
     debug["used_default_tags"] = used_default_tags
 
-    # 2. Память о просмотренных карточках
-    seen_exclude_ids: Set[str] = set()
-    recent_seen_ids: Set[str] = set()
-    seen_debug: Dict[str, Any] = {}
-    try:
-        seen_exclude_ids, recent_seen_ids, seen_debug = _get_seen_card_ids_for_user(
-            supabase, user_id
-        )
-    except Exception:
-        logger.exception("Error in _get_seen_card_ids_for_user")
-    debug["seen"] = seen_debug
+    # 1.1. Загружаем просмотренные карточки
+    seen_info = _load_seen_cards_for_user(supabase, user_id)
+    exclude_ids: Set[int] = seen_info.get("exclude_ids") or set()
+    recent_ids: Set[int] = seen_info.get("recent_ids") or set()
 
-    # 3. Собираем кандидатов несколькими "слоями":
-    #    сперва по тегам пользователя и свежести,
+    debug["seen"] = {
+        "rows": int(seen_info.get("rows") or 0),
+        "exclude_ids": len(exclude_ids),
+        "recent_ids": len(recent_ids),
+        "window_days": FEED_SEEN_EXCLUDE_DAYS,
+        "grace_minutes": FEED_SEEN_SESSION_GRACE_MINUTES,
+        "error": seen_info.get("error"),
+    }
+
+    # 2. Собираем кандидатов несколькими "слоями":
+    #    сначала строго по тегам пользователя и свежести,
     #    потом при необходимости расширяем выборку за счёт дефолтных тегов и более широкого окна по времени.
     # Берём с запасом: (limit + offset) * 3, чтобы хватило на пропуск offset.
     fetch_limit = (limit + offset) * 3
@@ -720,7 +732,6 @@ def build_feed_for_user(
             tags=tags,
             limit=remaining,
             max_age_hours=age_hours,
-            exclude_card_ids=seen_exclude_ids,
         )
 
         for card in fetched:
@@ -746,8 +757,26 @@ def build_feed_for_user(
     debug["phases"] = phases_debug
     debug["total_candidates_raw"] = total_candidates_raw
 
-    # 4. Если в БД ничего не нашли — пробуем сгенерировать карточки через OpenAI.
-    if total_candidates_raw == 0:
+    # 2.1. Фильтруем уже просмотренные карточки (по user_seen_cards)
+    if exclude_ids:
+        before_seen = len(candidates)
+        filtered: List[Dict[str, Any]] = []
+        for c in candidates:
+            cid = _safe_int_id(c.get("id"))
+            if cid is None:
+                filtered.append(c)
+                continue
+            if cid in exclude_ids:
+                continue
+            filtered.append(c)
+        candidates = filtered
+        debug["removed_seen"] = before_seen - len(candidates)
+
+    total_candidates = len(candidates)
+    debug["total_candidates"] = total_candidates
+
+    # 3. Если в БД ничего не нашли — пробуем сгенерировать карточки через OpenAI.
+    if total_candidates == 0:
         if LLM_CARD_GENERATION_ENABLED and openai_is_configured():
             need_count = max((limit + offset) * 2, 20)
             logger.info(
@@ -768,9 +797,9 @@ def build_feed_for_user(
                     source_type="llm",
                 )
                 candidates = inserted or []
-                total_candidates_raw = len(candidates)
+                total_candidates = len(candidates)
                 debug["reason"] = "generated_via_openai"
-                debug["generated"] = total_candidates_raw
+                debug["generated"] = total_candidates
             else:
                 debug["reason"] = "no_cards"
                 debug["returned"] = 0
@@ -786,18 +815,14 @@ def build_feed_for_user(
     else:
         debug["reason"] = "cards_from_db"
 
-    # 5. Ранжируем и применяем постобработку (анти-дубли + диверсификация)
-    ranked_scored = _score_cards_for_user(
-        candidates,
-        base_tags,
-        user_id=user_id,
-        recent_seen_ids=recent_seen_ids,
-    )
-    ranked, postprocess_debug = _apply_dedup_and_diversity(ranked_scored, base_tags)
+    # 4. Ранжируем (с учётом рандома) и применяем дедуп/диверсификацию
+    ranked_raw = _score_cards_for_user(candidates, base_tags, user_id=user_id)
+    ranked, postprocess_debug = _apply_dedup_and_diversity(ranked_raw, base_tags)
+    debug["postprocess"] = postprocess_debug
 
     total_ranked = len(ranked)
 
-    # 6. Пагинация по offset/limit
+    # 5. Пагинация по offset/limit
     start = min(offset, total_ranked)
     end = min(start + limit, total_ranked)
     page = ranked[start:end]
@@ -805,17 +830,14 @@ def build_feed_for_user(
     has_more = total_ranked > end
     next_offset = end if has_more else None
 
-    # 7. Обновляем память просмотренных карточек
-    try:
-        _mark_cards_as_seen(supabase, user_id, page)
-    except Exception:
-        logger.exception("Error in _mark_cards_as_seen")
-
     debug["total_candidates"] = total_ranked
     debug["returned"] = len(page)
     debug["has_more"] = has_more
     debug["next_offset"] = next_offset
-    debug["postprocess"] = postprocess_debug
+
+    # 6. Отмечаем карточки как просмотренные
+    seen_marked = _mark_cards_as_seen(supabase, user_id, page)
+    debug["seen"]["marked"] = int(seen_marked)
 
     return page, debug
 
