@@ -7,21 +7,48 @@
       name="viewport"
       content="width=device-width, initial-scale=1.0, viewport-fit=cover"
     />
-    <title>EYYE Feed</title>
+    <title>EYYE — AI лента</title>
     <link rel="stylesheet" href="/static/styles.css" />
   </head>
   <body>
     <div id="app" class="app">
-      <header class="channel-header">
-        <div class="avatar">E</div>
-        <div class="channel-meta">
-          <div class="channel-title">EYYE Feed</div>
-          <div class="channel-subtitle">
-            Персональная лента как Telegram-канал
+      <!-- Экран онбординга (город + темы) -->
+      <div id="onboarding-screen" class="screen hidden">
+        <div class="onboarding-step" id="onboarding-step-city">
+          <h1 class="title">Где ты сейчас?</h1>
+          <p class="subtitle">
+            Введи город, чтобы мы могли подмешивать локальные новости.
+          </p>
+          <input
+            id="city-input"
+            type="text"
+            placeholder="Например: London, Dubai"
+            class="input"
+          />
+          <div class="buttons-row">
+            <button id="city-skip-btn" class="btn secondary">Пропустить</button>
+            <button id="city-next-btn" class="btn primary">Далее</button>
           </div>
         </div>
-      </header>
-      <main id="main" class="main"></main>
+
+        <div class="onboarding-step hidden" id="onboarding-step-topics">
+          <h1 class="title">Выбери темы</h1>
+          <p class="subtitle">
+            Можно несколько — потом всегда можно изменить.
+          </p>
+          <div id="topics-container" class="topics-container"></div>
+          <button id="topics-submit-btn" class="btn primary full-width">
+            Продолжить
+          </button>
+        </div>
+      </div>
+
+      <!-- Экран ленты (одна карточка на весь экран, свайпы/скролл) -->
+      <div id="feed-screen" class="screen hidden">
+        <div id="feed-card-container" class="feed-card-container">
+          <!-- сюда через JS будет рендериться текущая карточка -->
+        </div>
+      </div>
     </div>
 
     <script src="https://telegram.org/js/telegram-web-app.js"></script>

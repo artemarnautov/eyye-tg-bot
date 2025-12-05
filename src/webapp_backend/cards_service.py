@@ -280,3 +280,58 @@ def build_feed_for_user(
     # 4. Не удалось ничего добыть
     debug["reason"] = "no_cards"
     return [], debug
+
+
+def build_feed_for_user_paginated(
+    supabase: Client | None,
+    user_id: int,
+    limit: int | None = None,
+    offset: int = 0,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+    """
+    Обёртка над build_feed_for_user с поддержкой пагинации по offset.
+
+    Возвращает:
+    - items: карточки для текущей "страницы" (offset + limit)
+    - debug: отладочная информация (reason, base_tags, offset, limit, has_more)
+    - cursor: метаданные пагинации (offset, next_offset, has_more)
+    """
+    # Базовые защиты от странных значений
+    if limit is None or limit <= 0:
+        limit = FEED_CARDS_LIMIT_DEFAULT
+    limit = min(max(limit, 1), 50)
+    offset = max(0, int(offset))
+
+    # Сколько карточек попросить у базовой функции:
+    # берём offset + limit, но не больше 50 (build_feed_for_user всё равно ограничивает)
+    internal_limit = min(limit + offset, 50)
+
+    # Используем уже существующую логику персонализации/ранкинга
+    all_items, base_debug = build_feed_for_user(
+        supabase=supabase,
+        user_id=user_id,
+        limit=internal_limit,
+    )
+
+    # Берём только нужный "срез"
+    page_items = all_items[offset: offset + limit]
+
+    # Проверяем, есть ли ещё карточки дальше
+    has_more = len(all_items) > offset + len(page_items)
+    next_offset = offset + len(page_items) if has_more else None
+
+    cursor: Dict[str, Any] = {
+        "limit": limit,
+        "offset": offset,
+        "next_offset": next_offset,
+        "has_more": has_more,
+    }
+
+    debug: Dict[str, Any] = {
+        **(base_debug or {}),
+        "offset": offset,
+        "limit": limit,
+        "has_more": has_more,
+    }
+
+    return page_items, debug, cursor
