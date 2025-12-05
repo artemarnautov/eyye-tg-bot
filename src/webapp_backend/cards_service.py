@@ -128,7 +128,7 @@ def _insert_cards_into_db(
     supabase: Client,
     cards: List[Dict[str, Any]],
     *,
-    language: str = "ru",
+    language: str | None = "ru",
     source_type: str = "llm",
     fallback_source_name: str | None = None,
     source_ref: str | None = None,
@@ -142,7 +142,8 @@ def _insert_cards_into_db(
     3) DEFAULT_SOURCE_NAME ("EYYE • AI-подборка") — только если нет реального источника.
 
     language / source_type / source_ref:
-    - language: язык карточки ("ru", "en", ...)
+    - language: язык карточки ("ru", "en", ...) — можно указать по умолчанию
+      или положить в саму карточку c["language"].
     - source_type: "telegram", "rss", "llm" и т.п.
     - source_ref: например, ссылка или message_id канала.
     """
@@ -150,6 +151,14 @@ def _insert_cards_into_db(
         return []
 
     payload: List[Dict[str, Any]] = []
+
+    # Язык по умолчанию, если в самой карточке не указан
+    default_lang: str | None
+    if isinstance(language, str):
+        default_lang = language.strip() or None
+    else:
+        default_lang = None
+
     for c in cards:
         title = (c.get("title") or "").strip()
         body = (c.get("body") or "").strip()
@@ -187,6 +196,14 @@ def _insert_cards_into_db(
         card_source_ref = c.get("source_ref") or c.get("url") or c.get("link")
         final_source_ref = source_ref or card_source_ref
 
+        # Язык карточки: сначала из самой карточки, потом дефолт, потом "ru"
+        card_lang_raw = c.get("language")
+        if isinstance(card_lang_raw, str):
+            card_lang = card_lang_raw.strip() or None
+        else:
+            card_lang = None
+        final_language = card_lang or default_lang or "ru"
+
         meta: Dict[str, Any] = {
             "source_name": source_name,
         }
@@ -200,7 +217,7 @@ def _insert_cards_into_db(
                 "is_active": True,
                 "source_type": source_type,
                 "source_ref": final_source_ref,
-                "language": language,
+                "language": final_language,
                 "meta": meta,
             }
         )
@@ -486,4 +503,3 @@ def build_feed_for_user_paginated(
     }
 
     return items, debug, cursor
-
