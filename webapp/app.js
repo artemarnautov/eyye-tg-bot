@@ -1,8 +1,14 @@
 // file: webapp/app.js
 (function () {
-  const API_BASE = ""; // тот же домен/порт, где крутится backend
+  "use strict";
 
-  const AVAILABLE_TOPICS = [
+  // ==== Настройки и константы ====
+
+  // Бекенд у нас на том же домене/порте
+  var API_BASE = "";
+
+  // Доступные темы для онбординга
+  var AVAILABLE_TOPICS = [
     { id: "world_news", label: "Мир" },
     { id: "business", label: "Бизнес" },
     { id: "finance", label: "Финансы / Крипто" },
@@ -20,13 +26,14 @@
     { id: "uk_students", label: "Студенческая жизнь в UK" }
   ];
 
-  const state = {
+  // Состояние приложения
+  var state = {
     tgId: null,
 
     // онбординг
     onboardingDone: false,
     cityDraft: "",
-    selectedTopics: new Set(),
+    selectedTopics: {}, // объект как set: {tag: true}
 
     // фид
     feedItems: [],
@@ -34,20 +41,40 @@
     loadingFeed: false,
     hasMore: true,
     nextOffset: 0,
-    seenIds: new Set(),
+    seenIds: {},
 
     // свайпы
     wheelLocked: false,
-    touchStartY: null,
-    swipeListenersAttached: false
+    lastWheelTime: 0,
+    touchStartY: null
   };
 
-  const tg =
-    window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
+  // DOM элементы
+  var elOnboardingScreen = null;
+  var elOnboardingCityStep = null;
+  var elOnboardingTopicsStep = null;
+  var elCityInput = null;
+  var elCityNextBtn = null;
+  var elCitySkipBtn = null;
+  var elTopicsContainer = null;
+  var elTopicsSubmitBtn = null;
+  var elFeedScreen = null;
+  var elFeedCardContainer = null;
 
-  // ==========
-  // УТИЛИТЫ
-  // ==========
+  // Telegram WebApp объект (если есть)
+  var tg = null;
+
+  // ==== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====
+
+  function logDebug() {
+    if (typeof console !== "undefined" && console.log) {
+      console.log.apply(console, arguments);
+    }
+  }
+
+  function $(id) {
+    return document.getElementById(id);
+  }
 
   function escapeHtml(str) {
     if (!str) return "";
@@ -59,448 +86,534 @@
       .replace(/'/g, "&#039;");
   }
 
-  function apiFetch(path, options) {
-    return fetch(API_BASE + path, {
-      headers: {
-        "Content-Type": "application/json"
-      },
-      ...options
-    });
+  function getTgIdFromLocation() {
+    var params = new URLSearchParams(window.location.search);
+    var raw = params.get("tg_id");
+    if (!raw) return null;
+    var n = Number(raw);
+    if (!isNaN(n)) return n;
+    return raw;
   }
 
-  function getTgId() {
-    // 1) Берём из Telegram WebApp
-    if (
-      tg &&
-      tg.initDataUnsafe &&
-      tg.initDataUnsafe.user &&
-      tg.initDataUnsafe.user.id
-    ) {
-      return tg.initDataUnsafe.user.id;
-    }
-
-    // 2) Фолбек — из query-параметра tg_id (для локальной отладки)
-    const params = new URLSearchParams(window.location.search);
-    const fromQuery = params.get("tg_id");
-    if (fromQuery) {
-      const n = Number(fromQuery);
-      if (!Number.isNaN(n)) return n;
-      return fromQuery;
-    }
-
-    return null;
-  }
-
-  // ==========
-  // ОНБОРДИНГ: UI
-  // ==========
-
-  function setupOnboardingUI() {
-    const cityInput = document.getElementById("city-input");
-    const citySkipBtn = document.getElementById("city-skip-btn");
-    const cityNextBtn = document.getElementById("city-next-btn");
-    const topicsContainer = document.getElementById("topics-container");
-    const topicsSubmitBtn = document.getElementById("topics-submit-btn");
-
-    if (!cityInput || !topicsContainer || !topicsSubmitBtn) {
-      console.warn("Onboarding DOM elements not found");
-      return;
-    }
-
-    // Подставляем уже известный город (если есть)
-    if (state.cityDraft) {
-      cityInput.value = state.cityDraft;
-    }
-
-    cityInput.addEventListener("input", function (e) {
-      state.cityDraft = e.target.value;
-    });
-
-    if (citySkipBtn) {
-      citySkipBtn.addEventListener("click", function () {
-        state.cityDraft = "";
-        goToTopicsStep();
-      });
-    }
-
-    if (cityNextBtn) {
-      cityNextBtn.addEventListener("click", function () {
-        goToTopicsStep();
-      });
-    }
-
-    // Рендерим чипы тем
-    topicsContainer.innerHTML = "";
-    AVAILABLE_TOPICS.forEach(function (topic) {
-      const chip = document.createElement("button");
-      chip.type = "button";
-      chip.className = "topic-chip";
-      chip.dataset.topicId = topic.id;
-      chip.textContent = topic.label;
-
-      if (state.selectedTopics.has(topic.id)) {
-        chip.classList.add("selected");
+  function resolveTgId() {
+    try {
+      if (
+        window.Telegram &&
+        window.Telegram.WebApp &&
+        window.Telegram.WebApp.initDataUnsafe &&
+        window.Telegram.WebApp.initDataUnsafe.user &&
+        window.Telegram.WebApp.initDataUnsafe.user.id
+      ) {
+        return window.Telegram.WebApp.initDataUnsafe.user.id;
       }
-
-      chip.addEventListener("click", function () {
-        const id = chip.dataset.topicId;
-        if (!id) return;
-        if (state.selectedTopics.has(id)) {
-          state.selectedTopics.delete(id);
-          chip.classList.remove("selected");
-        } else {
-          state.selectedTopics.add(id);
-          chip.classList.add("selected");
-        }
-      });
-
-      topicsContainer.appendChild(chip);
-    });
-
-    topicsSubmitBtn.addEventListener("click", submitOnboarding);
+    } catch (e) {
+      // ignore
+    }
+    return getTgIdFromLocation();
   }
 
-  function showOnboardingScreen() {
-    const onboardingScreen = document.getElementById("onboarding-screen");
-    const feedScreen = document.getElementById("feed-screen");
-    const cityStep = document.getElementById("onboarding-step-city");
-    const topicsStep = document.getElementById("onboarding-step-topics");
+  function apiFetch(path, options) {
+    options = options || {};
+    if (!options.headers) {
+      options.headers = {};
+    }
+    if (!options.headers["Content-Type"]) {
+      options.headers["Content-Type"] = "application/json";
+    }
 
-    if (feedScreen) feedScreen.classList.add("hidden");
-    if (onboardingScreen) onboardingScreen.classList.remove("hidden");
-    if (cityStep) cityStep.classList.remove("hidden");
-    if (topicsStep) topicsStep.classList.add("hidden");
+    return fetch(API_BASE + path, options);
   }
 
-  function goToTopicsStep() {
-    const cityStep = document.getElementById("onboarding-step-city");
-    const topicsStep = document.getElementById("onboarding-step-topics");
+  function showScreen(name) {
+    if (!elOnboardingScreen || !elFeedScreen) return;
 
-    if (cityStep) cityStep.classList.add("hidden");
-    if (topicsStep) topicsStep.classList.remove("hidden");
+    if (name === "onboarding") {
+      elOnboardingScreen.classList.remove("hidden");
+      elFeedScreen.classList.add("hidden");
+    } else if (name === "feed") {
+      elFeedScreen.classList.remove("hidden");
+      elOnboardingScreen.classList.add("hidden");
+    }
   }
 
-  async function submitOnboarding() {
+  function showOnboardingStep(stepName) {
+    if (!elOnboardingCityStep || !elOnboardingTopicsStep) return;
+
+    if (stepName === "city") {
+      elOnboardingCityStep.classList.remove("hidden");
+      elOnboardingTopicsStep.classList.add("hidden");
+    } else if (stepName === "topics") {
+      elOnboardingTopicsStep.classList.remove("hidden");
+      elOnboardingCityStep.classList.add("hidden");
+    }
+  }
+
+  function showOnboardingError(message) {
+    // Простой вывод ошибки как alert, чтобы точно увидеть
+    alert(message);
+  }
+
+  // ==== ОНБОРДИНГ ====
+
+  function renderTopicsChips() {
+    if (!elTopicsContainer) return;
+    var html = "";
+    for (var i = 0; i < AVAILABLE_TOPICS.length; i++) {
+      var t = AVAILABLE_TOPICS[i];
+      var selected = !!state.selectedTopics[t.id];
+      html +=
+        '<button class="topic-chip' +
+        (selected ? " selected" : "") +
+        '" data-topic-id="' +
+        escapeHtml(t.id) +
+        '">' +
+        escapeHtml(t.label) +
+        "</button>";
+    }
+    elTopicsContainer.innerHTML = html;
+
+    // навешиваем обработчики
+    var buttons = elTopicsContainer.querySelectorAll(".topic-chip");
+    for (var j = 0; j < buttons.length; j++) {
+      (function (btn) {
+        btn.addEventListener("click", function () {
+          var tag = btn.getAttribute("data-topic-id");
+          if (!tag) return;
+          if (state.selectedTopics[tag]) {
+            delete state.selectedTopics[tag];
+            btn.classList.remove("selected");
+          } else {
+            state.selectedTopics[tag] = true;
+            btn.classList.add("selected");
+          }
+        });
+      })(buttons[j]);
+    }
+  }
+
+  function handleCityNext() {
+    if (!elCityInput) return;
+    state.cityDraft = (elCityInput.value || "").trim();
+    showOnboardingStep("topics");
+    renderTopicsChips();
+  }
+
+  function handleCitySkip() {
+    state.cityDraft = "";
+    showOnboardingStep("topics");
+    renderTopicsChips();
+  }
+
+  function submitOnboarding() {
     if (!state.tgId) {
-      renderError(
+      showOnboardingError(
         "Не удалось получить твой Telegram ID. Открой WebApp через кнопку в боте и попробуй снова."
       );
       return;
     }
 
-    const payload = {
-      tg_id: state.tgId,
+    var tags = [];
+    for (var key in state.selectedTopics) {
+      if (Object.prototype.hasOwnProperty.call(state.selectedTopics, key)) {
+        tags.push(key);
+      }
+    }
+
+    var payload = {
+      user_id: state.tgId,
       city: state.cityDraft || null,
-      selected_topics: Array.from(state.selectedTopics)
+      tags: tags
     };
 
-    try {
-      const resp = await apiFetch("/api/profile/onboarding", {
-        method: "POST",
-        body: JSON.stringify(payload)
+    logDebug("Submitting onboarding", payload);
+
+    apiFetch("/api/profile/onboarding", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    })
+      .then(function (resp) {
+        if (!resp.ok) {
+          logDebug("Onboarding save HTTP error:", resp.status);
+        }
+        // В любом случае после онбординга пробуем открыть фид
+        state.onboardingDone = true;
+        showScreen("feed");
+        loadFeed(true);
+      })
+      .catch(function (err) {
+        logDebug("Onboarding save error:", err);
+        state.onboardingDone = true;
+        showScreen("feed");
+        loadFeed(true);
       });
-      if (!resp.ok) {
-        console.warn("Onboarding save failed:", resp.status);
-      }
-      state.onboardingDone = true;
-      showFeedScreen();
-      await loadMoreFeed(true);
-      attachSwipeListeners();
-    } catch (err) {
-      console.error("submitOnboarding error:", err);
-      renderError(
-        "Не удалось сохранить настройки профиля. Попробуй закрыть и снова открыть WebApp."
-      );
-    }
   }
 
-  // ==========
-  // ПРОФИЛЬ: загрузка состояния онбординга
-  // ==========
-
-  async function checkProfileAndStart() {
+  function loadProfileAndMaybeSkipOnboarding() {
     if (!state.tgId) {
-      renderError(
+      showOnboardingError(
         "Не удалось получить твой Telegram ID. Открой WebApp через кнопку в боте и попробуй снова."
       );
       return;
     }
 
-    try {
-      const resp = await apiFetch("/api/profile?tg_id=" + String(state.tgId), {
-        method: "GET"
+    apiFetch("/api/profile?tg_id=" + encodeURIComponent(String(state.tgId)), {
+      method: "GET"
+    })
+      .then(function (resp) {
+        if (!resp.ok) {
+          logDebug("GET /api/profile HTTP error:", resp.status);
+          // если ошибка — просто показываем онбординг
+          showScreen("onboarding");
+          showOnboardingStep("city");
+          return null;
+        }
+        return resp.json();
+      })
+      .then(function (data) {
+        if (!data) return;
+        logDebug("Profile data:", data);
+
+        if (data.has_onboarding) {
+          // онбординг уже пройден — сразу в фид
+          state.onboardingDone = true;
+          showScreen("feed");
+          loadFeed(true);
+        } else {
+          showScreen("onboarding");
+          showOnboardingStep("city");
+        }
+      })
+      .catch(function (err) {
+        logDebug("GET /api/profile error:", err);
+        // при ошибке профиля всё равно даём онбординг
+        showScreen("onboarding");
+        showOnboardingStep("city");
       });
-      if (!resp.ok) {
-        throw new Error("Profile HTTP " + resp.status);
-      }
-
-      const data = await resp.json();
-      state.onboardingDone = !!data.has_onboarding;
-
-      if (data.city) {
-        state.cityDraft = data.city;
-      }
-
-      if (Array.isArray(data.selected_topics)) {
-        state.selectedTopics = new Set(data.selected_topics);
-      }
-
-      if (state.onboardingDone) {
-        showFeedScreen();
-        await loadMoreFeed(true);
-        attachSwipeListeners();
-      } else {
-        showOnboardingScreen();
-      }
-    } catch (err) {
-      console.error("checkProfileAndStart error:", err);
-      // Если не удалось получить профиль — показываем онбординг как фолбек
-      showOnboardingScreen();
-    }
   }
 
-  // ==========
-  // ФИД: TikTok-стиль (одна карточка на экран)
-  // ==========
+  // ==== ФИД ====
 
-  function showFeedScreen() {
-    const onboardingScreen = document.getElementById("onboarding-screen");
-    const feedScreen = document.getElementById("feed-screen");
-
-    if (onboardingScreen) onboardingScreen.classList.add("hidden");
-    if (feedScreen) feedScreen.classList.remove("hidden");
-  }
-
-  async function loadMoreFeed(initial) {
-    if (state.loadingFeed) return;
-    if (!initial && (!state.hasMore || state.nextOffset == null)) return;
-    if (!state.tgId) return;
-
-    state.loadingFeed = true;
-
-    try {
-      const params = new URLSearchParams({
-        tg_id: String(state.tgId),
-        limit: "20"
-      });
-
-      if (!initial && typeof state.nextOffset === "number") {
-        params.set("offset", String(state.nextOffset));
-      } else {
-        params.set("offset", "0");
-      }
-
-      const resp = await apiFetch("/api/feed?" + params.toString(), {
-        method: "GET"
-      });
-      if (!resp.ok) {
-        throw new Error("Feed HTTP " + resp.status);
-      }
-
-      const data = await resp.json();
-      const items = Array.isArray(data.items) ? data.items : [];
-      const cursor = data.cursor || {};
-
-      // Фильтруем дубликаты по id
-      const newItems = items.filter(function (item) {
-        const id = item.id;
-        if (id == null) return true;
-        if (state.seenIds.has(id)) return false;
-        state.seenIds.add(id);
-        return true;
-      });
-
-      if (initial) {
-        state.feedItems = newItems;
-        state.currentIndex = 0;
-      } else {
-        state.feedItems = state.feedItems.concat(newItems);
-      }
-
-      state.hasMore = !!cursor.has_more;
-      state.nextOffset =
-        typeof cursor.next_offset === "number" ? cursor.next_offset : null;
-
-      if (initial) {
-        renderCurrentCard();
-      }
-    } catch (err) {
-      console.error("loadMoreFeed error:", err);
-      if (initial) {
-        renderError(
-          "Не получилось загрузить ленту. Попробуй вернуться в WebApp через пару минут."
-        );
-      }
-    } finally {
-      state.loadingFeed = false;
-    }
+  function renderEmptyFeed(message) {
+    if (!elFeedCardContainer) return;
+    var text =
+      message ||
+      "Пока для тебя нет готовых карточек. Я уже готовлю контент — загляни сюда чуть позже.";
+    elFeedCardContainer.innerHTML =
+      '<div class="card">' +
+      '<div class="card-content">' +
+      '<p class="card-body">' +
+      escapeHtml(text) +
+      "</p>" +
+      "</div>" +
+      "</div>";
   }
 
   function renderCurrentCard() {
-    const container = document.getElementById("feed-card-container");
-    if (!container) return;
+    if (!elFeedCardContainer) return;
 
-    const card = state.feedItems[state.currentIndex];
-
-    if (!card) {
-      container.innerHTML = `
-        <div class="card">
-          <div class="card-content">
-            <h2 class="card-title">Пока карточек нет</h2>
-            <p class="card-body">
-              Я уже собираю для тебя свежий контент — загляни чуть позже.
-            </p>
-          </div>
-        </div>
-      `;
+    if (!state.feedItems || state.feedItems.length === 0) {
+      renderEmptyFeed();
       return;
     }
 
-    const sourceName =
-      (card.meta && card.meta.source_name) || "EYYE • AI-подборка";
-
-    const title = escapeHtml(card.title || "");
-    const body = escapeHtml(card.body || "").replace(/\n/g, "<br />");
-
-    container.innerHTML = `
-      <div class="card">
-        <div class="card-header">
-          <span class="card-source">${escapeHtml(sourceName)}</span>
-        </div>
-        <div class="card-content">
-          <h2 class="card-title">${title}</h2>
-          <p class="card-body">${body}</p>
-        </div>
-        <div class="card-footer">
-          <span class="card-tagline">Свайпай, чтобы увидеть следующую</span>
-        </div>
-      </div>
-    `;
-  }
-
-  function attachSwipeListeners() {
-    if (state.swipeListenersAttached) return;
-    const container = document.getElementById("feed-card-container");
-    if (!container) return;
-
-    container.addEventListener("wheel", onWheel, { passive: true });
-    container.addEventListener("touchstart", onTouchStart, { passive: true });
-    container.addEventListener("touchend", onTouchEnd, { passive: true });
-
-    state.swipeListenersAttached = true;
-  }
-
-  function onWheel(e) {
-    if (state.wheelLocked) return;
-
-    const threshold = 40;
-    if (e.deltaY > threshold) {
-      goToNextCard();
-    } else if (e.deltaY < -threshold) {
-      goToPrevCard();
+    if (state.currentIndex < 0) {
+      state.currentIndex = 0;
+    }
+    if (state.currentIndex >= state.feedItems.length) {
+      state.currentIndex = state.feedItems.length - 1;
     }
 
-    state.wheelLocked = true;
-    setTimeout(function () {
-      state.wheelLocked = false;
-    }, 350);
-  }
-
-  function onTouchStart(e) {
-    if (e.touches.length !== 1) return;
-    state.touchStartY = e.touches[0].clientY;
-  }
-
-  function onTouchEnd(e) {
-    if (state.touchStartY == null) return;
-    const endY = e.changedTouches[0].clientY;
-    const deltaY = endY - state.touchStartY;
-
-    const threshold = 40;
-    if (deltaY < -threshold) {
-      // свайп вверх → следующая
-      goToNextCard();
-    } else if (deltaY > threshold) {
-      // свайп вниз → предыдущая
-      goToPrevCard();
+    var item = state.feedItems[state.currentIndex];
+    if (!item) {
+      renderEmptyFeed();
+      return;
     }
 
-    state.touchStartY = null;
+    var title = escapeHtml(item.title || "");
+    var body = escapeHtml(item.body || "");
+    body = body.replace(/\n/g, "<br />");
+
+    var sourceName = "";
+    if (item.meta && item.meta.source_name) {
+      sourceName = String(item.meta.source_name);
+    } else if (item.source_type === "telegram") {
+      sourceName = "Telegram";
+    } else if (item.source_type === "llm") {
+      sourceName = "EYYE • AI-подборка";
+    }
+
+    var html =
+      '<div class="card">' +
+      '<div class="card-header">' +
+      '<div class="card-source">' +
+      (sourceName ? "Источник: " + escapeHtml(sourceName) : "") +
+      "</div>" +
+      "</div>" +
+      '<div class="card-content">' +
+      '<h2 class="card-title">' +
+      title +
+      "</h2>" +
+      '<p class="card-body">' +
+      body +
+      "</p>" +
+      "</div>" +
+      '<div class="card-footer">' +
+      '<div class="card-tagline">Свайпай вверх/вниз, чтобы листать ленту</div>' +
+      "</div>" +
+      "</div>";
+
+    elFeedCardContainer.innerHTML = html;
+  }
+
+  function appendNewItems(items) {
+    if (!items || !items.length) return;
+
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var id = it.id;
+      if (id == null) {
+        state.feedItems.push(it);
+        continue;
+      }
+      var key = String(id);
+      if (!state.seenIds[key]) {
+        state.seenIds[key] = true;
+        state.feedItems.push(it);
+      }
+    }
+  }
+
+  function loadFeed(initial) {
+    if (!state.tgId) {
+      renderEmptyFeed(
+        "Не удалось получить твой Telegram ID. Открой WebApp через кнопку в боте и попробуй снова."
+      );
+      return;
+    }
+
+    if (state.loadingFeed) {
+      return;
+    }
+    if (!initial && !state.hasMore) {
+      return;
+    }
+
+    state.loadingFeed = true;
+
+    if (initial) {
+      state.feedItems = [];
+      state.currentIndex = 0;
+      state.hasMore = true;
+      state.nextOffset = 0;
+      state.seenIds = {};
+    }
+
+    var limit = 20;
+    var offset = state.nextOffset;
+
+    var url =
+      "/api/feed?tg_id=" +
+      encodeURIComponent(String(state.tgId)) +
+      "&limit=" +
+      String(limit) +
+      "&offset=" +
+      String(offset);
+
+    logDebug("Loading feed:", url);
+
+    apiFetch(url, { method: "GET" })
+      .then(function (resp) {
+        if (!resp.ok) {
+          logDebug("GET /api/feed HTTP error:", resp.status);
+          renderEmptyFeed(
+            "Не получилось загрузить ленту. Попробуй открыть WebApp чуть позже."
+          );
+          state.loadingFeed = false;
+          return null;
+        }
+        return resp.json();
+      })
+      .then(function (data) {
+        if (!data) return;
+        var items = data.items || [];
+        logDebug("Feed items batch:", items.length);
+
+        appendNewItems(items);
+
+        if (items.length < limit) {
+          state.hasMore = false;
+        } else {
+          state.nextOffset = offset + items.length;
+        }
+
+        if (state.feedItems.length === 0) {
+          renderEmptyFeed();
+        } else {
+          renderCurrentCard();
+        }
+
+        state.loadingFeed = false;
+      })
+      .catch(function (err) {
+        logDebug("GET /api/feed error:", err);
+        renderEmptyFeed(
+          "Не получилось загрузить ленту. Проверь интернет и попробуй ещё раз."
+        );
+        state.loadingFeed = false;
+      });
   }
 
   function goToNextCard() {
+    if (!state.feedItems || state.feedItems.length === 0) {
+      return;
+    }
     if (state.currentIndex < state.feedItems.length - 1) {
       state.currentIndex += 1;
       renderCurrentCard();
 
-      const remaining = state.feedItems.length - state.currentIndex - 1;
-      if (remaining < 3) {
-        loadMoreFeed(false);
+      // если мы приближаемся к концу — подгружаем
+      if (state.currentIndex >= state.feedItems.length - 3) {
+        loadFeed(false);
       }
-    } else if (state.hasMore) {
-      // карточки кончились, но бекенд говорит, что ещё можно подгрузить
-      loadMoreFeed(false).then(function () {
-        if (state.currentIndex < state.feedItems.length - 1) {
-          state.currentIndex += 1;
-          renderCurrentCard();
-        }
-      });
+    } else {
+      // дошли до конца текущего набора — пробуем ещё подгрузить
+      loadFeed(false);
     }
   }
 
   function goToPrevCard() {
+    if (!state.feedItems || state.feedItems.length === 0) {
+      return;
+    }
     if (state.currentIndex > 0) {
       state.currentIndex -= 1;
       renderCurrentCard();
     }
   }
 
-  function renderError(message) {
-    const onboardingScreen = document.getElementById("onboarding-screen");
-    const feedScreen = document.getElementById("feed-screen");
-    const container = document.getElementById("feed-card-container");
+  function handleWheel(event) {
+    event = event || window.event;
+    var now = Date.now();
+    if (state.wheelLocked && now - state.lastWheelTime < 250) {
+      return;
+    }
+    state.wheelLocked = true;
+    state.lastWheelTime = now;
+    setTimeout(function () {
+      state.wheelLocked = false;
+    }, 250);
 
-    if (onboardingScreen) onboardingScreen.classList.add("hidden");
-    if (feedScreen) feedScreen.classList.remove("hidden");
+    var deltaY = event.deltaY || event.wheelDeltaY || event.wheelDelta;
+    if (typeof deltaY !== "number") {
+      return;
+    }
 
-    if (container) {
-      container.innerHTML = `
-        <div class="card">
-          <div class="card-content">
-            <p class="card-body">
-              ${escapeHtml(message)}
-            </p>
-          </div>
-        </div>
-      `;
+    if (deltaY > 0) {
+      goToNextCard();
+    } else if (deltaY < 0) {
+      goToPrevCard();
     }
   }
 
-  // ==========
-  // ИНИЦИАЛИЗАЦИЯ
-  // ==========
+  function handleTouchStart(event) {
+    if (!event.touches || event.touches.length === 0) return;
+    state.touchStartY = event.touches[0].clientY;
+  }
+
+  function handleTouchEnd(event) {
+    if (state.touchStartY == null) return;
+    if (!event.changedTouches || event.changedTouches.length === 0) return;
+    var endY = event.changedTouches[0].clientY;
+    var diff = state.touchStartY - endY;
+    state.touchStartY = null;
+
+    var threshold = 40;
+    if (diff > threshold) {
+      // свайп вверх
+      goToNextCard();
+    } else if (diff < -threshold) {
+      // свайп вниз
+      goToPrevCard();
+    }
+  }
+
+  function attachSwipeHandlers() {
+    if (!elFeedCardContainer) return;
+
+    elFeedCardContainer.addEventListener("wheel", handleWheel, {
+      passive: true
+    });
+
+    elFeedCardContainer.addEventListener("touchstart", handleTouchStart, {
+      passive: true
+    });
+    elFeedCardContainer.addEventListener("touchend", handleTouchEnd, {
+      passive: true
+    });
+  }
+
+  // ==== ИНИЦИАЛИЗАЦИЯ ====
+
+  function initDomRefs() {
+    elOnboardingScreen = $("onboarding-screen");
+    elOnboardingCityStep = $("onboarding-step-city");
+    elOnboardingTopicsStep = $("onboarding-step-topics");
+    elCityInput = $("city-input");
+    elCityNextBtn = $("city-next-btn");
+    elCitySkipBtn = $("city-skip-btn");
+    elTopicsContainer = $("topics-container");
+    elTopicsSubmitBtn = $("topics-submit-btn");
+    elFeedScreen = $("feed-screen");
+    elFeedCardContainer = $("feed-card-container");
+  }
+
+  function initEventHandlers() {
+    if (elCityNextBtn) {
+      elCityNextBtn.addEventListener("click", handleCityNext);
+    }
+    if (elCitySkipBtn) {
+      elCitySkipBtn.addEventListener("click", handleCitySkip);
+    }
+    if (elTopicsSubmitBtn) {
+      elTopicsSubmitBtn.addEventListener("click", submitOnboarding);
+    }
+    attachSwipeHandlers();
+  }
+
+  function initTelegramWebApp() {
+    try {
+      if (window.Telegram && window.Telegram.WebApp) {
+        tg = window.Telegram.WebApp;
+        tg.ready();
+        tg.expand && tg.expand();
+      }
+    } catch (e) {
+      logDebug("Telegram WebApp init error:", e);
+    }
+  }
 
   function init() {
-    state.tgId = getTgId();
+    initDomRefs();
+    initTelegramWebApp();
 
-    if (tg) {
-      try {
-        tg.expand();
-        tg.ready();
-      } catch (e) {
-        console.warn("Telegram WebApp init error", e);
-      }
-    }
+    state.tgId = resolveTgId();
+    logDebug("Resolved tgId:", state.tgId);
 
     if (!state.tgId) {
-      renderError(
+      // Если мы вообще не знаем user id — показываем ошибку в онбординге
+      if (elOnboardingScreen) {
+        showScreen("onboarding");
+        showOnboardingStep("city");
+      }
+      showOnboardingError(
         "Не удалось получить твой Telegram ID. Открой WebApp через кнопку в боте и попробуй снова."
       );
       return;
     }
 
-    setupOnboardingUI();
-    checkProfileAndStart();
+    initEventHandlers();
+    // Пытаемся загрузить профиль и решить, показывать ли онбординг
+    loadProfileAndMaybeSkipOnboarding();
   }
 
   if (document.readyState === "loading") {
