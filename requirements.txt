@@ -6,3 +6,4 @@ redis
 sentry-sdk
 fastapi
 uvicorn[standard]
+telethon
