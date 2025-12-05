@@ -436,18 +436,34 @@
       .then(function (data) {
         if (!data) return;
         var items = data.items || [];
-        logDebug("Feed items batch:", items.length);
+        var debug = data.debug || {};
+        logDebug("Feed items batch:", items.length, "debug:", debug);
 
         appendNewItems(items);
 
-        if (items.length < limit) {
-          state.hasMore = false;
+        // Используем серверную логику пагинации, если она есть
+        if (typeof debug.has_more === "boolean") {
+          state.hasMore = debug.has_more;
+        } else {
+          // Fallback на старое поведение
+          state.hasMore = items.length >= limit;
+        }
+
+        if (typeof debug.next_offset === "number") {
+          state.nextOffset = debug.next_offset;
         } else {
           state.nextOffset = offset + items.length;
         }
 
         if (state.feedItems.length === 0) {
-          renderEmptyFeed();
+          // Спец-сообщение, если сервер честно сказал, что карточек нет
+          if (debug.reason === "no_cards") {
+            renderEmptyFeed(
+              "Пока нет новостей по выбранным темам. Я обновлю ленту, как только появятся свежие карточки."
+            );
+          } else {
+            renderEmptyFeed();
+          }
         } else {
           renderCurrentCard();
         }
