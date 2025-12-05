@@ -252,6 +252,45 @@ def _try_loose_json_parse(content: str) -> Dict[str, Any] | None:
     return None
 
 
+def _extract_message_content(resp_json: Dict[str, Any]) -> str:
+    """
+    Вытаскиваем message.content из chat.completions-ответа,
+    поддерживая как строку, так и список блоков.
+    """
+    if not resp_json:
+        return ""
+
+    choices = resp_json.get("choices")
+    if not isinstance(choices, list) or not choices:
+        logger.error("No choices in OpenAI response")
+        return ""
+
+    message = choices[0].get("message") or {}
+    content = message.get("content")
+
+    # Поддерживаем как старый формат (строка), так и новый (список блоков)
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, dict):
+                    value = text.get("value")
+                    if isinstance(value, str):
+                        parts.append(value)
+                elif isinstance(text, str):
+                    parts.append(text)
+            elif isinstance(part, str):
+                parts.append(part)
+        content_str = "\n".join(parts)
+    elif isinstance(content, str):
+        content_str = content
+    else:
+        content_str = str(content or "")
+
+    return content_str
+
+
 # ==========
 # Высокоуровневая генерация карточек
 # ==========
@@ -331,34 +370,7 @@ def generate_cards_for_tags(
     if not resp_json:
         return []
 
-    choices = resp_json.get("choices")
-    if not isinstance(choices, list) or not choices:
-        logger.error("No choices in OpenAI card generation response")
-        return []
-
-    message = choices[0].get("message") or {}
-
-    content = message.get("content")
-    # Поддерживаем как старый формат (строка), так и новый (список блоков)
-    if isinstance(content, list):
-        parts: List[str] = []
-        for part in content:
-            if isinstance(part, dict):
-                text = part.get("text")
-                if isinstance(text, dict):
-                    value = text.get("value")
-                    if isinstance(value, str):
-                        parts.append(value)
-                elif isinstance(text, str):
-                    parts.append(text)
-            elif isinstance(part, str):
-                parts.append(part)
-        content_str = "\n".join(parts)
-    elif isinstance(content, str):
-        content_str = content
-    else:
-        content_str = str(content or "")
-
+    content_str = _extract_message_content(resp_json)
     if not content_str.strip():
         logger.error("Empty content in OpenAI cards response")
         return []
@@ -437,3 +449,216 @@ def generate_cards_for_tags(
         )
 
     return result
+
+
+# ==========
+# Нормализация Telegram-постов → EYYE-карточка
+# ==========
+
+def _normalize_tag_list(tags: Any) -> List[str]:
+    """
+    Нормализует поле tags к списку строк в нижнем регистре.
+    """
+    if not tags:
+        return []
+    if isinstance(tags, str):
+        tags = [tags]
+    if not isinstance(tags, list):
+        return []
+
+    result: List[str] = []
+    for t in tags:
+        if not isinstance(t, str):
+            continue
+        v = t.strip().lower()
+        if v:
+            result.append(v)
+
+    # убираем дубликаты, сохраняя порядок
+    seen = set()
+    deduped: List[str] = []
+    for t in result:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return deduped
+
+
+def normalize_telegram_post(
+    raw_text: str,
+    channel_title: str,
+    language: str = "ru",
+) -> Dict[str, Any]:
+    """
+    Нормализация сырого Telegram-поста в EYYE-карточку с помощью OpenAI.
+
+    Возвращает dict:
+      {
+        "title": str,
+        "body": str,
+        "tags": [str, ...],
+        "importance_score": float,
+        "language": str,
+        "source_name": Optional[str],
+      }
+    """
+    if not OPENAI_API_KEY:
+        logger.warning("OPENAI_API_KEY is not set, skip normalize_telegram_post")
+        # Минимальный фоллбек: тупо заворачиваем сырой текст
+        first_line = (raw_text or "").strip().split("\n")[0] or "Новость"
+        return {
+            "title": first_line[:200],
+            "body": (raw_text or "").strip()[:2000] or first_line[:200],
+            "tags": [],
+            "importance_score": 0.5,
+            "language": language,
+            "source_name": None,
+        }
+
+    system_prompt = (
+        "Ты модуль нормализации новостной ленты EYYE.\n"
+        "На вход ты получаешь сырой пост из Telegram-канала и название канала.\n"
+        "Твоя задача — вернуть ОДНУ аккуратную новостную карточку в формате JSON.\n\n"
+        "Правила:\n"
+        "1) НЕ придумывай новости, работай только с предоставленным текстом.\n"
+        "2) title — одно краткое предложение, передающее суть новости без кликбейта.\n"
+        "3) body — 2–4 абзаца по 1–3 предложения, без воды, без эмодзи, без обращений к читателю.\n"
+        "4) tags — список из 1–6 общих тематических тегов (например: business, tech, sports, movies,\n"
+        "   politics, finance, crypto, ml, education, lifestyle, health, travel, games, humor и т.п.).\n"
+        "   Теги — только латиницей, нижний регистр.\n"
+        "5) importance_score — число от 0 до 1 (0.1 — мелкая заметка, 0.9 — очень важная/масштабная новость).\n"
+        "6) language — ISO-код исходного языка ('ru', 'en' и т.п.).\n"
+        "7) source_name — заполняй ТОЛЬКО если в тексте явно есть название издания/бренда\n"
+        "   (например, 'Bloomberg', 'Reuters', 'Медуза', 'РБК', 'Forbes' и т.п.). Ничего не выдумывай.\n"
+        "8) НЕ упоминай Telegram, каналы, подписи вида 'подпишись', 'читать в полном виде' и т.п.\n\n"
+        "Верни СТРОГО один JSON-объект БЕЗ пояснений вокруг."
+    )
+
+    user_prompt = (
+        f"Язык оригинала (hint): {language}\n"
+        f"Название Telegram-канала: {channel_title}\n\n"
+        "Сырой текст поста из Telegram:\n"
+        "-------------------\n"
+        f"{(raw_text or '').strip()}\n"
+        "-------------------\n\n"
+        "Верни JSON вида:\n"
+        "{\n"
+        '  \"title\": \"...\",\n'
+        '  \"body\": \"...\",\n'
+        '  \"tags\": [\"...\"],\n'
+        '  \"importance_score\": 0.7,\n'
+        '  \"language\": \"ru\",\n'
+        '  \"source_name\": \"...\" // опционально\n'
+        "}"
+    )
+
+    payload: Dict[str, Any] = {
+        "model": OPENAI_MODEL or "gpt-4.1-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_output_tokens": 800,
+        "temperature": 0.3,
+        "response_format": {"type": "json_object"},
+    }
+
+    started = time.monotonic()
+    resp_json = call_openai_chat(payload)
+    elapsed = time.monotonic() - started
+    logger.info(
+        "OpenAI normalize_telegram_post call finished in %.2fs (channel_title=%r)",
+        elapsed,
+        channel_title,
+    )
+
+    # Фоллбек, если совсем ничего не вернулось
+    first_line = (raw_text or "").strip().split("\n")[0] or "Новость"
+    fallback = {
+        "title": first_line[:200],
+        "body": (raw_text or "").strip()[:2000] or first_line[:200],
+        "tags": [],
+        "importance_score": 0.5,
+        "language": language,
+        "source_name": None,
+    }
+
+    if not resp_json:
+        return fallback
+
+    content_str = _extract_message_content(resp_json)
+    if not content_str.strip():
+        logger.error("Empty content in normalize_telegram_post response")
+        return fallback
+
+    # Пытаемся честно распарсить JSON
+    data: Dict[str, Any] | None = None
+    try:
+        parsed = json.loads(content_str)
+        if isinstance(parsed, dict):
+            data = parsed
+        elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+            # На всякий случай, если модель вернула список из одного объекта
+            data = parsed[0]
+    except json.JSONDecodeError:
+        logger.warning(
+            "Failed to json.loads normalize_telegram_post content, trying loose JSON parse",
+            exc_info=True,
+        )
+        data = _try_loose_json_parse(content_str)
+
+    # Если JSON так и не распарсился — salvage из текстового блока
+    if data is None:
+        logger.error(
+            "normalize_telegram_post JSON parsing failed, trying salvage via CARD_BLOCK_RE"
+        )
+        salvaged_cards = _parse_openai_cards_from_text(content_str, [])
+        if salvaged_cards:
+            c = salvaged_cards[0]
+            title = str(c.get("title", "")).strip() or fallback["title"]
+            body = str(c.get("body", "")).strip() or fallback["body"]
+            tags = _normalize_tag_list(c.get("tags"))
+            try:
+                importance_score = float(c.get("importance_score", 0.5))
+            except (TypeError, ValueError):
+                importance_score = 0.5
+            importance_score = max(0.0, min(1.0, importance_score))
+
+            return {
+                "title": title,
+                "body": body,
+                "tags": tags,
+                "importance_score": importance_score,
+                "language": language,
+                "source_name": None,
+            }
+        else:
+            logger.error("normalize_telegram_post salvage parser also failed, using fallback")
+            return fallback
+
+    # Нормализация полей
+    title = str(data.get("title") or "").strip()
+    body = str(data.get("body") or "").strip()
+    tags = _normalize_tag_list(data.get("tags"))
+    try:
+        importance_score = float(data.get("importance_score", data.get("importance", 0.5)))
+    except (TypeError, ValueError):
+        importance_score = 0.5
+    importance_score = max(0.0, min(1.0, importance_score))
+
+    lang_value = str(data.get("language") or "").strip() or language
+    source_name = (data.get("source_name") or "").strip() or None
+
+    if not title:
+        title = fallback["title"]
+    if not body:
+        body = fallback["body"]
+
+    return {
+        "title": title,
+        "body": body,
+        "tags": tags,
+        "importance_score": importance_score,
+        "language": lang_value,
+        "source_name": source_name,
+    }
