@@ -363,6 +363,19 @@
       "</div>";
 
     elFeedCardContainer.innerHTML = html;
+
+    // === ТЕЛЕМЕТРИЯ: карточка показана пользователю ===
+    if (
+      window.EYYETelemetry &&
+      typeof window.EYYETelemetry.onCardShown === "function" &&
+      item.id != null
+    ) {
+      window.EYYETelemetry.onCardShown({
+        tgId: state.tgId,
+        cardId: item.id,
+        position: state.currentIndex
+      });
+    }
   }
 
   function appendNewItems(items) {
@@ -483,6 +496,29 @@
     if (!state.feedItems || state.feedItems.length === 0) {
       return;
     }
+
+    // === ТЕЛЕМЕТРИЯ: свайп вперёд по текущей карточке ===
+    var prevItem =
+      state.feedItems &&
+      state.feedItems.length > 0 &&
+      state.currentIndex >= 0 &&
+      state.currentIndex < state.feedItems.length
+        ? state.feedItems[state.currentIndex]
+        : null;
+
+    if (
+      prevItem &&
+      prevItem.id != null &&
+      window.EYYETelemetry &&
+      typeof window.EYYETelemetry.onSwipeNext === "function"
+    ) {
+      window.EYYETelemetry.onSwipeNext({
+        tgId: state.tgId,
+        cardId: prevItem.id,
+        position: state.currentIndex
+      });
+    }
+
     if (state.currentIndex < state.feedItems.length - 1) {
       state.currentIndex += 1;
       renderCurrentCard();
@@ -625,6 +661,17 @@
         "Не удалось получить твой Telegram ID. Открой WebApp через кнопку в боте и попробуй снова."
       );
       return;
+    }
+
+    // === ТЕЛЕМЕТРИЯ: инициализация для этого пользователя ===
+    if (
+      window.EYYETelemetry &&
+      typeof window.EYYETelemetry.init === "function"
+    ) {
+      window.EYYETelemetry.init({
+        tgId: state.tgId,
+        source: "webapp"
+      });
     }
 
     initEventHandlers();
