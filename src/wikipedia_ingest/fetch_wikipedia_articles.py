@@ -1,50 +1,16 @@
 # file: src/wikipedia_ingest/fetch_wikipedia_articles.py
-"""
-Wikipedia ingest worker для EYYE.
-
-Логика v2.0:
-- для каждого языка (en, ru) берём топовые статьи по просмотрам за последние дни
-  через Wikimedia Pageviews API;
-- для каждой статьи тянем summary через REST API Wikipedia;
-- прогоняем summary через normalize_telegram_post, чтобы получить
-  title/body/tags/importance_score в нашей общей схеме;
-- фильтруем по тегам под наши топики (как в TikTok-лайт персонализации);
-- тянем HTML статьи и выдёргиваем внешние источники (домены ссылок);
-- в cards.meta.source_name пишем реальные источники (BBC, The Guardian и т.п.),
-  а не "Wikipedia" — сама Википедия хранится в meta.via = "Wikipedia";
-- сохраняем карточки в таблицу cards с source_type = "wikipedia";
-- /api/feed автоматически начнёт подмешивать их вместе с Telegram-карточками.
-"""
-
 import os
-import sys
 import logging
-from pathlib import Path
-from typing import Any, Dict, List
-from urllib.parse import quote, urlparse
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 import requests
-from supabase import create_client, Client
-from dotenv import load_dotenv
+from supabase import Client, create_client
+
+from webapp_backend.openai_client import normalize_telegram_post
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-# Подтягиваем .env
-load_dotenv()
-
-# ==========
-# Пути к общему коду (как в telegram_ingest)
-# ==========
-
-CURRENT_DIR = Path(__file__).resolve()
-SRC_DIR = CURRENT_DIR.parents[1]  # .../src
-if str(SRC_DIR) not in sys.path:
-    sys.path.append(str(SRC_DIR))
-
-from webapp_backend.openai_client import normalize_telegram_post
-from webapp_backend.cards_service import _insert_cards_into_db
 
 # ==========
 # Supabase
@@ -55,185 +21,287 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ==========
-# Конфиг Wikipedia-инжестора
+# Конфиг Wikipedia / Wikimedia
 # ==========
 
-# Языки, которые обрабатываем
-# Пример: "en,ru"
-WIKIPEDIA_LANGS = os.getenv("WIKIPEDIA_LANGS", "en,ru").split(",")
-WIKIPEDIA_LANGS = [lang.strip() for lang in WIKIPEDIA_LANGS if lang.strip()]
+WIKIPEDIA_LANGS: List[str] = ["en", "ru"]
 
-# На сколько дней назад смотреть статистику просмотров
-# (по умолчанию — вчера)
-WIKIPEDIA_DAYS_BACK = int(os.getenv("WIKIPEDIA_DAYS_BACK", "1"))
-
-# Максимум статей на язык за один запуск
-WIKIPEDIA_MAX_PER_LANG = int(os.getenv("WIKIPEDIA_MAX_PER_LANG", "5"))
-
-# Разрешённые теги — фильтр, чтобы в фид попадали только релевантные
-# нашему продукту топики
-ALLOWED_TAGS = {
-    "world_news",
-    "business",
-    "tech",
-    "entertainment",
-    "society",
-    "uk_students",
-    "politics",
-    "education",
-    "science",
-    "russia",
-    "movies",
-    "finance",
-    "careers",
+# Базовые (seed) статьи на случай, если trending не работает
+WIKIPEDIA_SEED_ARTICLES: Dict[str, List[str]] = {
+    "en": [
+        "Artificial_intelligence",
+        "Startup_company",
+        "Universities_in_the_United_Kingdom",
+        "Streaming_media",
+        "Climate_change",
+    ],
+    "ru": [
+        "Искусственный_интеллект",
+        "Стартап",
+        "Система_образования_Великобритании",
+        "Потоковое_мультимедиа",
+        "Изменение_климата",
+    ],
 }
 
+# Проекты для Wikimedia API
+WIKIMEDIA_PROJECTS: Dict[str, str] = {
+    "en": "en.wikipedia.org",
+    "ru": "ru.wikipedia.org",
+}
+
+# Ещё немного конфигов
+WIKIPEDIA_TRENDING_TITLES_PER_LANG = int(
+    os.getenv("WIKIPEDIA_TRENDING_TITLES_PER_LANG", "20")
+)
+
+WIKIMEDIA_USER_AGENT = os.getenv(
+    "WIKIMEDIA_USER_AGENT",
+    "EYYE-MVP/0.1 (https://github.com/artemarnautov/eyye-tg-bot; contact: dev@eyye.local)",
+)
+
+WIKIMEDIA_TOP_URL_TEMPLATE = (
+    "https://wikimedia.org/api/rest_v1/metrics/pageviews/top/"
+    "{project}/all-access/{year}/{month}/all-days"
+)
+
+WIKIPEDIA_API_URL_TEMPLATE = "https://{lang}.wikipedia.org/w/api.php"
+
+# Сколько карточек максимально вставляем одним батчем
+SUPABASE_INSERT_BATCH_SIZE = int(os.getenv("WIKIPEDIA_INSERT_BATCH_SIZE", "50"))
 
 # ==========
 # Вспомогательные функции
 # ==========
 
 
-def _fetch_trending_titles(lang: str, max_count: int) -> List[str]:
+def _card_exists(source_ref: str) -> bool:
     """
-    Берём топовые статьи по просмотрам за день (по умолчанию — вчера)
-    через Wikimedia Pageviews API.
-
-    Документация:
-    https://wikitech.wikimedia.org/wiki/Analytics/AQS/Pageviews#Top_articles
-    """
-    project = f"{lang}.wikipedia"
-    today = datetime.now(timezone.utc).date()
-    day = today - timedelta(days=WIKIPEDIA_DAYS_BACK)
-
-    url = (
-        "https://wikimedia.org/api/rest_v1/metrics/pageviews/top/"
-        f"{project}/all-access/{day.year}/{day.month:02d}/{day.day:02d}"
-    )
-
-    try:
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-    except Exception as exc:
-        log.warning("Failed to fetch trending articles for %s: %s", lang, exc)
-        return []
-
-    data = resp.json()
-    items = data.get("items") or []
-    if not items:
-        return []
-
-    articles = items[0].get("articles") or []
-    titles: List[str] = []
-
-    for a in articles:
-        title = a.get("article")
-        if not isinstance(title, str):
-            continue
-        # Отсекаем системные и служебные страницы
-        if title in ("Main_Page",):
-            continue
-        if ":" in title:  # Special:, Category:, etc.
-            continue
-
-        titles.append(title.replace("_", " "))
-        if len(titles) >= max_count:
-            break
-
-    log.info("Trending for %s: %r", lang, titles)
-    return titles
-
-
-def _fetch_summary(lang: str, title: str) -> Dict[str, Any]:
-    """
-    Тянем краткое содержание статьи через REST API Wikipedia:
-    /page/summary/{title}
-    """
-    base = f"https://{lang}.wikipedia.org/api/rest_v1/page/summary/"
-    url = base + quote(title.replace(" ", "_"))
-    resp = requests.get(url, timeout=10)
-    if resp.status_code != 200:
-        raise RuntimeError(
-            f"Failed to fetch summary for {lang}:{title}: {resp.status_code}"
-        )
-    return resp.json()
-
-
-def _fetch_external_sources(lang: str, title: str, max_sources: int = 5) -> List[str]:
-    """
-    Тянем HTML статьи и выдёргиваем внешние ссылки (References) — берём домены.
-    Это даёт нам реальные источники (BBC, The Guardian, ...), а не "Wikipedia".
-    """
-    html_url = (
-        f"https://{lang}.wikipedia.org/api/rest_v1/page/html/"
-        f"{quote(title.replace(' ', '_'))}"
-    )
-
-    try:
-        resp = requests.get(html_url, timeout=10)
-        resp.raise_for_status()
-    except Exception as exc:
-        log.warning("Failed to fetch HTML for sources %s:%s: %s", lang, title, exc)
-        return []
-
-    from html.parser import HTMLParser
-
-    class ExternalLinkParser(HTMLParser):
-        def __init__(self) -> None:
-            super().__init__()
-            self.domains: List[str] = []
-
-        def handle_starttag(self, tag: str, attrs):
-            if tag != "a":
-                return
-
-            attrs_dict = dict(attrs)
-            href = attrs_dict.get("href")
-            if not href:
-                return
-            if not href.startswith("http"):
-                return
-
-            # Ищем внешние ссылки из референсов
-            rel = attrs_dict.get("rel", "")
-            css_class = attrs_dict.get("class", "")
-
-            if "nofollow" not in rel and "external" not in css_class:
-                return
-
-            netloc = urlparse(href).netloc
-            if not netloc:
-                return
-            if netloc.endswith(".wikipedia.org"):
-                return
-            if netloc.startswith("www."):
-                netloc = netloc[4:]
-
-            if netloc not in self.domains:
-                self.domains.append(netloc)
-
-    parser = ExternalLinkParser()
-    parser.feed(resp.text)
-    return parser.domains[:max_sources]
-
-
-def _card_exists(url: str) -> bool:
-    """
-    Проверяем, есть ли уже карточка с таким source_ref и source_type = 'wikipedia'.
-    Чтобы не плодить дубли при повторных запусках воркера.
+    Проверяем, есть ли уже карточка с таким source_type/source_ref.
     """
     resp = (
         supabase.table("cards")
         .select("id")
         .eq("source_type", "wikipedia")
-        .eq("source_ref", url)
+        .eq("source_ref", source_ref)
         .limit(1)
         .execute()
     )
-    exists = bool(resp.data)
-    if exists:
-        log.info("Card for %s already exists, skipping", url)
-    return exists
+    data = resp.data or []
+    return len(data) > 0
+
+
+def _fetch_trending_titles_for_lang(lang: str) -> List[str]:
+    """
+    Берём самые популярные статьи за текущий месяц из Wikimedia Pageviews API.
+    Если что-то ломается (403 и т.п.) — возвращаем пустой список, а дальше
+    выше по стеку упадём на seed-статьи.
+    """
+    project = WIKIMEDIA_PROJECTS.get(lang)
+    if not project:
+        log.warning("No Wikimedia project configured for lang=%s", lang)
+        return []
+
+    today = datetime.utcnow()
+    url = WIKIMEDIA_TOP_URL_TEMPLATE.format(
+        project=project,
+        year=today.year,
+        month=f"{today.month:02d}",
+    )
+
+    headers = {
+        "User-Agent": WIKIMEDIA_USER_AGENT,
+        "accept": "application/json",
+    }
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        resp.raise_for_status()
+    except Exception as e:
+        log.warning("Failed to fetch trending articles for %s: %s", lang, e)
+        return []
+
+    data = resp.json() or {}
+    items = data.get("items") or []
+    if not items:
+        log.warning("No items in Wikimedia top response for lang=%s", lang)
+        return []
+
+    # В ответе items[0].articles — список статей
+    first_item = items[0] or {}
+    articles = first_item.get("articles") or []
+
+    titles: List[str] = []
+    for art in articles:
+        title = art.get("article")
+        if not isinstance(title, str):
+            continue
+
+        # Отбрасываем служебные страницы
+        if title.startswith("Special:") or title.startswith("Main_Page"):
+            continue
+
+        titles.append(title)
+        if len(titles) >= WIKIPEDIA_TRENDING_TITLES_PER_LANG:
+            break
+
+    log.info(
+        "Fetched %d trending titles for lang=%s",
+        len(titles),
+        lang,
+    )
+    return titles
+
+
+def _build_titles_for_lang(lang: str) -> List[str]:
+    """
+    Собираем список статей для конкретного языка:
+    - seed-статьи (AI, стартапы, UK unis, стриминг, климат)
+    - плюс trending из Wikimedia, если получилось их получить
+    """
+    titles: List[str] = []
+
+    seed = WIKIPEDIA_SEED_ARTICLES.get(lang, [])
+    titles.extend(seed)
+
+    trending = _fetch_trending_titles_for_lang(lang)
+    for t in trending:
+        if t not in titles:
+            titles.append(t)
+
+    return titles
+
+
+def _fetch_article_extract(lang: str, title: str) -> Optional[str]:
+    """
+    Тянем краткий текст статьи через Wikipedia API.
+    Используем prop=extracts, plaintext, ограничиваем по длине.
+    """
+    api_url = WIKIPEDIA_API_URL_TEMPLATE.format(lang=lang)
+
+    headers = {
+        "User-Agent": WIKIMEDIA_USER_AGENT,
+    }
+
+    params = {
+        "action": "query",
+        "format": "json",
+        "prop": "extracts",
+        "explaintext": True,
+        "exchars": 2000,  # примерно первые ~2k символов
+        "redirects": 1,
+        "titles": title,
+    }
+
+    try:
+        resp = requests.get(api_url, headers=headers, params=params, timeout=10)
+        resp.raise_for_status()
+    except Exception as e:
+        log.warning(
+            "Failed to fetch Wikipedia article '%s' (lang=%s): %s",
+            title,
+            lang,
+            e,
+        )
+        return None
+
+    data = resp.json() or {}
+    pages = data.get("query", {}).get("pages", {})
+    if not pages:
+        log.warning("No pages in Wikipedia response for title=%r, lang=%s", title, lang)
+        return None
+
+    page = next(iter(pages.values()))
+    extract = page.get("extract")
+    if not extract or not str(extract).strip():
+        log.warning("Empty extract for title=%r, lang=%s", title, lang)
+        return None
+
+    return str(extract)
+
+
+def _normalize_to_card(
+    lang: str,
+    title: str,
+    url: str,
+    extract: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Прогоняем текст Вики через уже существующий normalize_telegram_post,
+    чтобы получить title/body/tags/importance_score.
+
+    Доп. логика:
+    - если source_name от модели содержит 'wikipedia', мы его перетираем на
+      что-то нейтральное, чтобы не писать пользователю, что источник — Википедия.
+    """
+    # Lang для нашей модели: оставим "en"/"ru", как и есть
+    normalized = normalize_telegram_post(
+        raw_text=extract,
+        channel_title=f"Wikipedia ({lang})",
+        language=lang,
+    )
+
+    tags = normalized.get("tags") or []
+    if not isinstance(tags, list):
+        tags = []
+
+    # Заголовок / тело
+    norm_title = (normalized.get("title") or "").strip()
+    if not norm_title:
+        norm_title = title.replace("_", " ")
+
+    norm_body = (normalized.get("body") or "").strip()
+    if not norm_body:
+        # fallback: кусок оригинального текста
+        norm_body = extract[:800]
+
+    # Важность
+    try:
+        importance = float(normalized.get("importance_score", 0.5))
+    except Exception:
+        importance = 0.5
+
+    # Источник: не хотим показывать пользователю слово "Wikipedia"
+    source_name = (normalized.get("source_name") or "").strip()
+    if not source_name or "wikipedia" in source_name.lower():
+        source_name = "EYYE • AI-подборка"
+
+    card: Dict[str, Any] = {
+        "title": norm_title,
+        "body": norm_body,
+        "tags": tags,
+        "importance_score": importance,
+        "language": "en" if lang == "en" else "ru",
+        "is_active": True,
+        "source_type": "wikipedia",
+        "source_ref": url,
+        "meta": {"source_name": source_name},
+    }
+
+    log.info(
+        "Prepared Wikipedia card: title=%r, source_name=%r, tags=%r",
+        card["title"],
+        source_name,
+        tags,
+    )
+    return card
+
+
+def _insert_cards(cards: List[Dict[str, Any]]) -> None:
+    """
+    Вставляем карточки в Supabase пачками.
+    """
+    if not cards:
+        return
+
+    total = len(cards)
+    idx = 0
+    while idx < total:
+        batch = cards[idx : idx + SUPABASE_INSERT_BATCH_SIZE]
+        resp = supabase.table("cards").insert(batch).execute()
+        inserted = len(resp.data or [])
+        log.info("Inserted %d Wikipedia cards (batch size=%d)", inserted, len(batch))
+        idx += SUPABASE_INSERT_BATCH_SIZE
 
 
 # ==========
@@ -244,133 +312,54 @@ def _card_exists(url: str) -> bool:
 def fetch_wikipedia_articles() -> None:
     """
     Основной воркер:
-    - по каждому языку берём трендовые статьи,
-    - нормализуем в наш формат,
-    - фильтруем по тегам,
-    - сохраняем в cards.
+    - по каждому языку (en/ru) берёт список статей (seed + trending),
+    - для каждой статьи:
+        - строит URL,
+        - проверяет, нет ли уже карточки с таким source_ref,
+        - тянет текст из Wikipedia,
+        - нормализует в формат нашей карточки,
+        - добавляет в список для вставки.
     """
-    all_cards: List[Dict[str, Any]] = []
+    prepared_cards: List[Dict[str, Any]] = []
 
     for lang in WIKIPEDIA_LANGS:
-        lang = lang.strip()
-        if not lang:
-            continue
-
         log.info("Processing Wikipedia articles for lang=%s", lang)
 
-        trending_titles = _fetch_trending_titles(lang, WIKIPEDIA_MAX_PER_LANG)
-        if not trending_titles:
-            log.warning("No trending titles for lang=%s, skipping", lang)
+        titles = _build_titles_for_lang(lang)
+        if not titles:
+            log.warning("No titles for lang=%s, skipping", lang)
             continue
 
-        for title in trending_titles:
-            # 1) summary
-            try:
-                summary_json = _fetch_summary(lang, title)
-            except Exception as exc:
-                log.warning(
-                    "Failed to fetch summary for %s:%s: %s", lang, title, exc
-                )
-                continue
+        for title in titles:
+            url = f"https://{lang}.wikipedia.org/wiki/{title}"
 
-            url = summary_json.get("content_urls", {}).get("desktop", {}).get("page")
-            if not url:
-                url = f"https://{lang}.wikipedia.org/wiki/{quote(title.replace(' ', '_'))}"
-
-            # 2) дидуп по source_ref
             if _card_exists(url):
+                # Не дублируем то, что уже есть
                 continue
 
-            extract = (
-                summary_json.get("extract") or summary_json.get("description") or ""
-            )
-            if not extract or len(extract.strip()) < 40:
-                log.info("Summary too short for %s, skipping", url)
+            extract = _fetch_article_extract(lang, title)
+            if not extract:
                 continue
 
-            channel_title = f"Wikipedia ({lang})"
-
-            # 3) нормализация через OpenAI (та же логика, что у Telegram-постов)
             try:
-                normalized = normalize_telegram_post(
-                    raw_text=extract,
-                    channel_title=channel_title,
-                    language=lang,
-                )
-            except Exception as exc:
+                card = _normalize_to_card(lang, title, url, extract)
+            except Exception:
                 log.exception(
-                    "Failed to normalize Wikipedia article %s (%s): %s",
+                    "Failed to normalize Wikipedia article %s (%s)",
                     title,
                     lang,
-                    exc,
                 )
                 continue
 
-            tags = normalized.get("tags") or []
-            tags_norm = [str(t).strip().lower() for t in tags if str(t).strip()]
+            if card:
+                prepared_cards.append(card)
 
-            # 4) фильтрация по нашим топикам (TikTok-лайт логика)
-            if ALLOWED_TAGS and not any(t in ALLOWED_TAGS for t in tags_norm):
-                log.info(
-                    "Skipping article %s (%s) due to unrelated tags %r",
-                    title,
-                    lang,
-                    tags_norm,
-                )
-                continue
-
-            # 5) реальные источники из статьи
-            external_sources = _fetch_external_sources(lang, title, max_sources=5)
-            if external_sources:
-                source_name = ", ".join(external_sources[:3])
-            else:
-                # если совсем ничего нет — всё равно ставим что-то
-                source_name = f"Wikipedia {lang.upper()}"
-
-            meta = {
-                "source_name": source_name,      # это увидит пользователь
-                "sources": external_sources,     # список доменов
-                "via": "Wikipedia",              # внутренняя пометка
-            }
-
-            card_payload = {
-                "title": normalized.get("title")
-                or summary_json.get("title")
-                or title,
-                "body": normalized.get("body") or extract,
-                "tags": tags_norm,
-                "importance_score": float(
-                    normalized.get("importance_score", 0.6)
-                ),
-                "language": lang,
-                "is_active": True,
-                "source_type": "wikipedia",
-                "source_ref": url,
-                "meta": meta,
-            }
-
-            log.info(
-                "Prepared Wikipedia card: title=%r, source_name=%r, tags=%r",
-                card_payload["title"],
-                source_name,
-                card_payload["tags"],
-            )
-            all_cards.append(card_payload)
-
-    if not all_cards:
+    if not prepared_cards:
         log.info("No Wikipedia cards prepared on this run")
         return
 
-    # 6) Вставка в cards одним батчем
-    inserted = _insert_cards_into_db(
-        supabase,
-        all_cards,
-        language=None,         # язык берём из каждой карточки
-        source_type="wikipedia",
-        fallback_source_name=None,
-        source_ref=None,
-    )
-    log.info("Inserted %d Wikipedia cards", len(inserted))
+    _insert_cards(prepared_cards)
+    log.info("Wikipedia ingest finished, total cards prepared=%d", len(prepared_cards))
 
 
 def main() -> None:
@@ -378,6 +367,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    # CLI-режим:
-    # PYTHONPATH=src python -m wikipedia_ingest.fetch_wikipedia_articles
     main()
