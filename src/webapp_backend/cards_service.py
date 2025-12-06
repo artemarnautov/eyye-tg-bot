@@ -12,6 +12,71 @@ from .openai_client import generate_cards_for_tags, is_configured as openai_is_c
 
 logger = logging.getLogger(__name__)
 
+# ===================== Теги / топики =====================
+
+MAX_BASE_TAGS = 4  # сколько тегов максимум берём в базовый фильтр
+
+# дефолтный набор, если про юзера ещё ничего не знаем
+DEFAULT_BASE_TAGS = ["entertainment", "society", "business", "politics"]
+
+
+def build_base_tags_from_weights(user_rows: List[Dict[str, Any]]) -> Tuple[List[str], bool, Dict[str, Any]]:
+    """
+    user_rows: список dict с ключами 'tag' и 'weight' из user_topic_weights.
+    Возвращает (base_tags, used_default_tags, debug_info).
+    """
+    user_rows = user_rows or []
+    debug_info: Dict[str, Any] = {
+        "count": len(user_rows),
+        "top": [],
+    }
+
+    if user_rows:
+        # сортируем по убыванию веса
+        sorted_rows = sorted(
+            (r for r in user_rows if r.get("tag")),
+            key=lambda r: r.get("weight") or 0.0,
+            reverse=True,
+        )
+
+        # для debug.top оставим первые 5
+        debug_info["top"] = [
+            [r["tag"], float(r.get("weight") or 0.0)] for r in sorted_rows[:5]
+        ]
+
+        personal_tags: List[str] = []
+
+        # собираем персональные теги (оставляем 1 слот под общие)
+        for r in sorted_rows:
+            tag = r["tag"]
+            if tag not in personal_tags:
+                personal_tags.append(tag)
+            if len(personal_tags) >= MAX_BASE_TAGS - 1:
+                break
+
+        base_tags: List[str] = []
+
+        # сначала персональные
+        for tag in personal_tags:
+            if len(base_tags) >= MAX_BASE_TAGS:
+                break
+            if tag not in base_tags:
+                base_tags.append(tag)
+
+        # добиваем до MAX_BASE_TAGS дефолтными
+        for tag in DEFAULT_BASE_TAGS:
+            if len(base_tags) >= MAX_BASE_TAGS:
+                break
+            if tag not in base_tags:
+                base_tags.append(tag)
+
+        return base_tags, False, debug_info
+
+    # если по юзеру нет данных — чистый дефолт
+    debug_info["top"] = []
+    return DEFAULT_BASE_TAGS[:MAX_BASE_TAGS], True, debug_info
+
+
 # ===================== Базовые настройки фида =====================
 
 FEED_CARDS_LIMIT_DEFAULT = int(os.getenv("FEED_CARDS_LIMIT", "20"))
