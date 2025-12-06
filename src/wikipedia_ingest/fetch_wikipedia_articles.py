@@ -1,13 +1,16 @@
 # file: src/wikipedia_ingest/fetch_wikipedia_articles.py
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import requests
-from supabase import Client, create_client
-from dotenv import load_dotenv  # 🔹 добавили
+from dotenv import load_dotenv
 
+# Сначала подтягиваем .env, чтобы OPENAI_API_KEY был виден при импорте openai_client
+load_dotenv()
+
+from supabase import Client, create_client
 from webapp_backend.openai_client import normalize_telegram_post
 
 log = logging.getLogger(__name__)
@@ -16,9 +19,6 @@ logging.basicConfig(level=logging.INFO)
 # ==========
 # Supabase
 # ==========
-
-# 🔹 грузим .env (как в telegram_ingest)
-load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -52,6 +52,20 @@ WIKIPEDIA_SEED_ARTICLES: Dict[str, List[str]] = {
     ],
 }
 
+# Fallback-теги для seed-статей, если модель вдруг не вернёт tags
+SEED_TITLE_TAGS: Dict[tuple, List[str]] = {
+    ("en", "Artificial_intelligence"): ["tech", "world_news", "science"],
+    ("en", "Startup_company"): ["business", "careers", "finance", "tech"],
+    ("en", "Universities_in_the_United_Kingdom"): ["uk_students", "education", "world_news"],
+    ("en", "Streaming_media"): ["entertainment", "movies", "tech"],
+    ("en", "Climate_change"): ["world_news", "society", "science"],
+    ("ru", "Искусственный_интеллект"): ["tech", "world_news", "science", "russia"],
+    ("ru", "Стартап"): ["business", "careers", "finance", "tech"],
+    ("ru", "Система_образования_Великобритании"): ["uk_students", "education", "world_news"],
+    ("ru", "Потоковое_мультимедиа"): ["entertainment", "movies", "tech"],
+    ("ru", "Изменение_климата"): ["world_news", "society", "science"],
+}
+
 # Проекты для Wikimedia API
 WIKIMEDIA_PROJECTS: Dict[str, str] = {
     "en": "en.wikipedia.org",
@@ -68,9 +82,10 @@ WIKIMEDIA_USER_AGENT = os.getenv(
     "EYYE-MVP/0.1 (https://github.com/artemarnautov/eyye-tg-bot; contact: dev@eyye.local)",
 )
 
+# правим URL под «топ за конкретный день»
 WIKIMEDIA_TOP_URL_TEMPLATE = (
     "https://wikimedia.org/api/rest_v1/metrics/pageviews/top/"
-    "{project}/all-access/{year}/{month}/all-days"
+    "{project}/all-access/{year}/{month}/{day}"
 )
 
 WIKIPEDIA_API_URL_TEMPLATE = "https://{lang}.wikipedia.org/w/api.php"
@@ -101,20 +116,21 @@ def _card_exists(source_ref: str) -> bool:
 
 def _fetch_trending_titles_for_lang(lang: str) -> List[str]:
     """
-    Берём самые популярные статьи за текущий месяц из Wikimedia Pageviews API.
-    Если что-то ломается (403 и т.п.) — возвращаем пустой список, а дальше
-    выше по стеку упадём на seed-статьи.
+    Берём самые популярные статьи за вчерашний день из Wikimedia Pageviews API.
+    Если что-то ломается — возвращаем пустой список, дальше используем только seed-статьи.
     """
     project = WIKIMEDIA_PROJECTS.get(lang)
     if not project:
         log.warning("No Wikimedia project configured for lang=%s", lang)
         return []
 
-    today = datetime.utcnow()
+    # вчерашний день по UTC
+    yesterday = datetime.utcnow() - timedelta(days=1)
     url = WIKIMEDIA_TOP_URL_TEMPLATE.format(
         project=project,
-        year=today.year,
-        month=f"{today.month:02d}",
+        year=yesterday.year,
+        month=f"{yesterday.month:02d}",
+        day=f"{yesterday.day:02d}",
     )
 
     headers = {
@@ -241,8 +257,9 @@ def _normalize_to_card(
     Доп. логика:
     - если source_name от модели содержит 'wikipedia', мы его перетираем на
       что-то нейтральное, чтобы не писать пользователю, что источник — Википедия.
+    - если модель не вернула теги для seed-страницы, подставляем заранее
+      подготовленные SEED_TITLE_TAGS.
     """
-    # Lang для нашей модели: оставим "en"/"ru", как и есть
     normalized = normalize_telegram_post(
         raw_text=extract,
         channel_title=f"Wikipedia ({lang})",
@@ -252,6 +269,10 @@ def _normalize_to_card(
     tags = normalized.get("tags") or []
     if not isinstance(tags, list):
         tags = []
+
+    # 🔹 fallback-теги для seed-страниц, если модель не вернула tags
+    if not tags:
+        tags = SEED_TITLE_TAGS.get((lang, title), [])
 
     # Заголовок / тело
     norm_title = (normalized.get("title") or "").strip()
