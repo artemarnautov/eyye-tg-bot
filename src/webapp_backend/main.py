@@ -12,6 +12,7 @@ from supabase import Client, create_client
 
 from .cards_service import build_feed_for_user
 from .profile_service import get_profile_summary, save_onboarding
+from .telemetry_service import EventsRequest, log_events  # <-- используем существующий telemetry_service
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -178,6 +179,12 @@ async def api_feed(
   Основной endpoint для WebApp:
   возвращает персональную ленту карточек для пользователя с поддержкой offset.
   """
+  if supabase is None:
+    raise HTTPException(
+      status_code=500,
+      detail="Supabase is not configured",
+    )
+
   items, debug = build_feed_for_user(
     supabase,
     tg_id,
@@ -185,3 +192,22 @@ async def api_feed(
     offset=offset,
   )
   return {"items": items, "debug": debug}
+
+
+# ---- Телеметрия событий (TikTok-lite сигналы) ----
+
+
+@app.post("/api/events")
+async def api_events(payload: EventsRequest) -> Dict[str, Any]:
+  """
+  Принимаем батч событий от фронта:
+  - пишем в user_events
+  - обновляем user_topic_weights
+  """
+  try:
+    log_events(payload)
+  except Exception:
+    logger.exception("Failed to log events for tg_id=%s", payload.tg_id)
+    raise HTTPException(status_code=500, detail="failed to log events")
+
+  return {"status": "ok"}
