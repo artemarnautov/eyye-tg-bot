@@ -19,7 +19,17 @@ logging.basicConfig(level=logging.INFO)
 
 # Подтягиваем .env (локально и на сервере, как в telegram_ingest)
 load_dotenv()
+# ==========
+# Пути к общему коду (как в telegram_ingest)
+# ==========
 
+CURRENT_DIR = Path(__file__).resolve()
+SRC_DIR = CURRENT_DIR.parents[1]  # .../src
+if str(SRC_DIR) not in sys.path:
+    sys.path.append(str(SRC_DIR))
+
+from webapp_backend.openai_client import normalize_telegram_post  # 👈 ВАЖНАЯ СТРОКА
+from webapp_backend.cards_service import _insert_cards_into_db    # 👈 и эта тоже
 # ==========
 # Supabase
 # ==========
