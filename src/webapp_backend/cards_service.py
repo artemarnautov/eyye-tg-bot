@@ -247,6 +247,45 @@ def _load_seen_cards_for_user(
     return result
 
 
+def _load_user_topic_weights(
+    supabase: Client | None,
+    user_id: int,
+) -> Dict[str, float]:
+    """
+    Загружаем веса интересов по тегам из user_topic_weights.
+    tg_id в таблице = user_id (Telegram ID).
+    """
+    weights: Dict[str, float] = {}
+    if supabase is None:
+        return weights
+
+    try:
+        resp = (
+            supabase.table("user_topic_weights")
+            .select("tag,weight")
+            .eq("tg_id", user_id)
+            .execute()
+        )
+    except Exception:
+        logger.exception("Error loading user_topic_weights for user_id=%s", user_id)
+        return weights
+
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+    for row in data or []:
+        tag = str(row.get("tag") or "").strip()
+        if not tag:
+            continue
+        try:
+            w = float(row.get("weight") or 0.0)
+        except (TypeError, ValueError):
+            w = 0.0
+        weights[tag] = w
+
+    return weights
+
+
 def _mark_cards_as_seen(
     supabase: Client | None,
     user_id: int,
@@ -311,14 +350,20 @@ def _score_cards_for_user(
     cards: List[Dict[str, Any]],
     base_tags: List[str],
     user_id: int | None = None,
+    user_topic_weights: Dict[str, float] | None = None,
 ) -> List[Dict[str, Any]]:
     """
-    Скор для карточек:
-    importance_score + бонус за совпадение тегов + бонус за свежесть + лёгкий рандом.
+    TikTok-lite скоринг:
+    - importance_score (базовый вес карточки)
+    - персональные веса по тегам из user_topic_weights
+    - совпадение тегов с интересами онбординга
+    - свежесть
+    - лёгкий детерминированный рандом
     """
     now = datetime.now(timezone.utc)
     base_tag_set = set(base_tags)
     today_str = now.strftime("%Y-%m-%d")
+    topic_weights = user_topic_weights or {}
 
     scored: List[Tuple[float, Dict[str, Any]]] = []
 
@@ -332,25 +377,30 @@ def _score_cards_for_user(
         except (TypeError, ValueError):
             importance = 1.0
 
-        # Бонус за совпадение тегов с профилем
-        profile_bonus = 0.0
+        # Сигнал по пользовательским весам тегов (user_topic_weights)
+        interest_score = 0.0
         for t in card_tags:
-            if t in base_tag_set:
-                profile_bonus += 0.3
+            interest_score += float(topic_weights.get(t, 0.0))
 
-        # Бонус за свежесть
-        recency_bonus = 0.0
+        # Бонус за совпадение с тегами онбординга (простой fallback)
+        overlap_count = sum(1 for t in card_tags if t in base_tag_set)
+        overlap_bonus = 0.3 * overlap_count
+
+        # Бонус за свежесть (0..1)
+        recency_score = 0.0
         created_at = card.get("created_at")
         if isinstance(created_at, str):
             try:
                 dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
                 age_hours = (now - dt).total_seconds() / 3600.0
                 if age_hours < FEED_MAX_CARD_AGE_HOURS:
-                    recency_bonus = (
+                    recency_score = (
                         FEED_MAX_CARD_AGE_HOURS - age_hours
                     ) / FEED_MAX_CARD_AGE_HOURS
+                else:
+                    recency_score = 0.0
             except Exception:
-                pass
+                recency_score = 0.0
 
         # Лёгкий детерминированный рандом для этого пользователя и карточки
         rand_bonus = 0.0
@@ -364,7 +414,15 @@ def _score_cards_for_user(
             # Преобразуем в [-1, 1] и масштабируем
             rand_bonus = (value * 2.0 - 1.0) * FEED_RANDOMNESS_STRENGTH
 
-        score = importance + profile_bonus + recency_bonus + rand_bonus
+        # Финальный скор: интересы пользователя доминируют,
+        # importance и свежесть — поддерживающие факторы.
+        score = (
+            importance
+            + 1.5 * interest_score
+            + overlap_bonus
+            + recency_score
+            + rand_bonus
+        )
         scored.append((score, card))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -637,7 +695,7 @@ def build_feed_for_user(
 
     debug["limit"] = limit
 
-    # 1. Теги интересов пользователя
+    # 1. Теги интересов пользователя (из онбординга)
     base_tags = get_interest_tags_for_user(supabase, user_id)
     used_default_tags = False
     if not base_tags:
@@ -647,7 +705,20 @@ def build_feed_for_user(
     debug["base_tags"] = base_tags
     debug["used_default_tags"] = used_default_tags
 
-    # 1.1. Загружаем просмотренные карточки
+    # 1.1. Загружаем веса интересов пользователя по тегам (user_topic_weights)
+    user_topic_weights = _load_user_topic_weights(supabase, user_id)
+    if user_topic_weights:
+        sorted_items = sorted(
+            user_topic_weights.items(), key=lambda kv: kv[1], reverse=True
+        )
+        debug["user_topic_weights"] = {
+            "count": len(user_topic_weights),
+            "top": sorted_items[:20],
+        }
+    else:
+        debug["user_topic_weights"] = {"count": 0, "top": []}
+
+    # 1.2. Загружаем просмотренные карточки
     seen_info = _load_seen_cards_for_user(supabase, user_id)
     exclude_ids: Set[int] = seen_info.get("exclude_ids") or set()
     recent_ids: Set[int] = seen_info.get("recent_ids") or set()
@@ -815,8 +886,13 @@ def build_feed_for_user(
     else:
         debug["reason"] = "cards_from_db"
 
-    # 4. Ранжируем (с учётом рандома) и применяем дедуп/диверсификацию
-    ranked_raw = _score_cards_for_user(candidates, base_tags, user_id=user_id)
+    # 4. Ранжируем (TikTok-lite) и применяем дедуп/диверсификацию
+    ranked_raw = _score_cards_for_user(
+        candidates,
+        base_tags,
+        user_id=user_id,
+        user_topic_weights=user_topic_weights,
+    )
     ranked, postprocess_debug = _apply_dedup_and_diversity(ranked_raw, base_tags)
     debug["postprocess"] = postprocess_debug
 
