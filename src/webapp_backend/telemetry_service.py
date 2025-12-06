@@ -4,9 +4,7 @@ from datetime import datetime
 from typing import Any, Iterable, Literal, List
 
 from pydantic import BaseModel
-
-# Используй тот же клиент, что и в cards_service/profile_service
-from .supabase_client import supabase  # если у тебя он называется иначе, поправь импорт
+from supabase import Client
 
 
 class EventPayload(BaseModel):
@@ -36,11 +34,15 @@ POSITIVE_EVENTS = {"view", "click_more", "click_source", "like", "share"}
 NEGATIVE_EVENTS = {"swipe_next", "dislike"}
 
 
-def log_events(payload: EventsRequest) -> None:
+def log_events(supabase: Client | None, payload: EventsRequest) -> None:
     """
     1) Пишем события в user_events.
     2) Обновляем веса интересов пользователя в user_topic_weights.
     """
+    if supabase is None:
+        # На уровне /api/events мы и так кидаем 500, но тут на всякий случай
+        return
+
     if not payload.events:
         return
 
@@ -57,9 +59,11 @@ def log_events(payload: EventsRequest) -> None:
         for ev in payload.events
     ]
 
+    # 1. Логируем события
     supabase.table("user_events").insert(rows).execute()
 
-    _update_user_topic_weights(payload.tg_id, payload.events)
+    # 2. Обновляем веса по тегам
+    _update_user_topic_weights(supabase, payload.tg_id, payload.events)
 
 
 def _event_delta(ev: EventPayload) -> float:
@@ -85,7 +89,11 @@ def _event_delta(ev: EventPayload) -> float:
     return base * dwell_factor
 
 
-def _update_user_topic_weights(tg_id: int, events: Iterable[EventPayload]) -> None:
+def _update_user_topic_weights(
+    supabase: Client,
+    tg_id: int,
+    events: Iterable[EventPayload],
+) -> None:
     """Инкрементально обновляем веса user_topic_weights по тегам карточек."""
 
     meaningful_events = [

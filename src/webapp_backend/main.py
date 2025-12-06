@@ -204,8 +204,14 @@ async def api_events(payload: EventsRequest) -> Dict[str, Any]:
   - пишем в user_events
   - обновляем user_topic_weights
   """
+  if supabase is None:
+    raise HTTPException(
+      status_code=500,
+      detail="Supabase is not configured",
+    )
+
   try:
-    log_events(payload)
+    log_events(supabase, payload)
   except Exception:
     logger.exception("Failed to log events for tg_id=%s", payload.tg_id)
     raise HTTPException(status_code=500, detail="failed to log events")
