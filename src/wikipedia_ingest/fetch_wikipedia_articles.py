@@ -8,6 +8,7 @@ from urllib.parse import quote
 
 import requests
 from supabase import create_client, Client
+from dotenv import load_dotenv  # 👈 ДОБАВИЛИ ЭТО
 
 # ==========
 # Логирование
@@ -16,17 +17,8 @@ from supabase import create_client, Client
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ==========
-# Пути к общему коду (как в telegram_ingest)
-# ==========
-
-CURRENT_DIR = Path(__file__).resolve()
-SRC_DIR = CURRENT_DIR.parents[1]  # .../src
-if str(SRC_DIR) not in sys.path:
-    sys.path.append(str(SRC_DIR))
-
-from webapp_backend.openai_client import normalize_telegram_post
-from webapp_backend.cards_service import _insert_cards_into_db
+# Подтягиваем .env (локально и на сервере, как в telegram_ingest)
+load_dotenv()
 
 # ==========
 # Supabase
