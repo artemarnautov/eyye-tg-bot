@@ -318,9 +318,12 @@ def _load_user_topic_weights(
 ) -> Tuple[Dict[str, float], List[Dict[str, Any]]]:
     """
     Загружаем веса интересов по тегам из user_topic_weights.
+    tg_id в таблице = user_id (Telegram ID).
+
     Возвращаем:
-    - weights: {tag: weight}
-    - rows:   список dict-ов {"tag": ..., "weight": ...} для debug и сборки base_tags.
+      - weights: {tag -> weight}
+      - rows: сырые строки [{"tag": ..., "weight": ...}, ...] — их будем
+        передавать в build_base_tags_from_weights.
     """
     weights: Dict[str, float] = {}
     rows: List[Dict[str, Any]] = []
@@ -343,7 +346,9 @@ def _load_user_topic_weights(
     if data is None:
         data = getattr(resp, "model", None)
 
-    for row in data or []:
+    rows = list(data or [])
+
+    for row in rows:
         tag = str(row.get("tag") or "").strip()
         if not tag:
             continue
@@ -351,16 +356,10 @@ def _load_user_topic_weights(
             w = float(row.get("weight") or 0.0)
         except (TypeError, ValueError):
             w = 0.0
-
         weights[tag] = w
-        rows.append(
-            {
-                "tag": tag,
-                "weight": w,
-            }
-        )
 
     return weights, rows
+
 
 
 
@@ -773,32 +772,43 @@ def build_feed_for_user(
 
     debug["limit"] = limit
 
-       # 1. Загружаем веса интересов пользователя по тегам (user_topic_weights)
+           # 1. Загружаем веса интересов пользователя по тегам (user_topic_weights)
     user_topic_weights, user_topic_rows = _load_user_topic_weights(supabase, user_id)
 
-    # 1.1. Собираем базовые теги для фида
     base_tags: List[str] = []
     used_default_tags = False
 
     if user_topic_rows:
-        # Есть реальные веса из таблицы user_topic_weights → строим base_tags из них
-        base_tags, used_default_tags, user_topics_debug = build_base_tags_from_weights(
-            user_topic_rows
+        # Есть реальные веса по тегам — строим base_tags из них
+        base_tags, used_default_tags_from_builder, user_topics_debug = (
+            build_base_tags_from_weights(user_topic_rows)
         )
+        used_default_tags = used_default_tags_from_builder
     else:
-        # Фоллбек: онбординг → дефолтные теги фида
+        # Нет весов (новый пользователь) — используем онбординг или дефолт
         base_tags = get_interest_tags_for_user(supabase, user_id)
         if not base_tags:
             base_tags = DEFAULT_FEED_TAGS
             used_default_tags = True
-        user_topics_debug = {
-            "count": 0,
-            "top": [],
-        }
+
+        if user_topic_weights:
+            sorted_items = sorted(
+                user_topic_weights.items(), key=lambda kv: kv[1], reverse=True
+            )
+            user_topics_debug = {
+                "count": len(user_topic_weights),
+                "top": sorted_items[:20],
+            }
+        else:
+            user_topics_debug = {
+                "count": 0,
+                "top": [],
+            }
 
     debug["base_tags"] = base_tags
     debug["used_default_tags"] = used_default_tags
     debug["user_topic_weights"] = user_topics_debug
+
 
     # 1.2. Загружаем просмотренные карточки
     seen_info = _load_seen_cards_for_user(supabase, user_id)
