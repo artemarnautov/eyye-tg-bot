@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import requests
 from supabase import Client, create_client
+from dotenv import load_dotenv  # 🔹 добавили
 
 from webapp_backend.openai_client import normalize_telegram_post
 
@@ -16,8 +17,15 @@ logging.basicConfig(level=logging.INFO)
 # Supabase
 # ==========
 
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
+# 🔹 грузим .env (как в telegram_ingest)
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError("SUPABASE_URL or SUPABASE_KEY is not set. Check your .env")
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ==========
