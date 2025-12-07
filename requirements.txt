@@ -10,3 +10,4 @@ telethon
 requests>=2.31.0
 requests
 beautifulsoup4
+openai>=1.2.0
