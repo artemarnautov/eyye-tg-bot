@@ -8,3 +8,5 @@ fastapi
 uvicorn[standard]
 telethon
 requests>=2.31.0
+requests
+beautifulsoup4
