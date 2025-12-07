@@ -5,7 +5,7 @@ import json
 import requests
 from openai import OpenAI
 
-DATASET_URL = "https://raw.githubusercontent.com/aeros/telegram-channels/master/channels.json"
+DATASET_URL = "https://raw.githubusercontent.com/aeros/telegram-channels/master/data/channels.json"
 OUTPUT_PATH = "data/tg_channels_seed.json"
 
 AVAILABLE_TOPICS = [
