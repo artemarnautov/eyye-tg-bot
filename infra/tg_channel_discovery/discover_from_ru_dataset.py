@@ -5,7 +5,7 @@ import json
 import requests
 from openai import OpenAI
 
-DATASET_URL = "https://raw.githubusercontent.com/alexbers/mtprotoproxy/master/telegram_channels_ru.json"
+DATASET_URL = "https://raw.githubusercontent.com/Alb-310/telegram_channels_dataset/main/channels_ru.json"
 OUTPUT_PATH = "data/tg_channels_seed.json"
 
 AVAILABLE_TOPICS = [
@@ -36,7 +36,18 @@ def download_dataset():
     print(f"[INFO] Downloading dataset from GitHub…")
     response = requests.get(DATASET_URL, timeout=30)
     response.raise_for_status()
-    return response.json()
+    data = response.json()
+
+    # dataset structure:
+    # { "channels": [ {...}, {...} ] }
+    if isinstance(data, dict) and "channels" in data:
+        return data["channels"]
+    elif isinstance(data, list):
+        return data
+    else:
+        print("[ERROR] Unexpected dataset format")
+        return []
+
 
 
 def clean_and_filter(channels):
