@@ -8,6 +8,12 @@ from datetime import timezone
 from typing import Dict, Any, List
 
 from telethon import TelegramClient
+from telethon.errors import (
+    UsernameInvalidError,
+    UsernameNotOccupiedError,
+    ChannelPrivateError,
+    ChannelInvalidError,
+)
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -15,6 +21,7 @@ from supabase import create_client, Client
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 # ==========
 # Пути / импорты внутреннего кода
@@ -76,12 +83,44 @@ async def fetch_for_channel(
 
     title = channel_row.get("title") or str(username) or str(tg_chat_id)
 
-    # entity: по username (если есть) или по tg_chat_id
-    entity = await client.get_entity(username or tg_chat_id)
+    # --- безопасно резолвим entity ---
+    try:
+        entity_key = username or tg_chat_id
+        logger.info("Fetching for channel %s (@%s, tg_chat_id=%s)", title, username, tg_chat_id)
+        entity = await client.get_entity(entity_key)
+    except (UsernameInvalidError, UsernameNotOccupiedError) as e:
+        logger.warning(
+            "Channel %s (@%s) has invalid or unused username. Disabling channel. Error: %s",
+            title,
+            username,
+            e,
+        )
+        supabase.table("telegram_channels").update(
+            {"is_active": False}
+        ).eq("id", channel_id).execute()
+        return
+    except (ChannelPrivateError, ChannelInvalidError) as e:
+        logger.warning(
+            "Channel %s (@%s) is private or invalid. Disabling channel. Error: %s",
+            title,
+            username,
+            e,
+        )
+        supabase.table("telegram_channels").update(
+            {"is_active": False}
+        ).eq("id", channel_id).execute()
+        return
+    except Exception as e:
+        logger.exception(
+            "Unexpected error while resolving channel %s (@%s). Skipping this channel. Error: %s",
+            title,
+            username,
+            e,
+        )
+        return
 
     kwargs: Dict[str, Any] = {"limit": limit}
     if last_fetched_message_id:
-        # берём только новые сообщения
         kwargs["min_id"] = last_fetched_message_id
 
     messages = await client.get_messages(entity, **kwargs)
@@ -104,7 +143,6 @@ async def fetch_for_channel(
 
         max_message_id = max(max_message_id, tg_message_id)
 
-        # t.me/<username>/<message_id>, если username есть
         if username:
             message_url = f"https://t.me/{username}/{tg_message_id}"
         else:
@@ -116,7 +154,6 @@ async def fetch_for_channel(
 
         raw_text = msg.message or ""
 
-        # Сырой пост — в telegram_posts
         rows.append(
             {
                 "channel_id": channel_id,
@@ -128,7 +165,6 @@ async def fetch_for_channel(
             }
         )
 
-        # Пытаемся сразу же сделать EYYE-карточку через OpenAI
         if (
             openai_is_configured()
             and raw_text
@@ -145,11 +181,8 @@ async def fetch_for_channel(
                     "body": norm.get("body"),
                     "tags": norm.get("tags") or [],
                     "importance_score": norm.get("importance_score", 0.5),
-                    # язык карточки — берём из ответа модели, либо дефолт
                     "language": norm.get("language") or TELEGRAM_DEFAULT_LANGUAGE,
-                    # отдаём source_name, чтобы в cards.meta.source_name был корректный бренд
                     "source_name": norm.get("source_name") or title,
-                    # чтобы можно было отследить конкретный источник
                     "source_ref": message_url or f"{tg_chat_id}:{tg_message_id}",
                 }
                 cards.append(card)
@@ -160,32 +193,26 @@ async def fetch_for_channel(
                     title,
                 )
 
-    # Вставляем сырые посты
     if rows:
         print(f"[{title}] вставляем {len(rows)} сообщений в telegram_posts")
         supabase.table("telegram_posts").insert(rows).execute()
 
-        # фиксируем до какого message_id дошли
         supabase.table("telegram_channels").update(
             {"last_fetched_message_id": max_message_id}
         ).eq("id", channel_id).execute()
     else:
         print(f"[{title}] сообщений для вставки нет")
 
-    # Вставляем карточки в cards
     if cards:
         inserted = _insert_cards_into_db(
             supabase,
             cards,
-            # language=None -> язык берётся из каждой карточки
             language=None,
             source_type="telegram",
             fallback_source_name=title,
             source_ref=None,
         )
-        print(
-            f"[{title}] создано {len(inserted)} карточек из Telegram-постов"
-        )
+        print(f"[{title}] создано {len(inserted)} карточек из Telegram-постов")
     else:
         print(f"[{title}] нет подходящих постов для карточек")
 
