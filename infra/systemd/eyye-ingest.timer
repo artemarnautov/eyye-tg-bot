@@ -1,0 +1,10 @@
+# file: infra/systemd/eyye-ingest.timer
+[Unit]
+Description=Run EYYE unified ingest (Telegram + Wikipedia) hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

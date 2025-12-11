@@ -1,0 +1,12 @@
+# file: infra/systemd/eyye-ingest.service
+[Unit]
+Description=EYYE unified ingest (Telegram + Wikipedia)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/eyye-tg-bot
+EnvironmentFile=/root/eyye-tg-bot/.env
+ExecStart=/bin/bash -lc 'cd /root/eyye-tg-bot && source venv/bin/activate && PYTHONPATH=src python -m eyye_ingest_runner'
+Restart=on-failure
