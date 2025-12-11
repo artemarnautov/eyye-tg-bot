@@ -519,10 +519,11 @@ def _apply_dedup_and_diversity(
     """
     Постобработка уже отсортированного списка:
     - убираем дубли по заголовкам;
-    - разводим карточки по источникам и основным тегам.
+    - стараемся развести карточки по источникам и основным тегам;
+    - НО больше НЕ выбрасываем карточки навсегда, только откладываем.
 
-    Возвращаем:
-    (список карточек, debug_postprocess)
+    Важно: все недубльные карточки в итоге попадают в итоговый список.
+    Это гарантирует «длинный» фид, а диверсификация влияет только на порядок.
     """
     if not ranked:
         return [], {
@@ -531,6 +532,7 @@ def _apply_dedup_and_diversity(
             "removed_as_duplicates": 0,
             "deferred_count": 0,
             "used_deferred": 0,
+            "tail_added": 0,
             "total_ranked_raw": 0,
         }
 
@@ -559,10 +561,14 @@ def _apply_dedup_and_diversity(
             return True
         return False
 
-    # Первый проход: выбираем всё, что не ломает диверсификацию
+    # Первый проход: отбираем всё, что:
+    # - не дубликат по заголовку;
+    # - не ломает диверсификацию "здесь и сейчас".
     for card in ranked:
         title = (card.get("title") or "").strip()
         norm_title = _normalize_title_for_duplicate(title)
+
+        # Жёсткий дедуп по заголовкам
         if norm_title and norm_title in seen_titles:
             removed_duplicates += 1
             continue
@@ -571,6 +577,7 @@ def _apply_dedup_and_diversity(
         main_tag = _extract_main_tag(card, base_tags)
 
         if violates_diversity(selected, source_key, main_tag):
+            # Откладываем, попробуем вставить позже
             deferred.append(card)
             continue
 
@@ -578,14 +585,17 @@ def _apply_dedup_and_diversity(
         if norm_title:
             seen_titles.add(norm_title)
 
-    deferred_count = len(deferred)
+    # Второй проход: пробуем мягко домешать отложенные карточки
+    still_deferred: List[Dict[str, Any]] = []
     used_deferred = 0
 
-    # Второй проход: пытаемся домешать отложенные карточки
     for card in deferred:
         source_key = _extract_source_key(card)
         main_tag = _extract_main_tag(card, base_tags)
+
         if violates_diversity(selected, source_key, main_tag):
+            # Всё ещё ломает диверсификацию – пока держим отдельно
+            still_deferred.append(card)
             continue
 
         title = (card.get("title") or "").strip()
@@ -599,16 +609,33 @@ def _apply_dedup_and_diversity(
             seen_titles.add(norm_title)
         used_deferred += 1
 
+    # Третий проход: всё, что так и не вписалось по "красоте",
+    # просто докидываем в хвост (кроме дублей по заголовкам).
+    tail_added = 0
+    for card in still_deferred:
+        title = (card.get("title") or "").strip()
+        norm_title = _normalize_title_for_duplicate(title)
+        if norm_title and norm_title in seen_titles:
+            removed_duplicates += 1
+            continue
+
+        selected.append(card)
+        if norm_title:
+            seen_titles.add(norm_title)
+        tail_added += 1
+
     debug_postprocess = {
         "initial": total_ranked_raw,
         "after_dedup_and_diversity": len(selected),
         "removed_as_duplicates": removed_duplicates,
-        "deferred_count": deferred_count,
+        "deferred_count": len(deferred),
         "used_deferred": used_deferred,
+        "tail_added": tail_added,
         "total_ranked_raw": total_ranked_raw,
     }
 
     return selected, debug_postprocess
+
 
 
 # ===================== Вставка LLM-карточек в DB =====================
