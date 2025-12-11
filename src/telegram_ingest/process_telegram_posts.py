@@ -3,12 +3,16 @@ import os
 import logging
 from typing import Any, Dict, List
 
+from dotenv import load_dotenv
 from supabase import create_client, Client
 
 from webapp_backend.openai_client import normalize_telegram_post
 
 log = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+# === Новое: подтягиваем .env, чтобы скрипт работал из systemd/таймера ===
+load_dotenv()
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
@@ -143,7 +147,7 @@ def process_telegram_posts_batch(limit: int = BATCH_SIZE) -> None:
         post_id = post["id"]
         channel = post.get("channel") or {}
         raw_text = (post.get("raw_text") or "").strip()
-        message_url = post.get("message_url") or ""
+        message_url = (post.get("message_url") or "").strip()
         language = (channel.get("language") or "ru").strip() or "ru"
         channel_title = channel.get("title") or ""
 

@@ -80,7 +80,9 @@ def build_base_tags_from_weights(user_rows: List[Dict[str, Any]]) -> Tuple[List[
 # ===================== Базовые настройки фида =====================
 
 FEED_CARDS_LIMIT_DEFAULT = int(os.getenv("FEED_CARDS_LIMIT", "20"))
-FEED_MAX_CARD_AGE_HOURS = int(os.getenv("FEED_MAX_CARD_AGE_HOURS", "48"))
+
+# "Свежее" окно по времени (часов) — по умолчанию 72 часа (3 дня)
+FEED_MAX_CARD_AGE_HOURS = int(os.getenv("FEED_MAX_CARD_AGE_HOURS", "72"))
 
 LLM_CARD_GENERATION_ENABLED = (
     os.getenv("LLM_CARD_GENERATION_ENABLED", "true").lower() in ("1", "true", "yes")
@@ -91,8 +93,12 @@ DEFAULT_FEED_TAGS: List[str] = ["world_news", "business", "tech", "uk_students"]
 # Максимальное количество карточек, которое мы вообще готовы тащить в ранжирование
 FEED_MAX_FETCH_LIMIT = int(os.getenv("FEED_MAX_FETCH_LIMIT", "300"))
 
-# Широкое окно по времени для "добора" карточек, если в пределах 48 часов мало
-FEED_WIDE_AGE_HOURS = int(os.getenv("FEED_WIDE_AGE_HOURS", "240"))  # 10 дней
+# Широкое окно по времени для "добора" карточек, если в пределах FEED_MAX_CARD_AGE_HOURS мало.
+# По умолчанию 30 дней (720 часов).
+FEED_WIDE_AGE_HOURS = int(os.getenv("FEED_WIDE_AGE_HOURS", "720"))
+
+# Глубокое окно по времени для all-time fallback (по умолчанию ~1 год).
+FEED_DEEP_AGE_HOURS = int(os.getenv("FEED_DEEP_AGE_HOURS", "8760"))
 
 # Дефолтный источник только для чисто LLM-карточек,
 # когда у нас нет реального канала/СМИ.
@@ -196,7 +202,7 @@ def _fetch_candidate_cards(
     """
     Берём кандидатов из таблицы cards:
     - только is_active = true
-    - только достаточно свежие (created_at >= now - max_age_hours)
+    - только достаточно свежие (created_at >= now - max_age_hours), если max_age_hours > 0
     - если есть теги, используем overlaps(tags, tags_array).
     """
     if limit <= 0:
@@ -359,8 +365,6 @@ def _load_user_topic_weights(
         weights[tag] = w
 
     return weights, rows
-
-
 
 
 def _mark_cards_as_seen(
@@ -759,20 +763,28 @@ def build_feed_for_user(
             "recent_ids": 0,
             "window_days": FEED_SEEN_EXCLUDE_DAYS,
             "grace_minutes": FEED_SEEN_SESSION_GRACE_MINUTES,
+            "error": "no_supabase",
+            "relaxed": False,
+            "marked": 0,
         }
         return [], debug
 
+    # --- нормализуем offset/limit ---
+    try:
+        offset = int(offset)
+    except (TypeError, ValueError):
+        offset = 0
     if offset < 0:
         offset = 0
 
     if limit is None or limit <= 0:
         limit = FEED_CARDS_LIMIT_DEFAULT
-    # Ограничиваем размер страницы, но не количество кандидатов
-    limit = min(max(limit, 1), 50)
-
+    limit = min(max(int(limit), 1), 50)
     debug["limit"] = limit
+    page_index = offset // limit
+    debug["page_index"] = page_index
 
-           # 1. Загружаем веса интересов пользователя по тегам (user_topic_weights)
+    # 1. Загружаем веса интересов пользователя по тегам (user_topic_weights) + base_tags
     user_topic_weights, user_topic_rows = _load_user_topic_weights(supabase, user_id)
 
     base_tags: List[str] = []
@@ -809,8 +821,7 @@ def build_feed_for_user(
     debug["used_default_tags"] = used_default_tags
     debug["user_topic_weights"] = user_topics_debug
 
-
-    # 1.2. Загружаем просмотренные карточки
+    # 2. Загружаем просмотренные карточки
     seen_info = _load_seen_cards_for_user(supabase, user_id)
     exclude_ids: Set[int] = seen_info.get("exclude_ids") or set()
     recent_ids: Set[int] = seen_info.get("recent_ids") or set()
@@ -822,11 +833,11 @@ def build_feed_for_user(
         "window_days": FEED_SEEN_EXCLUDE_DAYS,
         "grace_minutes": FEED_SEEN_SESSION_GRACE_MINUTES,
         "error": seen_info.get("error"),
+        "relaxed": False,
+        "marked": 0,
     }
 
-    # 2. Собираем кандидатов несколькими "слоями":
-    #    сначала строго по тегам пользователя и свежести,
-    #    потом при необходимости расширяем выборку за счёт дефолтных тегов и более широкого окна по времени.
+    # 3. Собираем кандидатов несколькими "слоями" (tiered fallback)
     # Берём с запасом: (limit + offset) * 3, чтобы хватило на пропуск offset.
     fetch_limit = (limit + offset) * 3
     fetch_limit = max(fetch_limit, limit)  # на всякий случай
@@ -834,114 +845,150 @@ def build_feed_for_user(
 
     mixed_tags = sorted({*base_tags, *DEFAULT_FEED_TAGS})
 
-    phases_config = [
+    phases_config: List[Dict[str, Any]] = []
+
+    # Персональные теги, свежее окно
+    phases_config.append(
         {
-            "stage": "base_tags_recent",
+            "stage": "personal_recent",
             "tags": base_tags,
             "age_hours": FEED_MAX_CARD_AGE_HOURS,
-        },
-    ]
+        }
+    )
 
-    # Если пользовательские теги отличаются от "дефолтных" — пробуем домешать дефолтные
-    if mixed_tags != base_tags:
+    # Персональные теги, широкое окно по времени
+    if FEED_WIDE_AGE_HOURS > FEED_MAX_CARD_AGE_HOURS:
         phases_config.append(
             {
-                "stage": "mixed_with_default_recent",
+                "stage": "personal_wide",
+                "tags": base_tags,
+                "age_hours": FEED_WIDE_AGE_HOURS,
+            }
+        )
+
+    # Персональные + дефолтные теги
+    if mixed_tags and mixed_tags != base_tags:
+        phases_config.append(
+            {
+                "stage": "mixed_recent",
                 "tags": mixed_tags,
                 "age_hours": FEED_MAX_CARD_AGE_HOURS,
             }
         )
-
-    # Широкое окно по времени с пользовательскими + дефолтными тегами
-    phases_config.append(
-        {
-            "stage": "mixed_with_default_wide",
-            "tags": mixed_tags,
-            "age_hours": FEED_WIDE_AGE_HOURS,
-        }
-    )
+        phases_config.append(
+            {
+                "stage": "mixed_wide",
+                "tags": mixed_tags,
+                "age_hours": FEED_WIDE_AGE_HOURS,
+            }
+        )
 
     candidates_by_id: Dict[str, Dict[str, Any]] = {}
     phases_debug: List[Dict[str, Any]] = []
 
-    for phase in phases_config:
-        # Если мы уже собрали достаточно кандидатов, нет смысла продолжать
-        if len(candidates_by_id) >= fetch_limit:
-            break
+    def _run_phases(phases: List[Dict[str, Any]], label: str) -> None:
+        nonlocal candidates_by_id, phases_debug
+        for phase in phases:
+            if len(candidates_by_id) >= fetch_limit:
+                break
 
-        tags = phase["tags"] or []
-        age_hours = int(phase["age_hours"])
-        stage_name = phase["stage"]
+            tags = phase.get("tags") or []
+            age_hours = int(phase.get("age_hours") or 0)
+            stage_name = phase.get("stage") or "unknown"
 
-        # Сколько ещё карточек нужно добрать в этом "слое"
-        remaining = fetch_limit - len(candidates_by_id)
-        if remaining <= 0:
-            break
+            remaining = fetch_limit - len(candidates_by_id)
+            if remaining <= 0:
+                break
 
-        if not tags:
+            # Фазы без тегов считаем явным fallback (label="fallback"),
+            # поэтому в initial-раунде мы их не задаём.
+            if label == "initial" and not tags:
+                phases_debug.append(
+                    {
+                        "stage": stage_name,
+                        "label": label,
+                        "tags_count": 0,
+                        "age_hours": age_hours,
+                        "fetched": 0,
+                        "skipped": True,
+                    }
+                )
+                continue
+
+            fetched = _fetch_candidate_cards(
+                supabase=supabase,
+                tags=tags,
+                limit=remaining,
+                max_age_hours=age_hours,
+            )
+
+            for card in fetched:
+                cid = card.get("id")
+                if cid is None:
+                    continue
+                key = str(cid)
+                if key not in candidates_by_id:
+                    candidates_by_id[key] = card
+
             phases_debug.append(
                 {
                     "stage": stage_name,
-                    "tags_count": 0,
+                    "label": label,
+                    "tags_count": len(tags),
                     "age_hours": age_hours,
-                    "fetched": 0,
-                    "skipped": True,
+                    "fetched": len(fetched),
+                    "unique_after_phase": len(candidates_by_id),
                 }
             )
-            continue
 
-        fetched = _fetch_candidate_cards(
-            supabase=supabase,
-            tags=tags,
-            limit=remaining,
-            max_age_hours=age_hours,
-        )
+    # Основные фазы (персональные и дефолтные теги)
+    _run_phases(phases_config, label="initial")
 
-        for card in fetched:
-            cid = card.get("id")
-            if cid is None:
-                continue
-            key = str(cid)
-            if key not in candidates_by_id:
-                candidates_by_id[key] = card
+    candidates_all: List[Dict[str, Any]] = list(candidates_by_id.values())
+    total_candidates_raw = len(candidates_all)
+    debug["phases"] = phases_debug
+    debug["total_candidates_raw_initial"] = total_candidates_raw
 
-        phases_debug.append(
+    required_for_page = offset + limit
+
+    # 3.1. Если даже в широком окне по тегам не хватает кандидатов для этой страницы —
+    # добавляем fallback-фазы "любой тег".
+    if total_candidates_raw < required_for_page and total_candidates_raw < fetch_limit:
+        fallback_phases: List[Dict[str, Any]] = []
+
+        # Любые теги, широкое окно (например, 30 дней)
+        fallback_phases.append(
             {
-                "stage": stage_name,
-                "tags_count": len(tags),
-                "age_hours": age_hours,
-                "fetched": len(fetched),
-                "unique_after_phase": len(candidates_by_id),
+                "stage": "any_recent_wide",
+                "tags": [],
+                "age_hours": FEED_WIDE_AGE_HOURS,
             }
         )
 
-    candidates: List[Dict[str, Any]] = list(candidates_by_id.values())
-    total_candidates_raw = len(candidates)
-    debug["phases"] = phases_debug
+        # Любые теги, вообще без ограничения по времени
+        deep_hours = FEED_DEEP_AGE_HOURS if FEED_DEEP_AGE_HOURS > 0 else 0
+        fallback_phases.append(
+            {
+                "stage": "any_all_time",
+                "tags": [],
+                "age_hours": deep_hours,
+            }
+        )
+
+        _run_phases(fallback_phases, label="fallback")
+
+        candidates_all = list(candidates_by_id.values())
+        total_candidates_raw = len(candidates_all)
+        debug["total_candidates_raw_after_fallback"] = total_candidates_raw
+    else:
+        debug["total_candidates_raw_after_fallback"] = total_candidates_raw
+
     debug["total_candidates_raw"] = total_candidates_raw
 
-    # 2.1. Фильтруем уже просмотренные карточки (по user_seen_cards)
-    if exclude_ids:
-        before_seen = len(candidates)
-        filtered: List[Dict[str, Any]] = []
-        for c in candidates:
-            cid = _safe_int_id(c.get("id"))
-            if cid is None:
-                filtered.append(c)
-                continue
-            if cid in exclude_ids:
-                continue
-            filtered.append(c)
-        candidates = filtered
-        debug["removed_seen"] = before_seen - len(candidates)
-
-    total_candidates = len(candidates)
-    debug["total_candidates"] = total_candidates
-
-    # 3. Если в БД ничего не нашли — пробуем сгенерировать карточки через OpenAI.
-    if total_candidates == 0:
+    # 4. Если в БД вообще ничего не нашли — пробуем сгенерировать карточки через OpenAI.
+    if total_candidates_raw == 0:
         if LLM_CARD_GENERATION_ENABLED and openai_is_configured():
-            need_count = max((limit + offset) * 2, 20)
+            need_count = max(required_for_page * 2, 20)
             logger.info(
                 "No cards in DB for user_id=%s. Generating ~%d cards via OpenAI.",
                 user_id,
@@ -959,10 +1006,10 @@ def build_feed_for_user(
                     language="ru",
                     source_type="llm",
                 )
-                candidates = inserted or []
-                total_candidates = len(candidates)
+                candidates_all = inserted or []
+                total_candidates_raw = len(candidates_all)
                 debug["reason"] = "generated_via_openai"
-                debug["generated"] = total_candidates
+                debug["generated"] = total_candidates_raw
             else:
                 debug["reason"] = "no_cards"
                 debug["returned"] = 0
@@ -978,7 +1025,35 @@ def build_feed_for_user(
     else:
         debug["reason"] = "cards_from_db"
 
-    # 4. Ранжируем (TikTok-lite) и применяем дедуп/диверсификацию
+    # 5. Фильтрация просмотренных карточек.
+    # Сначала пробуем отдать только "unseen", но если их не хватает даже для текущей страницы —
+    # возвращаем весь пул (включая seen), чтобы лента не обрывалась.
+    if exclude_ids:
+        unseen: List[Dict[str, Any]] = []
+        for c in candidates_all:
+            cid = _safe_int_id(c.get("id"))
+            if cid is None or cid not in exclude_ids:
+                unseen.append(c)
+        unseen_count = len(unseen)
+    else:
+        unseen = list(candidates_all)
+        unseen_count = len(unseen)
+
+    debug["removed_seen"] = total_candidates_raw - unseen_count
+
+    if unseen_count >= required_for_page:
+        # unseen-кандидатов достаточно для этой страницы – используем их.
+        candidates = unseen
+        debug["seen"]["relaxed"] = False
+    else:
+        # unseen недостаточно – используем весь пул кандидатов (seen + unseen).
+        candidates = candidates_all
+        debug["seen"]["relaxed"] = True
+
+    total_candidates = len(candidates)
+    debug["total_candidates"] = total_candidates
+
+    # 6. Ранжируем (TikTok-lite) и применяем дедуп/диверсификацию
     ranked_raw = _score_cards_for_user(
         candidates,
         base_tags,
@@ -989,21 +1064,43 @@ def build_feed_for_user(
     debug["postprocess"] = postprocess_debug
 
     total_ranked = len(ranked)
+    debug["total_ranked"] = total_ranked
 
-    # 5. Пагинация по offset/limit
-    start = min(offset, total_ranked)
-    end = min(start + limit, total_ranked)
-    page = ranked[start:end]
+    if total_ranked == 0:
+        debug["reason"] = "no_ranked_cards"
+        debug["returned"] = 0
+        debug["has_more"] = False
+        debug["next_offset"] = None
+        return [], debug
 
-    has_more = total_ranked > end
-    next_offset = end if has_more else None
+    # 7. Пагинация по offset/limit + wrap-around fallback для маленьких корпусов.
+    if offset < total_ranked:
+        start = offset
+        end = min(start + limit, total_ranked)
+        page = ranked[start:end]
+        has_more = total_ranked > end
+        next_offset = end if has_more else None
+        debug["pagination_mode"] = "linear"
+    else:
+        # offset вышел за пределы доступных карточек – включаем "круговую" пагинацию,
+        # чтобы лента не обрывалась даже при маленьком количестве контента.
+        wrapped_offset = offset % total_ranked
+        page: List[Dict[str, Any]] = []
+        idx = wrapped_offset
+        while len(page) < limit and len(page) < total_ranked:
+            page.append(ranked[idx])
+            idx = (idx + 1) % total_ranked
 
-    debug["total_candidates"] = total_ranked
+        has_more = True  # круговая лента по сути бесконечна
+        next_offset = offset + limit
+        debug["pagination_mode"] = "wrapped"
+        debug["wrapped_offset"] = wrapped_offset
+
     debug["returned"] = len(page)
     debug["has_more"] = has_more
     debug["next_offset"] = next_offset
 
-    # 6. Отмечаем карточки как просмотренные
+    # 8. Отмечаем карточки как просмотренные
     seen_marked = _mark_cards_as_seen(supabase, user_id, page)
     debug["seen"]["marked"] = int(seen_marked)
 

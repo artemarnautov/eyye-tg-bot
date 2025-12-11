@@ -1,172 +1,420 @@
 # file: src/webapp_backend/telemetry_service.py
+import logging
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Literal
 
-from datetime import datetime
-from typing import Any, Iterable, Literal, List
-
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from supabase import Client
 
+logger = logging.getLogger(__name__)
 
-class EventPayload(BaseModel):
+# ==============================
+# Pydantic-модели запросов
+# ==============================
+
+# Типы событий, которые понимает backend.
+EventType = Literal["view", "like", "dislike", "open_source"]
+
+
+class Event(BaseModel):
+    """
+    Одно событие от фронта.
+
+    type:
+      - "view"        — просмотр карточки (важен dwell_ms)
+      - "like"        — юзер явно лайкнул карточку
+      - "dislike"     — юзер явно скрыл/дизлайкнул карточку
+      - "open_source" — юзер ткнул на источник (читать подробнее)
+
+    card_id: ID карточки из таблицы cards.
+    ts: когда событие произошло (если нет — подставим server now()).
+    dwell_ms: длительность просмотра карточки в миллисекундах
+              (нужна только для type="view").
+    """
+
+    type: EventType
     card_id: int
-    event_type: Literal[
-        "impression",
-        "view",
-        "swipe_next",
-        "click_more",
-        "click_source",
-        "like",
-        "dislike",
-        "share",
-    ]
-    dwell_ms: int | None = None
-    position: int | None = None
-    source: str | None = None
-    extra: dict[str, Any] | None = None
+    ts: Optional[datetime] = Field(
+        default=None,
+        description="Время события, если не передано — подставим текущее (UTC).",
+    )
+    dwell_ms: Optional[int] = Field(
+        default=None,
+        ge=0,
+        description="Длительность просмотра карточки в миллисекундах.",
+    )
 
 
 class EventsRequest(BaseModel):
+    """
+    Тело POST /api/events.
+
+    tg_id: Telegram ID пользователя.
+    events: список событий.
+    """
+
     tg_id: int
-    events: List[EventPayload]
+    events: List[Event]
 
 
-POSITIVE_EVENTS = {"view", "click_more", "click_source", "like", "share"}
-NEGATIVE_EVENTS = {"swipe_next", "dislike"}
+# ==============================
+# Вспомогалки для работы с БД
+# ==============================
 
 
-def log_events(supabase: Client | None, payload: EventsRequest) -> None:
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _fetch_tags_for_cards(
+    supabase: Client,
+    card_ids: List[int],
+) -> Dict[int, List[str]]:
     """
-    1) Пишем события в user_events.
-    2) Обновляем веса интересов пользователя в user_topic_weights.
+    Забираем теги для пачки карточек из таблицы cards.
+
+    Возвращаем словарь: {card_id: [tag1, tag2, ...]}.
     """
-    if supabase is None:
-        # На уровне /api/events мы и так кидаем 500, но тут на всякий случай
-        return
+    if not card_ids:
+        return {}
 
-    if not payload.events:
-        return
+    # Убираем дубликаты, чтобы не долбить БД лишний раз
+    unique_ids = sorted(set(card_ids))
 
-    rows = [
-        {
-            "tg_id": payload.tg_id,
-            "card_id": ev.card_id,
-            "event_type": ev.event_type,
-            "dwell_ms": ev.dwell_ms,
-            "position": ev.position,
-            "source": ev.source,
-            "extra": ev.extra,
-        }
-        for ev in payload.events
-    ]
+    try:
+        resp = (
+            supabase.table("cards")
+            .select("id,tags")
+            .in_("id", unique_ids)
+            .execute()
+        )
+    except Exception:
+        logger.exception("Failed to fetch card tags for ids=%s", unique_ids)
+        return {}
 
-    # 1. Логируем события
-    supabase.table("user_events").insert(rows).execute()
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+    rows = data or []
 
-    # 2. Обновляем веса по тегам
-    _update_user_topic_weights(supabase, payload.tg_id, payload.events)
+    by_id: Dict[int, List[str]] = {}
+    for row in rows:
+        cid = row.get("id")
+        if cid is None:
+            continue
+        tags_raw = row.get("tags") or []
+        if not isinstance(tags_raw, list):
+            tags_raw = [tags_raw]
+
+        tags_clean: List[str] = []
+        for t in tags_raw:
+            s = str(t).strip().lower()
+            if s:
+                tags_clean.append(s)
+
+        by_id[int(cid)] = tags_clean
+
+    return by_id
 
 
-def _event_delta(ev: EventPayload) -> float:
-    """Переводим тип события + длительность просмотра в числовой сигнал."""
-    base = {
-        "impression": 0.1,
-        "view": 1.0,
-        "swipe_next": -0.7,
-        "click_more": 1.5,
-        "click_source": 1.5,
-        "like": 3.0,
-        "dislike": -4.0,
-        "share": 3.5,
-    }.get(ev.event_type, 0.0)
+def _delta_for_view(dwell_ms: Optional[int]) -> float:
+    """
+    Конвертируем просмотр с определённым dwell_ms в изменение веса интереса.
 
-    dwell_ms = ev.dwell_ms or 0
-    # до ~4 секунд → множитель ~1, до 8+ сек → максимум ~2
-    if dwell_ms > 0:
-        dwell_factor = max(0.5, min(2.0, dwell_ms / 4000.0))
-    else:
-        dwell_factor = 1.0
+    Новая логика:
 
-    return base * dwell_factor
+    - < 2 секунд  : лёгкий минус (юзер почти сразу пролистнул)
+    - 2–4 секунды : нейтрально (увидел карточку, но не зацепило и не раздражает)
+    - 4–10 секунд : нормальное чтение карточки → уверенный плюс
+    - > 10 секунд : очень сильный интерес → сильный плюс
+
+    Коэффициенты подобраны так, чтобы:
+    - явные действия (like/dislike) оставались сильнее одного просмотра;
+    - длительные просмотры всё равно заметно двигали веса по тегам.
+    """
+    if dwell_ms is None:
+        return 0.0
+
+    # < 2 секунд — лёгкий негативный сигнал
+    if dwell_ms < 2000:
+        return -0.2
+
+    # 2–4 секунды — нейтрально
+    if dwell_ms < 4000:
+        return 0.0
+
+    # 4–10 секунд — нормальный плюс (прочитал карточку)
+    if dwell_ms < 10000:
+        return 0.6
+
+    # > 10 секунд — сильный интерес
+    return 1.2
+
+
+
+def _delta_for_event(ev: Event) -> float:
+    """
+    Переводим событие в dW по тегам карточки.
+
+    Все "магические коэффициенты" собраны здесь, чтобы потом было удобно
+    тюнить поведение фида без переписывания логики.
+    """
+    if ev.type == "view":
+        return _delta_for_view(ev.dwell_ms or 0)
+
+    if ev.type == "like":
+        # Явный лайк — сильный плюс.
+        return 2.0
+
+    if ev.type == "dislike":
+        # Явный дизлайк/скрытие — сильный минус.
+        return -2.0
+
+    if ev.type == "open_source":
+        # Клик по источнику — сильный интерес к теме.
+        return 1.5
+
+    # На всякий случай: неизвестный тип события не влияет на веса.
+    return 0.0
 
 
 def _update_user_topic_weights(
     supabase: Client,
     tg_id: int,
-    events: Iterable[EventPayload],
+    tag_deltas: Dict[str, float],
 ) -> None:
-    """Инкрементально обновляем веса user_topic_weights по тегам карточек."""
+    """
+    Применяем накопленные dW по тегам к user_topic_weights.
 
-    meaningful_events = [
-        ev for ev in events if ev.event_type in (POSITIVE_EVENTS | NEGATIVE_EVENTS)
-    ]
-    if not meaningful_events:
+    Схема user_topic_weights предполагается такой:
+    - tg_id (int/bigint)
+    - tag (text)
+    - weight (float8)
+    """
+    if not tag_deltas:
         return
 
-    # 1. Собираем ID карточек, по которым были сигналы
-    card_ids = list({ev.card_id for ev in meaningful_events})
-    if not card_ids:
+    # 1. Читаем текущие веса по пользователю
+    try:
+        resp = (
+            supabase.table("user_topic_weights")
+            .select("tag,weight")
+            .eq("tg_id", tg_id)
+            .execute()
+        )
+    except Exception:
+        logger.exception("Failed to load user_topic_weights for tg_id=%s", tg_id)
         return
 
-    cards_resp = (
-        supabase.table("cards")
-        .select("id,tags")
-        .in_("id", card_ids)
-        .execute()
-    )
-    cards_by_id = {row["id"]: row for row in (cards_resp.data or [])}
+    data = getattr(resp, "data", None)
+    if data is None:
+        data = getattr(resp, "model", None)
+    rows = data or []
 
-    # 2. Накапливаем дельты по тегам
-    deltas: dict[str, float] = {}
+    current: Dict[str, float] = {}
+    for row in rows:
+        tag = str(row.get("tag") or "").strip().lower()
+        if not tag:
+            continue
+        try:
+            w = float(row.get("weight") or 0.0)
+        except (TypeError, ValueError):
+            w = 0.0
+        current[tag] = w
 
-    for ev in meaningful_events:
-        card = cards_by_id.get(ev.card_id)
-        if not card:
+    # 2. Применяем дельты и пишем обратно
+    for tag, delta in tag_deltas.items():
+        tag_norm = tag.strip().lower()
+        if not tag_norm:
             continue
 
-        tags = card.get("tags") or []
+        old = current.get(tag_norm, 0.0)
+        new = old + delta
+
+        # Лёгкий кламп, чтобы веса не улетели в космос
+        if new > 10.0:
+            new = 10.0
+        elif new < -10.0:
+            new = -10.0
+
+        try:
+            if tag_norm in current:
+                # Уже есть строка — обновляем
+                supabase.table("user_topic_weights").update(
+                    {"weight": new}
+                ).eq("tg_id", tg_id).eq("tag", tag_norm).execute()
+            else:
+                # Нет строки — создаём
+                supabase.table("user_topic_weights").insert(
+                    {"tg_id": tg_id, "tag": tag_norm, "weight": new}
+                ).execute()
+        except Exception:
+            logger.exception(
+                "Failed to upsert user_topic_weights for tg_id=%s, tag=%r",
+                tg_id,
+                tag_norm,
+            )
+
+    logger.info(
+        "Updated user_topic_weights for tg_id=%s, tags=%d",
+        tg_id,
+        len(tag_deltas),
+    )
+
+
+def _insert_user_events(
+    supabase: Client,
+    tg_id: int,
+    events: List[Event],
+) -> None:
+    """
+    Пишем сырые события в таблицу user_events.
+
+    Рекомендуемая схема user_events (для справки):
+    - id (uuid / serial, PK)
+    - tg_id (bigint)
+    - card_id (int)
+    - event_type (text)
+    - event_ts (timestamptz)
+    - dwell_ms (int, nullable)
+    """
+    if not events:
+        return
+
+    now = _now_utc()
+    payload: List[Dict[str, Any]] = []
+
+    for ev in events:
+        ts = ev.ts or now
+        payload.append(
+            {
+                "tg_id": tg_id,
+                "card_id": ev.card_id,
+                "event_type": ev.type,
+                "event_ts": ts.isoformat(),
+                "dwell_ms": ev.dwell_ms,
+            }
+        )
+
+    try:
+        supabase.table("user_events").insert(payload).execute()
+    except Exception:
+        logger.exception("Failed to insert user_events for tg_id=%s", tg_id)
+
+
+def _insert_seen_cards_from_events(
+    supabase: Client,
+    tg_id: int,
+    events: List[Event],
+) -> None:
+    """
+    Помечаем карточки как увиденные в user_seen_cards,
+    если есть событие view с dwell >= 1 секунды.
+
+    Схема user_seen_cards ожидается такой же, как уже используется в cards_service:
+    - user_id (bigint) — Telegram ID
+    - card_id (int)
+    - seen_at (timestamptz)
+    """
+    if not events:
+        return
+
+    now = _now_utc()
+    payload: List[Dict[str, Any]] = []
+
+    for ev in events:
+        if ev.type != "view":
+            continue
+        dwell = ev.dwell_ms or 0
+        # Карточка считается увиденной при dwell >= 1 секунды
+        if dwell < 1000:
+            continue
+
+        ts = ev.ts or now
+        payload.append(
+            {
+                "user_id": tg_id,
+                "card_id": ev.card_id,
+                "seen_at": ts.isoformat(),
+            }
+        )
+
+    if not payload:
+        return
+
+    try:
+        supabase.table("user_seen_cards").insert(payload).execute()
+    except Exception:
+        # Дубликаты по (user_id, card_id) нам не страшны: cards_service берёт set(card_id)
+        logger.exception(
+            "Failed to insert into user_seen_cards for tg_id=%s (rows=%d)",
+            tg_id,
+            len(payload),
+        )
+
+
+# ==============================
+# Публичная функция для /api/events
+# ==============================
+
+
+def log_events(supabase: Client, payload: EventsRequest) -> None:
+    """
+    Обрабатываем батч событий от фронта:
+
+    1) Пишем сами события в user_events (сырые логи).
+    2) На их основе считаем dW по тегам и обновляем user_topic_weights.
+    3) Помечаем карточки как увиденные (user_seen_cards) при view + dwell >= 1 сек.
+
+    Важно: функция специально максимально "мягкая":
+    любые ошибки логируются, но не роняют процесс.
+    """
+    if supabase is None:
+        logger.warning("Supabase is None in log_events, skipping")
+        return
+
+    tg_id = int(payload.tg_id)
+    events = payload.events or []
+
+    if not events:
+        logger.info("log_events called with empty events list (tg_id=%s)", tg_id)
+        return
+
+    # 1. Пишем сырые события
+    _insert_user_events(supabase, tg_id, events)
+
+    # 2. Загружаем теги карточек и накапливаем дельты по тегам
+    card_ids = [e.card_id for e in events]
+    tags_by_card = _fetch_tags_for_cards(supabase, card_ids)
+
+    tag_deltas: Dict[str, float] = defaultdict(float)
+
+    for ev in events:
+        tags = tags_by_card.get(ev.card_id) or []
         if not tags:
             continue
 
-        delta = _event_delta(ev)
+        delta = _delta_for_event(ev)
         if delta == 0.0:
             continue
 
         for tag in tags:
-            deltas[tag] = deltas.get(tag, 0.0) + delta
+            tag_norm = str(tag).strip().lower()
+            if not tag_norm:
+                continue
+            tag_deltas[tag_norm] += delta
 
-    if not deltas:
-        return
+    # 3. Применяем изменения к user_topic_weights
+    if tag_deltas:
+        _update_user_topic_weights(supabase, tg_id, dict(tag_deltas))
 
-    # 3. Тянем текущие веса
-    existing_resp = (
-        supabase.table("user_topic_weights")
-        .select("tag,weight")
-        .eq("tg_id", tg_id)
-        .in_("tag", list(deltas.keys()))
-        .execute()
+    # 4. Помечаем карточки как увиденные (для фильтрации в cards_service)
+    _insert_seen_cards_from_events(supabase, tg_id, events)
+
+    logger.info(
+        "Processed %d events for tg_id=%s (tags_with_delta=%d)",
+        len(events),
+        tg_id,
+        len(tag_deltas),
     )
-    existing = {row["tag"]: row["weight"] for row in (existing_resp.data or [])}
-
-    # 4. Обновляем веса с небольшим learning rate и клиппингом
-    lr = 0.1
-    now = datetime.utcnow().isoformat()
-
-    upsert_rows = []
-    for tag, delta in deltas.items():
-        old_w = existing.get(tag, 0.0)
-        new_w = old_w + lr * delta
-        new_w = max(-5.0, min(5.0, new_w))  # клип, чтобы не улетать
-
-        upsert_rows.append(
-            {
-                "tg_id": tg_id,
-                "tag": tag,
-                "weight": new_w,
-                "updated_at": now,
-            }
-        )
-
-    supabase.table("user_topic_weights").upsert(
-        upsert_rows,
-        on_conflict="tg_id,tag",
-    ).execute()

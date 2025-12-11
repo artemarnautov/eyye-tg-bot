@@ -13,6 +13,7 @@ from supabase import Client, create_client
 from .cards_service import build_feed_for_user
 from .profile_service import get_profile_summary, save_onboarding
 from .telemetry_service import EventsRequest, log_events  # <-- используем существующий telemetry_service
+from .feed_ranker import rank_cards_for_user  # <-- НОВОЕ: ранжирование фида
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +43,48 @@ if SUPABASE_URL and SUPABASE_KEY:
   logger.info("Supabase client initialized in webapp_backend")
 else:
   logger.warning("Supabase URL/KEY are not set. /api/feed and /api/profile will not work.")
+
+
+# ==========
+# Вспомогательные функции
+# ==========
+
+def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
+  """
+  Тянем user_topic_weights для пользователя и приводим к виду:
+    { "tech": 1.5, "business": 0.7, ... }
+
+  Если что-то падает — возвращаем пустой dict, чтобы не ломать фид.
+  """
+  if supabase is None:
+    return {}
+
+  try:
+    resp = supabase.table("user_topic_weights") \
+      .select("tag, weight") \
+      .eq("tg_id", tg_id) \
+      .execute()
+  except Exception:
+    logger.exception("Failed to load user_topic_weights for tg_id=%s", tg_id)
+    return {}
+
+  rows = getattr(resp, "data", None) or []
+  result: Dict[str, float] = {}
+  for row in rows:
+    tag = row.get("tag")
+    weight = row.get("weight")
+    if tag is None:
+      continue
+    try:
+      w = float(weight)
+    except (TypeError, ValueError):
+      continue
+    tag_str = str(tag).strip()
+    if not tag_str:
+      continue
+    result[tag_str] = w
+
+  return result
 
 
 # ==========
@@ -185,12 +228,27 @@ async def api_feed(
       detail="Supabase is not configured",
     )
 
+  # 1. Базовый фид (как раньше: подбор карточек по тегам/offset)
   items, debug = build_feed_for_user(
     supabase,
     tg_id,
     limit=limit,
     offset=offset,
   )
+
+  # 2. Подтягиваем веса тем пользователя
+  topic_weights = load_user_topic_weights_for_user(tg_id)
+
+  # 3. Ранжируем карточки по «интересности» с сохранением разнообразия (TikTok-lite)
+  if topic_weights:
+    try:
+      items = rank_cards_for_user(items, topic_weights)
+      debug = debug or {}
+      # Прокидываем веса в debug, чтобы видеть в /debug что происходит
+      debug.setdefault("topic_weights", topic_weights)
+    except Exception:
+      logger.exception("Failed to rank feed for tg_id=%s", tg_id)
+
   return {"items": items, "debug": debug}
 
 
