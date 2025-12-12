@@ -1,3 +1,4 @@
+# file: src/webapp_backend/main.py
 import logging
 import os
 from datetime import datetime, timezone
@@ -14,8 +15,8 @@ from .cards_service import build_feed_for_user
 from .profile_service import get_profile_summary, save_onboarding
 from .telemetry_service import EventsRequest, log_events
 
-logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ==========
 # Paths
@@ -230,4 +231,3 @@ async def api_events(payload: EventsRequest) -> Dict[str, Any]:
 @app.post("/api/telemetry")
 async def api_telemetry(payload: EventsRequest) -> Dict[str, Any]:
     return await api_events(payload)
-PY
