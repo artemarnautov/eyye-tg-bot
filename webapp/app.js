@@ -459,7 +459,9 @@
   
         var items = data.items || [];
         var debug = data.debug || {};
-        logDebug("Feed items batch:", items.length, "debug:", debug);
+        var cursor = data.cursor || {};
+  
+        logDebug("Feed items batch:", items.length, "cursor:", cursor, "debug:", debug);
   
         // считаем сколько реально добавили (appendNewItems уже делает dedup по seenIds)
         var beforeLen = state.feedItems.length;
@@ -467,17 +469,23 @@
         var afterLen = state.feedItems.length;
         var addedCount = afterLen - beforeLen;
   
-        // серверная пагинация
-        if (typeof debug.has_more === "boolean") {
+        // server pagination (source of truth: cursor; fallback: debug; fallback: heuristic)
+        if (typeof cursor.has_more === "boolean") {
+          state.hasMore = cursor.has_more;
+        } else if (typeof debug.has_more === "boolean") {
           state.hasMore = debug.has_more;
         } else {
           state.hasMore = items.length >= limit;
         }
   
-        if (typeof debug.next_offset === "number") {
+        // nextOffset (важно: если сервер внутри страницы дедупит/диверсифицирует,
+        // items.length может быть меньше limit — сдвиг всё равно должен идти по курсору)
+        if (typeof cursor.next_offset === "number") {
+          state.nextOffset = cursor.next_offset;
+        } else if (typeof debug.next_offset === "number") {
           state.nextOffset = debug.next_offset;
         } else {
-          state.nextOffset = offset + items.length;
+          state.nextOffset = offset + limit; // безопаснее, чем offset + items.length
         }
   
         if (state.feedItems.length === 0) {
@@ -498,6 +506,7 @@
         state.loadingFeed = false;
   
         if (onDone) {
+          // оставляем сигнатуру (addedCount, rawItems, debug) чтобы не ломать goToNextCard()
           onDone(addedCount, items, debug);
         }
       })
@@ -511,12 +520,13 @@
       });
   }
   
+  
 
   function goToNextCard() {
     if (!state.feedItems || state.feedItems.length === 0) {
       return;
     }
-
+  
     // === ТЕЛЕМЕТРИЯ: свайп вперёд по текущей карточке ===
     var prevItem =
       state.feedItems &&
@@ -525,7 +535,7 @@
       state.currentIndex < state.feedItems.length
         ? state.feedItems[state.currentIndex]
         : null;
-
+  
     if (
       prevItem &&
       prevItem.id != null &&
@@ -538,20 +548,50 @@
         position: state.currentIndex
       });
     }
-
+  
+    // обычный шаг вперёд, если есть куда
     if (state.currentIndex < state.feedItems.length - 1) {
       state.currentIndex += 1;
       renderCurrentCard();
-
-      // если мы приближаемся к концу — подгружаем
+  
+      // предзагрузка рядом с концом
       if (state.currentIndex >= state.feedItems.length - 3) {
         loadFeed(false);
       }
-    } else {
-      // дошли до конца текущего набора — пробуем ещё подгрузить
-      loadFeed(false);
+      return;
     }
+  
+    // === мы на последней карточке ===
+    // 1) если сервер ещё обещает has_more — просто подгружаем и, если пришло новое, перелистываем
+    if (state.hasMore) {
+      loadFeed(false, {
+        onDone: function (addedCount) {
+          if (addedCount > 0) {
+            state.currentIndex += 1;
+            renderCurrentCard();
+          }
+        }
+      });
+      return;
+    }
+  
+    // 2) если has_more=false — делаем refresh с offset=0 (ищем новые unseen карточки)
+    // важно: НЕ сбрасываем state.seenIds, иначе в сессии начнутся дубли
+    loadFeed(false, {
+      force: true,
+      forceOffsetZero: true,
+      onDone: function (addedCount) {
+        if (addedCount > 0) {
+          state.currentIndex += 1;
+          renderCurrentCard();
+        } else {
+          // новых карточек нет — остаёмся на последней
+          // (можно потом добавить UI-уведомление, но без alert)
+        }
+      }
+    });
   }
+  
 
   function goToPrevCard() {
     if (!state.feedItems || state.feedItems.length === 0) {
