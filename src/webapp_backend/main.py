@@ -1,4 +1,4 @@
-cat > /root/eyye-tg-bot/src/webapp_backend/main.py <<'PY'
+
 import logging
 import os
 from datetime import datetime, timezone
@@ -22,7 +22,7 @@ logging.basicConfig(level=logging.INFO)
 # Paths
 # ==========
 THIS_DIR = Path(__file__).resolve().parent          # .../eyye-tg-bot/src/webapp_backend
-ROOT_DIR = THIS_DIR.parents[1]                      # .../eyye-tg-bot
+ROOT_DIR = THIS_DIR.parents[2]                      # .../eyye-tg-bot
 WEBAPP_DIR = ROOT_DIR / "webapp"
 INDEX_HTML_PATH = WEBAPP_DIR / "index.html"
 
@@ -99,6 +99,10 @@ def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
 # ==========
 app = FastAPI(title="EYYE WebApp Backend")
 
+@app.on_event("startup")
+async def _startup_log() -> None:
+    logger.info("FastAPI startup OK. ROOT_DIR=%s WEBAPP_DIR=%s", ROOT_DIR, WEBAPP_DIR)
+
 # Static mount only if directory exists (иначе FastAPI падает на старте)
 if WEBAPP_DIR.exists() and WEBAPP_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(WEBAPP_DIR)), name="static")
@@ -120,7 +124,6 @@ app.add_middleware(
 async def ping() -> Dict[str, Any]:
     return {"status": "ok", "service": "eyye-webapp-backend"}
 
-# ВАЖНО: один health, без дублей
 @app.get("/api/health")
 @app.get("/health")
 async def api_health() -> Dict[str, Any]:
