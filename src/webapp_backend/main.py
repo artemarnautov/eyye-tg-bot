@@ -1,4 +1,4 @@
-# file: src/webapp_backend/main.py
+cat > /root/eyye-tg-bot/src/webapp_backend/main.py <<'PY'
 import logging
 import os
 from datetime import datetime, timezone
@@ -19,9 +19,8 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # ==========
-# Пути (аккуратно, без ошибки индекса parents[])
+# Paths
 # ==========
-
 THIS_DIR = Path(__file__).resolve().parent          # .../eyye-tg-bot/src/webapp_backend
 ROOT_DIR = THIS_DIR.parents[1]                      # .../eyye-tg-bot
 WEBAPP_DIR = ROOT_DIR / "webapp"
@@ -35,7 +34,6 @@ if not INDEX_HTML_PATH.exists():
 # ==========
 # Supabase
 # ==========
-
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
@@ -51,9 +49,8 @@ else:
     logger.warning("Supabase URL/KEY are not set. /api/feed and /api/profile will not work.")
 
 # ==========
-# Optional ranker (чтобы main.py не валился, если модуль отсутствует)
+# Optional ranker (не должен валить сервис, если файла нет)
 # ==========
-
 try:
     from .feed_ranker import rank_cards_for_user  # type: ignore
 except Exception:
@@ -63,7 +60,6 @@ except Exception:
 # ==========
 # Helpers
 # ==========
-
 def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
     if supabase is None:
         return {}
@@ -93,19 +89,17 @@ def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
             continue
 
         tag_str = str(tag).strip()
-        if not tag_str:
-            continue
-        out[tag_str] = w
+        if tag_str:
+            out[tag_str] = w
 
     return out
 
 # ==========
-# FastAPI app
+# App
 # ==========
-
 app = FastAPI(title="EYYE WebApp Backend")
 
-# Static mount only if dir exists (иначе FastAPI падает на старте)
+# Static mount only if directory exists (иначе FastAPI падает на старте)
 if WEBAPP_DIR.exists() and WEBAPP_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(WEBAPP_DIR)), name="static")
 else:
@@ -118,10 +112,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.on_event("startup")
-async def _startup_log() -> None:
-    logger.info("FastAPI startup OK. ROOT_DIR=%s WEBAPP_DIR=%s", ROOT_DIR, WEBAPP_DIR)
-
 # ==========
 # Routes
 # ==========
@@ -130,7 +120,7 @@ async def _startup_log() -> None:
 async def ping() -> Dict[str, Any]:
     return {"status": "ok", "service": "eyye-webapp-backend"}
 
-# ВАЖНО: только один health (без дублей!)
+# ВАЖНО: один health, без дублей
 @app.get("/api/health")
 @app.get("/health")
 async def api_health() -> Dict[str, Any]:
@@ -234,7 +224,8 @@ async def api_events(payload: EventsRequest) -> Dict[str, Any]:
 
     return {"status": "ok"}
 
-# Backward compatible alias
+# backward compatible alias
 @app.post("/api/telemetry")
 async def api_telemetry(payload: EventsRequest) -> Dict[str, Any]:
     return await api_events(payload)
+PY
