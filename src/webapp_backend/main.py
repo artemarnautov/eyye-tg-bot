@@ -3,7 +3,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,8 +13,7 @@ from supabase import Client, create_client
 
 from .cards_service import build_feed_for_user
 from .profile_service import get_profile_summary, save_onboarding
-from .telemetry_service import EventsRequest, log_events  # <-- используем существующий telemetry_service
-from .feed_ranker import rank_cards_for_user  # <-- опционально (по env)
+from .telemetry_service import EventsRequest, log_events
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -46,12 +45,14 @@ else:
     logger.warning("Supabase URL/KEY are not set. /api/feed and /api/profile will not work.")
 
 # ==========
-# Настройки (опционально)
+# Optional ranker (чтобы не падать, если файл/модуль переехал)
 # ==========
 
-# ВАЖНО: cards_service уже ранжирует и делает дедуп/диверсификацию.
-# Этот флаг оставляем только на будущее (если захочешь экспериментировать).
-USE_EXTERNAL_PAGE_RANKER = os.getenv("USE_EXTERNAL_PAGE_RANKER", "false").lower() in ("1", "true", "yes")
+try:
+    from .feed_ranker import rank_cards_for_user  # type: ignore
+except Exception:
+    rank_cards_for_user = None  # type: ignore
+    logger.info("feed_ranker not available, skipping extra ranking in main.py")
 
 # ==========
 # Вспомогательные функции
@@ -61,11 +62,6 @@ def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
     """
     Тянем user_topic_weights для пользователя и приводим к виду:
       { "tech": 1.5, "business": 0.7, ... }
-
-    Если что-то падает — возвращаем пустой dict, чтобы не ломать фид.
-
-    NB: build_feed_for_user уже использует веса внутри себя.
-    Эта функция нужна только для опционального внешнего ранкера.
     """
     if supabase is None:
         return {}
@@ -92,12 +88,15 @@ def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
             w = float(weight)
         except (TypeError, ValueError):
             continue
+
         tag_str = str(tag).strip()
         if not tag_str:
             continue
+
         result[tag_str] = w
 
     return result
+
 
 # ==========
 # FastAPI app
@@ -106,51 +105,31 @@ def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
 app = FastAPI(title="EYYE WebApp Backend")
 
 # Статика: webapp/ -> /static/*
-if WEBAPP_DIR.exists():
-    app.mount(
-        "/static",
-        StaticFiles(directory=str(WEBAPP_DIR)),
-        name="static",
-    )
+# Важно: StaticFiles падает на старте, если директории нет.
+if WEBAPP_DIR.exists() and WEBAPP_DIR.is_dir():
+    app.mount("/static", StaticFiles(directory=str(WEBAPP_DIR)), name="static")
 else:
-    logger.warning("WEBAPP_DIR not found at %s (static mount skipped)", WEBAPP_DIR)
+    logger.warning("WEBAPP_DIR does not exist, skipping /static mount: %s", WEBAPP_DIR)
 
-# CORS на будущее, сейчас всё из того же домена
-cors_origins_raw = os.getenv("CORS_ALLOW_ORIGINS", "*")
-allow_origins = [o.strip() for o in cors_origins_raw.split(",") if o.strip()] or ["*"]
-
+# CORS (пока permissive для MVP)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ==========
-# Маршруты
+# Health / Ping
 # ==========
 
 @app.get("/ping")
-from datetime import datetime, timezone
-
-@app.get("/api/health")
-@app.get("/health")  # optional alias
-async def api_health() -> dict:
-    return {
-        "ok": True,
-        "service": "eyye-webapp-backend",
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "supabase_configured": bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_KEY")),
-    }
-
 async def ping() -> dict:
     return {"status": "ok", "service": "eyye-webapp-backend"}
 
 @app.get("/api/health")
+@app.get("/health")  # alias
 async def api_health() -> Dict[str, Any]:
-    """
-    Нужно, чтобы `curl http://127.0.0.1:8000/api/health` не возвращал 404.
-    """
     return {
         "ok": True,
         "service": "eyye-webapp-backend",
@@ -158,8 +137,12 @@ async def api_health() -> Dict[str, Any]:
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
     }
 
+# ==========
+# WebApp index
+# ==========
+
 @app.get("/", response_class=HTMLResponse)
-async def index(tg_id: str | None = None) -> HTMLResponse:
+async def index(tg_id: Optional[str] = None) -> HTMLResponse:
     """
     Отдаём index.html WebApp. tg_id читается на фронте из query-параметра.
     """
@@ -174,14 +157,15 @@ async def index(tg_id: str | None = None) -> HTMLResponse:
 
     return HTMLResponse(content=html)
 
-# ---- Профиль / онбординг ----
+# ==========
+# Profile / onboarding
+# ==========
 
 @app.get("/api/profile")
 async def api_profile(
     tg_id: int = Query(..., alias="tg_id"),
 ) -> Dict[str, Any]:
     """
-    Короткая сводка профиля:
     {
       "has_onboarding": bool,
       "city": str | None,
@@ -191,15 +175,13 @@ async def api_profile(
     if supabase is None:
         return {"has_onboarding": False, "city": None, "tags": []}
 
-    summary = get_profile_summary(supabase, tg_id)
-    return summary
+    return get_profile_summary(supabase, tg_id)
 
 @app.post("/api/profile/onboarding")
 async def api_profile_onboarding(
     payload: Dict[str, Any] = Body(...),
 ) -> Dict[str, Any]:
     """
-    Принимаем результат онбординга из WebApp:
     {
       "user_id": int,
       "city": str | null,
@@ -237,26 +219,25 @@ async def api_profile_onboarding(
         logger.exception("Failed to save onboarding for user_id=%s", user_id)
         raise HTTPException(status_code=500, detail="failed to save profile")
 
-    # Возвращаем актуальную сводку профиля
-    summary = get_profile_summary(supabase, user_id)
-    return summary
+    return get_profile_summary(supabase, user_id)
 
-# ---- Фид ----
+# ==========
+# Feed
+# ==========
 
 @app.get("/api/feed")
 async def api_feed(
     tg_id: int = Query(..., alias="tg_id"),
     limit: int = Query(20, ge=1, le=50),
     offset: int = Query(0, ge=0),
-) -> dict:
+) -> Dict[str, Any]:
     """
     Основной endpoint для WebApp:
-    возвращает персональную ленту карточек для пользователя с поддержкой offset.
+    возвращает персональную ленту карточек с поддержкой offset.
     """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase is not configured")
 
-    # 1) Основной фид (ВКЛЮЧАЯ ранжирование/дедуп/диверсификацию внутри cards_service)
     items, debug = build_feed_for_user(
         supabase,
         tg_id,
@@ -264,22 +245,21 @@ async def api_feed(
         offset=offset,
     )
 
-    # 2) Опционально: внешний ранкер ТОЛЬКО на странице (эксперименты).
-    # ВАЖНО: это может ломать стабильность пагинации, т.к. ранжируем уже нарезанную страницу.
-    if USE_EXTERNAL_PAGE_RANKER:
+    # optional: extra ranking (если модуль существует)
+    topic_weights = load_user_topic_weights_for_user(tg_id)
+    if topic_weights and rank_cards_for_user is not None:
         try:
-            topic_weights = load_user_topic_weights_for_user(tg_id)
-            if topic_weights:
-                items = rank_cards_for_user(items, topic_weights)
-                debug = debug or {}
-                debug.setdefault("external_page_ranker", True)
-                debug.setdefault("topic_weights_external", topic_weights)
+            items = rank_cards_for_user(items, topic_weights)
+            debug = debug or {}
+            debug.setdefault("topic_weights", topic_weights)
         except Exception:
-            logger.exception("Failed to apply external page ranker for tg_id=%s", tg_id)
+            logger.exception("Failed to rank feed for tg_id=%s", tg_id)
 
     return {"items": items, "debug": debug}
 
-# ---- Телеметрия событий (TikTok-lite сигналы) ----
+# ==========
+# Events / telemetry
+# ==========
 
 @app.post("/api/events")
 async def api_events(payload: EventsRequest) -> Dict[str, Any]:
@@ -299,7 +279,7 @@ async def api_events(payload: EventsRequest) -> Dict[str, Any]:
 
     return {"status": "ok"}
 
-# (необязательно) alias для совместимости, если где-то уже дергают /api/telemetry
+# backward compatible endpoint (если фронт/старый код дергает /api/telemetry)
 @app.post("/api/telemetry")
 async def api_telemetry(payload: EventsRequest) -> Dict[str, Any]:
     return await api_events(payload)
