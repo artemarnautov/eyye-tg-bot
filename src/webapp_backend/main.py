@@ -19,14 +19,16 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 # ==========
-# Пути
+# Пути (аккуратно, без ошибки индекса parents[])
 # ==========
 
-THIS_DIR = Path(__file__).resolve().parent          # .../src/webapp_backend
-ROOT_DIR = THIS_DIR.parents[2]                      # .../eyye-tg-bot
+THIS_DIR = Path(__file__).resolve().parent          # .../eyye-tg-bot/src/webapp_backend
+ROOT_DIR = THIS_DIR.parents[1]                      # .../eyye-tg-bot
 WEBAPP_DIR = ROOT_DIR / "webapp"
 INDEX_HTML_PATH = WEBAPP_DIR / "index.html"
 
+if not WEBAPP_DIR.exists():
+    logger.warning("WEBAPP_DIR not found: %s", WEBAPP_DIR)
 if not INDEX_HTML_PATH.exists():
     logger.warning("index.html not found at %s", INDEX_HTML_PATH)
 
@@ -39,30 +41,30 @@ SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logger.info("Supabase client initialized in webapp_backend")
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        logger.info("Supabase client initialized in webapp_backend")
+    except Exception:
+        logger.exception("Failed to init Supabase client")
+        supabase = None
 else:
     logger.warning("Supabase URL/KEY are not set. /api/feed and /api/profile will not work.")
 
 # ==========
-# Optional ranker (чтобы не падать, если файл/модуль переехал)
+# Optional ranker (чтобы main.py не валился, если модуль отсутствует)
 # ==========
 
 try:
     from .feed_ranker import rank_cards_for_user  # type: ignore
 except Exception:
     rank_cards_for_user = None  # type: ignore
-    logger.info("feed_ranker not available, skipping extra ranking in main.py")
+    logger.info("feed_ranker not available (ok for MVP)")
 
 # ==========
-# Вспомогательные функции
+# Helpers
 # ==========
 
 def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
-    """
-    Тянем user_topic_weights для пользователя и приводим к виду:
-      { "tech": 1.5, "business": 0.7, ... }
-    """
     if supabase is None:
         return {}
 
@@ -78,7 +80,8 @@ def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
         return {}
 
     rows = getattr(resp, "data", None) or []
-    result: Dict[str, float] = {}
+    out: Dict[str, float] = {}
+
     for row in rows:
         tag = row.get("tag")
         weight = row.get("weight")
@@ -92,11 +95,9 @@ def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
         tag_str = str(tag).strip()
         if not tag_str:
             continue
+        out[tag_str] = w
 
-        result[tag_str] = w
-
-    return result
-
+    return out
 
 # ==========
 # FastAPI app
@@ -104,14 +105,12 @@ def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
 
 app = FastAPI(title="EYYE WebApp Backend")
 
-# Статика: webapp/ -> /static/*
-# Важно: StaticFiles падает на старте, если директории нет.
+# Static mount only if dir exists (иначе FastAPI падает на старте)
 if WEBAPP_DIR.exists() and WEBAPP_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(WEBAPP_DIR)), name="static")
 else:
-    logger.warning("WEBAPP_DIR does not exist, skipping /static mount: %s", WEBAPP_DIR)
+    logger.warning("Skipping /static mount because webapp dir missing: %s", WEBAPP_DIR)
 
-# CORS (пока permissive для MVP)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -119,16 +118,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.on_event("startup")
+async def _startup_log() -> None:
+    logger.info("FastAPI startup OK. ROOT_DIR=%s WEBAPP_DIR=%s", ROOT_DIR, WEBAPP_DIR)
+
 # ==========
-# Health / Ping
+# Routes
 # ==========
 
 @app.get("/ping")
-async def ping() -> dict:
+async def ping() -> Dict[str, Any]:
     return {"status": "ok", "service": "eyye-webapp-backend"}
 
+# ВАЖНО: только один health (без дублей!)
 @app.get("/api/health")
-@app.get("/health")  # alias
+@app.get("/health")
 async def api_health() -> Dict[str, Any]:
     return {
         "ok": True,
@@ -137,15 +141,8 @@ async def api_health() -> Dict[str, Any]:
         "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
     }
 
-# ==========
-# WebApp index
-# ==========
-
 @app.get("/", response_class=HTMLResponse)
 async def index(tg_id: Optional[str] = None) -> HTMLResponse:
-    """
-    Отдаём index.html WebApp. tg_id читается на фронте из query-параметра.
-    """
     if not INDEX_HTML_PATH.exists():
         raise HTTPException(status_code=500, detail="index.html not found")
 
@@ -157,37 +154,16 @@ async def index(tg_id: Optional[str] = None) -> HTMLResponse:
 
     return HTMLResponse(content=html)
 
-# ==========
-# Profile / onboarding
-# ==========
+# ---- Profile ----
 
 @app.get("/api/profile")
-async def api_profile(
-    tg_id: int = Query(..., alias="tg_id"),
-) -> Dict[str, Any]:
-    """
-    {
-      "has_onboarding": bool,
-      "city": str | None,
-      "tags": [str, ...]
-    }
-    """
+async def api_profile(tg_id: int = Query(..., alias="tg_id")) -> Dict[str, Any]:
     if supabase is None:
         return {"has_onboarding": False, "city": None, "tags": []}
-
     return get_profile_summary(supabase, tg_id)
 
 @app.post("/api/profile/onboarding")
-async def api_profile_onboarding(
-    payload: Dict[str, Any] = Body(...),
-) -> Dict[str, Any]:
-    """
-    {
-      "user_id": int,
-      "city": str | null,
-      "tags": [str, ...]
-    }
-    """
+async def api_profile_onboarding(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase is not configured")
 
@@ -199,9 +175,7 @@ async def api_profile_onboarding(
 
     city = payload.get("city")
     if city is not None:
-        city = str(city).strip()
-        if city == "":
-            city = None
+        city = str(city).strip() or None
 
     tags = payload.get("tags") or []
     if not isinstance(tags, list):
@@ -221,9 +195,7 @@ async def api_profile_onboarding(
 
     return get_profile_summary(supabase, user_id)
 
-# ==========
-# Feed
-# ==========
+# ---- Feed ----
 
 @app.get("/api/feed")
 async def api_feed(
@@ -231,21 +203,11 @@ async def api_feed(
     limit: int = Query(20, ge=1, le=50),
     offset: int = Query(0, ge=0),
 ) -> Dict[str, Any]:
-    """
-    Основной endpoint для WebApp:
-    возвращает персональную ленту карточек с поддержкой offset.
-    """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase is not configured")
 
-    items, debug = build_feed_for_user(
-        supabase,
-        tg_id,
-        limit=limit,
-        offset=offset,
-    )
+    items, debug = build_feed_for_user(supabase, tg_id, limit=limit, offset=offset)
 
-    # optional: extra ranking (если модуль существует)
     topic_weights = load_user_topic_weights_for_user(tg_id)
     if topic_weights and rank_cards_for_user is not None:
         try:
@@ -257,17 +219,10 @@ async def api_feed(
 
     return {"items": items, "debug": debug}
 
-# ==========
-# Events / telemetry
-# ==========
+# ---- Events / Telemetry ----
 
 @app.post("/api/events")
 async def api_events(payload: EventsRequest) -> Dict[str, Any]:
-    """
-    Принимаем батч событий от фронта:
-    - пишем в user_events
-    - обновляем user_topic_weights
-    """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase is not configured")
 
@@ -279,7 +234,7 @@ async def api_events(payload: EventsRequest) -> Dict[str, Any]:
 
     return {"status": "ok"}
 
-# backward compatible endpoint (если фронт/старый код дергает /api/telemetry)
+# Backward compatible alias
 @app.post("/api/telemetry")
 async def api_telemetry(payload: EventsRequest) -> Dict[str, Any]:
     return await api_events(payload)
