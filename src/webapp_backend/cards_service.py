@@ -123,6 +123,13 @@ try:
 except ValueError:
     FEED_RANDOMNESS_STRENGTH = 0.15
 
+# ===================== Настройки для Wikipedia-источника =====================
+
+# В каком окне по длине фрагмента ленты контролируем долю wiki-карт
+WIKI_WINDOW_SIZE = int(os.getenv("FEED_WIKI_WINDOW_SIZE", "4"))
+# Максимальное количество wiki-карт в этом окне (по умолчанию 1 wiki на 4 карточки)
+WIKI_MAX_IN_WINDOW = int(os.getenv("FEED_WIKI_MAX_IN_WINDOW", "1"))
+
 # ===================== Вспомогательные функции =====================
 
 
@@ -187,6 +194,14 @@ def _extract_main_tag(card: Dict[str, Any], base_tags: List[str]) -> str:
         if t in base_set:
             return t
     return tags[0] if tags else "unknown"
+
+
+def _is_wikipedia_card(card: Dict[str, Any]) -> bool:
+    """
+    Простая проверка, что карточка из Wikipedia.
+    """
+    src_type = (card.get("source_type") or "").strip().lower()
+    return src_type == "wikipedia"
 
 
 # ===================== Работа с таблицей cards =====================
@@ -520,10 +535,12 @@ def _apply_dedup_and_diversity(
     Постобработка уже отсортированного списка:
     - убираем дубли по заголовкам;
     - стараемся развести карточки по источникам и основным тегам;
-    - НО больше НЕ выбрасываем карточки навсегда, только откладываем.
+    - контролируем долю Wikipedia-карточек:
+      по умолчанию не более 1 wiki-карточки в окне из 4 подряд (≈ 25% ленты локально);
+    - НО при этом не выбрасываем карточки полностью, а сначала откладываем
+      и пытаемся вставить позже, затем — в хвост.
 
-    Важно: все недубльные карточки в итоге попадают в итоговый список.
-    Это гарантирует «длинный» фид, а диверсификация влияет только на порядок.
+    Важно: дублям по заголовкам всё равно запрещено попадать в итоговый список.
     """
     if not ranked:
         return [], {
@@ -534,6 +551,8 @@ def _apply_dedup_and_diversity(
             "used_deferred": 0,
             "tail_added": 0,
             "total_ranked_raw": 0,
+            "wiki_window_size": WIKI_WINDOW_SIZE,
+            "wiki_max_in_window": WIKI_MAX_IN_WINDOW,
         }
 
     total_ranked_raw = len(ranked)
@@ -547,8 +566,9 @@ def _apply_dedup_and_diversity(
         current: List[Dict[str, Any]],
         source_key: str,
         main_tag: str,
+        card: Dict[str, Any],
     ) -> bool:
-        # Смотрим на последние 4 карточки
+        # Смотрим на последние несколько карточек
         window = current[-4:]
         same_source = 0
         same_tag = 0
@@ -557,8 +577,22 @@ def _apply_dedup_and_diversity(
                 same_source += 1
             if _extract_main_tag(c, base_tags) == main_tag:
                 same_tag += 1
+
         if same_source >= max_consecutive_source or same_tag >= max_consecutive_tag:
             return True
+
+        # Дополнительное правило для Wikipedia:
+        # среди последних WIKI_WINDOW_SIZE карточек не должно быть больше
+        # WIKI_MAX_IN_WINDOW wiki-карт.
+        if _is_wikipedia_card(card) and WIKI_WINDOW_SIZE > 0:
+            wiki_window = current[-WIKI_WINDOW_SIZE:]
+            wiki_count = 0
+            for c in wiki_window:
+                if _is_wikipedia_card(c):
+                    wiki_count += 1
+            if wiki_count >= WIKI_MAX_IN_WINDOW:
+                return True
+
         return False
 
     # Первый проход: отбираем всё, что:
@@ -576,7 +610,7 @@ def _apply_dedup_and_diversity(
         source_key = _extract_source_key(card)
         main_tag = _extract_main_tag(card, base_tags)
 
-        if violates_diversity(selected, source_key, main_tag):
+        if violates_diversity(selected, source_key, main_tag, card):
             # Откладываем, попробуем вставить позже
             deferred.append(card)
             continue
@@ -585,7 +619,7 @@ def _apply_dedup_and_diversity(
         if norm_title:
             seen_titles.add(norm_title)
 
-    # Второй проход: пробуем мягко домешать отложенные карточки
+    # Второй проход: пробуем домешать отложенные карточки
     still_deferred: List[Dict[str, Any]] = []
     used_deferred = 0
 
@@ -593,7 +627,7 @@ def _apply_dedup_and_diversity(
         source_key = _extract_source_key(card)
         main_tag = _extract_main_tag(card, base_tags)
 
-        if violates_diversity(selected, source_key, main_tag):
+        if violates_diversity(selected, source_key, main_tag, card):
             # Всё ещё ломает диверсификацию – пока держим отдельно
             still_deferred.append(card)
             continue
@@ -611,6 +645,8 @@ def _apply_dedup_and_diversity(
 
     # Третий проход: всё, что так и не вписалось по "красоте",
     # просто докидываем в хвост (кроме дублей по заголовкам).
+    # Здесь мы уже НЕ применяем ограничения по источнику/тегам,
+    # но по-прежнему соблюдаем дедуп по заголовкам.
     tail_added = 0
     for card in still_deferred:
         title = (card.get("title") or "").strip()
@@ -632,10 +668,11 @@ def _apply_dedup_and_diversity(
         "used_deferred": used_deferred,
         "tail_added": tail_added,
         "total_ranked_raw": total_ranked_raw,
+        "wiki_window_size": WIKI_WINDOW_SIZE,
+        "wiki_max_in_window": WIKI_MAX_IN_WINDOW,
     }
 
     return selected, debug_postprocess
-
 
 
 # ===================== Вставка LLM-карточек в DB =====================
@@ -661,7 +698,7 @@ def _insert_cards_into_db(
     language / source_type / source_ref:
     - language: язык карточки ("ru", "en", ...) — можно указать по умолчанию
       или положить в саму карточку c["language"].
-    - source_type: "telegram", "rss", "llm" и т.п.
+    - source_type: "telegram", "rss", "llm", "wikipedia" и т.п.
     - source_ref: например, ссылка или message_id канала.
     """
     if not cards:
@@ -1093,6 +1130,17 @@ def build_feed_for_user(
     total_ranked = len(ranked)
     debug["total_ranked"] = total_ranked
 
+    # Дополнительно считаем распределение источников во всём ranked
+    source_counts: Dict[str, int] = {}
+    wiki_count_total = 0
+    for c in ranked:
+        src = (c.get("source_type") or "unknown").lower()
+        source_counts[src] = source_counts.get(src, 0) + 1
+        if _is_wikipedia_card(c):
+            wiki_count_total += 1
+    debug["sources_ranked"] = source_counts
+    debug["wiki_count_ranked"] = wiki_count_total
+
     if total_ranked == 0:
         debug["reason"] = "no_ranked_cards"
         debug["returned"] = 0
@@ -1112,7 +1160,7 @@ def build_feed_for_user(
         # offset вышел за пределы доступных карточек – включаем "круговую" пагинацию,
         # чтобы лента не обрывалась даже при маленьком количестве контента.
         wrapped_offset = offset % total_ranked
-        page: List[Dict[str, Any]] = []
+        page = []
         idx = wrapped_offset
         while len(page) < limit and len(page) < total_ranked:
             page.append(ranked[idx])
@@ -1122,6 +1170,17 @@ def build_feed_for_user(
         next_offset = offset + limit
         debug["pagination_mode"] = "wrapped"
         debug["wrapped_offset"] = wrapped_offset
+
+    # Источники только на текущей странице
+    page_source_counts: Dict[str, int] = {}
+    page_wiki_count = 0
+    for c in page:
+        src = (c.get("source_type") or "unknown").lower()
+        page_source_counts[src] = page_source_counts.get(src, 0) + 1
+        if _is_wikipedia_card(c):
+            page_wiki_count += 1
+    debug["sources_page"] = page_source_counts
+    debug["wiki_count_page"] = page_wiki_count
 
     debug["returned"] = len(page)
     debug["has_more"] = has_more

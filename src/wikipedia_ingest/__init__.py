@@ -2,6 +2,12 @@
 """
 Wikipedia ingest package for EYYE.
 
-Скрипты:
-- fetch_wikipedia_articles.py — берёт статьи из Википедии и создаёт карточки в cards.
+Назначение:
+- Фоново подтягивать статьи из Wikipedia (en/ru),
+- нормализовать их в формат cards,
+- учитывать глобальные интересы пользователей (user_topic_weights),
+- приоритезировать популярные и релевантные темы.
+
+Основной скрипт:
+- fetch_wikipedia_articles.py — точка входа для systemd-воркера.
 """

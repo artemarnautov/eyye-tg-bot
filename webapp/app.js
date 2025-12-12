@@ -22,8 +22,7 @@
     { id: "sports", label: "Спорт" },
     { id: "lifestyle", label: "Лайфстайл" },
     { id: "education", label: "Образование / Карьера" },
-    { id: "city", label: "Город / Локальные новости" },
-    { id: "uk_students", label: "Студенческая жизнь в UK" }
+    { id: "city", label: "Город / Локальные новости" }
   ];
 
   // Состояние приложения
