@@ -2,7 +2,7 @@ import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,17 +16,23 @@ from .telemetry_service import EventsRequest, log_events
 logger = logging.getLogger("eyye.webapp_backend")
 logging.basicConfig(level=logging.INFO)
 
+# ==========
+# Paths
+# ==========
+THIS_DIR = Path(__file__).resolve().parent
+DEFAULT_ROOT = Path("/root/eyye-tg-bot")
 
-# ==========
-# Paths (robust)
-# ==========
+
 def _detect_root_dir() -> Path:
     """
+    Goal: ROOT_DIR must be repo root: /root/eyye-tg-bot
+
     Prefer:
       1) EYYE_ROOT_DIR env
-      2) process cwd (systemd WorkingDirectory)
-      3) walk parents of this file for marker webapp/index.html
-      4) fallback to parents[2]
+      2) marker search: parent containing webapp/index.html
+      3) cwd containing webapp/
+      4) default /root/eyye-tg-bot if exists
+      5) fallback to parents[2]
     """
     env_root = os.getenv("EYYE_ROOT_DIR")
     if env_root:
@@ -34,16 +40,18 @@ def _detect_root_dir() -> Path:
         if p.exists():
             return p
 
-    cwd = Path.cwd().resolve()
-    if (cwd / "webapp").exists():
-        return cwd
-
     here = Path(__file__).resolve()
     for p in here.parents:
         if (p / "webapp" / "index.html").exists():
             return p
 
-    # fallback: .../src/webapp_backend/main.py -> parents[2] == repo root
+    cwd = Path.cwd().resolve()
+    if (cwd / "webapp").exists():
+        return cwd
+
+    if (DEFAULT_ROOT / "webapp" / "index.html").exists():
+        return DEFAULT_ROOT
+
     try:
         return here.parents[2]
     except Exception:
@@ -54,12 +62,15 @@ ROOT_DIR = _detect_root_dir()
 WEBAPP_DIR = ROOT_DIR / "webapp"
 INDEX_HTML_PATH = WEBAPP_DIR / "index.html"
 
-
 # ==========
 # Supabase
 # ==========
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY") or os.getenv("SUPABASE_SERVICE_KEY")
+SUPABASE_KEY = (
+    os.getenv("SUPABASE_KEY")
+    or os.getenv("SUPABASE_ANON_KEY")
+    or os.getenv("SUPABASE_SERVICE_KEY")
+)
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -72,16 +83,14 @@ if SUPABASE_URL and SUPABASE_KEY:
 else:
     logger.warning("Supabase URL/KEY are not set. /api/feed and /api/profile will not work.")
 
-
 # ==========
-# Optional ranker (не должен валить сервис)
+# Optional ranker (must not crash service)
 # ==========
 try:
     from .feed_ranker import rank_cards_for_user  # type: ignore
 except Exception:
     rank_cards_for_user = None  # type: ignore
     logger.info("feed_ranker not available (ok for MVP)")
-
 
 # ==========
 # Helpers
@@ -117,7 +126,6 @@ def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
             out[tag_str] = w
     return out
 
-
 # ==========
 # App
 # ==========
@@ -135,12 +143,11 @@ api = APIRouter(prefix="/api")
 
 @app.on_event("startup")
 async def _startup_log() -> None:
-    logger.info("FastAPI startup OK. ROOT_DIR=%s WEBAPP_DIR=%s", ROOT_DIR, WEBAPP_DIR)
+    logger.info("FastAPI startup OK. ROOT_DIR=%s WEBAPP_DIR=%s", str(ROOT_DIR), str(WEBAPP_DIR))
     if not WEBAPP_DIR.exists():
         logger.warning("WEBAPP_DIR not found: %s", WEBAPP_DIR)
     if not INDEX_HTML_PATH.exists():
         logger.warning("index.html not found at %s", INDEX_HTML_PATH)
-
 
 # ==========
 # Non-API routes
@@ -148,7 +155,6 @@ async def _startup_log() -> None:
 @app.get("/ping")
 async def ping() -> Dict[str, Any]:
     return {"status": "ok", "service": "eyye-webapp-backend"}
-
 
 # ==========
 # API routes
@@ -168,6 +174,7 @@ async def api_health() -> Dict[str, Any]:
 
 @api.get("/profile")
 async def api_profile(tg_id: int = Query(..., alias="tg_id")) -> Dict[str, Any]:
+    # MVP: service must be alive even without Supabase
     if supabase is None:
         return {"has_onboarding": False, "city": None, "tags": []}
     return get_profile_summary(supabase, tg_id)
@@ -244,7 +251,6 @@ async def api_events(payload: EventsRequest) -> Dict[str, Any]:
     return {"status": "ok"}
 
 
-# backward compatible alias
 @api.post("/telemetry")
 async def api_telemetry(payload: EventsRequest) -> Dict[str, Any]:
     return await api_events(payload)
@@ -252,10 +258,8 @@ async def api_telemetry(payload: EventsRequest) -> Dict[str, Any]:
 
 app.include_router(api)
 
-
 # ==========
-# Serve WebApp from "/" (so /app.js, /styles.css etc work)
-# Mount LAST so that /api/* and /ping keep priority.
+# Serve WebApp from "/"
 # ==========
 if WEBAPP_DIR.exists() and WEBAPP_DIR.is_dir():
     app.mount("/", StaticFiles(directory=str(WEBAPP_DIR), html=True), name="webapp")
