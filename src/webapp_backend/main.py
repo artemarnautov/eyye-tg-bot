@@ -131,6 +131,18 @@ app.add_middleware(
 # ==========
 
 @app.get("/ping")
+from datetime import datetime, timezone
+
+@app.get("/api/health")
+@app.get("/health")  # optional alias
+async def api_health() -> dict:
+    return {
+        "ok": True,
+        "service": "eyye-webapp-backend",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "supabase_configured": bool(os.getenv("SUPABASE_URL") and os.getenv("SUPABASE_KEY")),
+    }
+
 async def ping() -> dict:
     return {"status": "ok", "service": "eyye-webapp-backend"}
 
