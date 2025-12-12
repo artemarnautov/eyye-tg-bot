@@ -1,13 +1,16 @@
-# file: src/wikipedia_ingest/__init__.py
 """
 Wikipedia ingest package for EYYE.
 
-Назначение:
-- Фоново подтягивать статьи из Wikipedia (en/ru),
-- нормализовать их в формат cards,
-- учитывать глобальные интересы пользователей (user_topic_weights),
-- приоритезировать популярные и релевантные темы.
+Новая логика (MVP, hourly):
+- Не быть "бездушной энциклопедией".
+- Собирать кандидатов из:
+  1) RecentChanges (свежие правки) — сигнал "why now"
+  2) Wikimedia Pageviews Top — сигнал "why now" по трендам
+- Дальше пропускать кандидата через OpenAI-гейт:
+  - is_newsworthy=true/false
+  - why_now обязателен
+  - если нет "почему сейчас" -> SKIP
 
-Основной скрипт:
-- fetch_wikipedia_articles.py — точка входа для systemd-воркера.
+Точка входа:
+- fetch_wikipedia_articles.py
 """

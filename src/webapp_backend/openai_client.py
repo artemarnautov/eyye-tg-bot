@@ -1,4 +1,3 @@
-# file: src/webapp_backend/openai_client.py
 import json
 import logging
 import os
@@ -16,36 +15,25 @@ logger = logging.getLogger(__name__)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
-# Можно переопределить базовый URL (для прокси / совместимых API)
+# Отдельная модель под Wikipedia (можно поставить ещё дешевле)
+OPENAI_WIKIPEDIA_MODEL = os.getenv("OPENAI_WIKIPEDIA_MODEL", OPENAI_MODEL)
+
 OPENAI_API_BASE = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
 OPENAI_CHAT_COMPLETIONS_URL = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
 
 OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
-
 RAW_LOG_MAX_LEN = 4000
 
 
 def is_configured() -> bool:
-    """
-    Есть ли вообще ключ для OpenAI.
-    """
     return bool(OPENAI_API_KEY)
 
-
-# ==========
-# Низкоуровневый вызов chat.completions
-# ==========
 
 import urllib.request
 import urllib.error
 
 
 def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Обёртка вокруг OpenAI Chat Completions.
-    Принимает payload со старыми полями (input, max_output_tokens и т.п.),
-    под капотом бьёт в /v1/chat/completions.
-    """
     if not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY is not set, skipping OpenAI call")
         return {}
@@ -58,8 +46,6 @@ def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     model = payload.get("model") or OPENAI_MODEL or "gpt-4.1-mini"
 
-    # 1) если передали messages — используем их;
-    # 2) если нет, смотрим input (список сообщений или строка).
     messages = payload.get("messages")
     if not messages:
         input_field = payload.get("input")
@@ -101,11 +87,7 @@ def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
             raw = resp.read().decode("utf-8")
         elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
         logger.info("OpenAI chat.completions call OK (%.2fs)", elapsed)
-        logger.debug(
-            "OpenAI raw response (first %d chars): %s",
-            RAW_LOG_MAX_LEN,
-            raw[:RAW_LOG_MAX_LEN],
-        )
+        logger.debug("OpenAI raw response (first %d chars): %s", RAW_LOG_MAX_LEN, raw[:RAW_LOG_MAX_LEN])
         return json.loads(raw)
     except urllib.error.HTTPError as e:
         elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
@@ -126,15 +108,7 @@ def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
 
-# ==========
-# Парсеры "кривого" JSON карточек
-# ==========
-
-# Объекты, где точно есть title — этого достаточно для salvage
-CARD_BLOCK_RE = re.compile(
-    r"\{[^{}]*\"title\"\s*:\s*\"[^\"]+\"[^{}]*\}",
-    re.DOTALL,
-)
+CARD_BLOCK_RE = re.compile(r"\{[^{}]*\"title\"\s*:\s*\"[^\"]+\"[^{}]*\}", re.DOTALL)
 
 
 def _extract_str(block: str, field: str) -> str | None:
@@ -156,7 +130,6 @@ def _extract_float(block: str, field: str, default: float = 1.0) -> float:
 
 
 def _extract_tags_from_block(block: str, fallback_tags: List[str]) -> List[str]:
-    # Пытаемся вытащить tags: ["...","..."]
     m = re.search(r'"tags"\s*:\s*\[([^\]]*)\]', block)
     tags: List[str] = []
     if m:
@@ -165,14 +138,12 @@ def _extract_tags_from_block(block: str, fallback_tags: List[str]) -> List[str]:
             part = part.strip()
             if not part:
                 continue
-            # убираем кавычки по краям
             if part.startswith('"') and part.endswith('"'):
                 part = part[1:-1]
             if part:
                 tags.append(part.strip())
 
     if not tags:
-        # fallback: одиночный tag
         tag = _extract_str(block, "tag")
         if tag:
             tags.append(tag)
@@ -184,26 +155,15 @@ def _extract_tags_from_block(block: str, fallback_tags: List[str]) -> List[str]:
 
 
 def _parse_openai_cards_from_text(content: str, fallback_tags: List[str]) -> List[Dict[str, Any]]:
-    """
-    Пытаемся вытащить карточки из "кривого" JSON-текста.
-    Ищем отдельные объекты с полями title/body/summary/tag/importance/tags.
-    Если ничего не нашли — возвращаем пустой список.
-    """
     if not content:
         return []
 
     cards: List[Dict[str, Any]] = []
-
     for idx, m in enumerate(CARD_BLOCK_RE.finditer(content), start=1):
         block = m.group(0)
 
         title = _extract_str(block, "title") or f"Новость #{idx}"
-        body = (
-            _extract_str(block, "body")
-            or _extract_str(block, "summary")
-            or ""
-        )
-
+        body = _extract_str(block, "body") or _extract_str(block, "summary") or ""
         if not title and not body:
             continue
 
@@ -213,25 +173,12 @@ def _parse_openai_cards_from_text(content: str, fallback_tags: List[str]) -> Lis
 
         tags = _extract_tags_from_block(block, fallback_tags)
 
-        cards.append(
-            {
-                "title": title,
-                "body": body or title,
-                "tags": tags,
-                "importance_score": importance,
-            }
-        )
+        cards.append({"title": title, "body": body or title, "tags": tags, "importance_score": importance})
 
     return cards
 
 
 def _try_loose_json_parse(content: str) -> Dict[str, Any] | None:
-    """
-    Пытаемся немного "починить" JSON:
-    - обрезаем мусор с краёв
-    - пробуем вытащить только объект, начинающийся с { и заканчивающийся на }.
-    Возвращаем dict или None.
-    """
     if not content:
         return None
 
@@ -248,15 +195,10 @@ def _try_loose_json_parse(content: str) -> Dict[str, Any] | None:
             return parsed
     except Exception:
         return None
-
     return None
 
 
 def _extract_message_content(resp_json: Dict[str, Any]) -> str:
-    """
-    Вытаскиваем message.content из chat.completions-ответа,
-    поддерживая как строку, так и список блоков.
-    """
     if not resp_json:
         return ""
 
@@ -268,7 +210,6 @@ def _extract_message_content(resp_json: Dict[str, Any]) -> str:
     message = choices[0].get("message") or {}
     content = message.get("content")
 
-    # Поддерживаем как старый формат (строка), так и новый (список блоков)
     if isinstance(content, list):
         parts: List[str] = []
         for part in content:
@@ -282,13 +223,12 @@ def _extract_message_content(resp_json: Dict[str, Any]) -> str:
                     parts.append(text)
             elif isinstance(part, str):
                 parts.append(part)
-        content_str = "\n".join(parts)
-    elif isinstance(content, str):
-        content_str = content
-    else:
-        content_str = str(content or "")
+        return "\n".join(parts)
 
-    return content_str
+    if isinstance(content, str):
+        return content
+
+    return str(content or "")
 
 
 # ==========
@@ -297,22 +237,13 @@ def _extract_message_content(resp_json: Dict[str, Any]) -> str:
 
 DEFAULT_FEED_TAGS = ["world_news", "business", "tech", "uk_students"]
 
+ALLOWED_TAGS_CANONICAL = [
+    "world_news", "business", "finance", "tech", "science", "history", "politics", "society",
+    "entertainment", "gaming", "sports", "lifestyle", "education", "city", "uk_students",
+]
 
-def generate_cards_for_tags(
-    tags: List[str],
-    language: str,
-    count: int,
-) -> List[Dict[str, Any]]:
-    """
-    Синхронная генерация новых карточек через OpenAI.
-    Результат: список словарей формата, подходящего для вставки в таблицу cards:
-    {
-      "title": str,
-      "body": str,
-      "tags": [str, ...],
-      "importance_score": float,
-    }
-    """
+
+def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[Dict[str, Any]]:
     if not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY is not set, skip OpenAI card generation")
         return []
@@ -322,18 +253,22 @@ def generate_cards_for_tags(
 
     system_prompt = (
         "Ты – движок новостной ленты EYYE.\n"
-        "Твоя задача – сгенерировать короткие новостные карточки в одном стиле.\n"
-        "Каждая карточка: цепляющий заголовок и 2–4 абзаца текста.\n"
-        "Пиши на языке, указанном в параметрах (ru или en).\n"
-        "Отвечай строго валидным JSON без лишнего текста.\n"
-        "Структура JSON:\n"
+        "Сгенерируй короткие новостные карточки.\n"
+        "Каждая карточка: заголовок + 2–4 абзаца текста.\n"
+        "Пиши на языке параметра (ru или en).\n"
+        "Отвечай строго валидным JSON без лишнего текста.\n\n"
+        "Теги можно использовать ТОЛЬКО из этого списка:\n"
+        + ", ".join(ALLOWED_TAGS_CANONICAL)
+        + "\n\n"
+        "JSON-структура:\n"
         "{\n"
         '  \"cards\": [\n'
         "    {\n"
-        '      \"title\": \"Заголовок\",\n'
-        '      \"body\": \"Текст карточки (2–4 абзаца)\",\n'
-        '      \"tags\": [\"один_из_тегов_из_списка\"],\n'
-        '      \"importance_score\": 1.0\n'
+        '      \"title\": \"...\",\n'
+        '      \"body\": \"...\",\n'
+        '      \"tags\": [\"world_news\"],\n'
+        '      \"importance_score\": 0.7,\n'
+        '      \"language\": \"ru\"\n'
         "    }\n"
         "  ]\n"
         "}\n"
@@ -345,7 +280,7 @@ def generate_cards_for_tags(
         "tags": tags,
         "requirements": [
             "Карточки должны быть интересными и понятными.",
-            "Не выдумывай точные факты про конкретных реальных людей, лучше описывай общие тренды.",
+            "Не выдумывай точные факты про конкретных реальных людей.",
             "Избегай кликбейта, но делай заголовки цепляющими.",
         ],
     }
@@ -358,7 +293,6 @@ def generate_cards_for_tags(
         ],
         "max_output_tokens": 1200,
         "temperature": 0.7,
-        # Даже если модель забьёт на это, это не сломает совместимость
         "response_format": {"type": "json_object"},
     }
 
@@ -375,65 +309,34 @@ def generate_cards_for_tags(
         logger.error("Empty content in OpenAI cards response")
         return []
 
-    logger.debug(
-        "OpenAI cards raw content (first %d chars): %s",
-        200,
-        content_str[:200].replace("\n", " "),
-    )
-
     raw_cards: List[Dict[str, Any]] = []
-
-    # 1) Пробуем честный json.loads(content_str)
     try:
         parsed = json.loads(content_str)
         if isinstance(parsed, dict):
             raw_cards = parsed.get("cards") or parsed.get("items") or []
         elif isinstance(parsed, list):
             raw_cards = parsed
-        else:
-            logger.warning("Parsed card JSON is not dict/list, got %s", type(parsed))
-            raw_cards = []
     except json.JSONDecodeError:
-        logger.warning(
-            "Failed to json.loads OpenAI content directly, trying loose JSON parse",
-            exc_info=True,
-        )
         parsed_loose = _try_loose_json_parse(content_str)
         if parsed_loose is not None:
             raw_cards = parsed_loose.get("cards") or parsed_loose.get("items") or []
-        else:
-            raw_cards = []
 
-    # 2) Если до сих пор пусто — задействуем salvage по тексту
     if not raw_cards:
-        logger.error(
-            "Card list is empty after JSON parsing, trying salvage parser on raw text"
-        )
         raw_cards = _parse_openai_cards_from_text(content_str, tags)
         if not raw_cards:
-            logger.error("Salvage parser did not find any valid card items.")
             return []
-        logger.warning(
-            "Salvage parser recovered %d card items from broken JSON.",
-            len(raw_cards),
-        )
 
     result: List[Dict[str, Any]] = []
     for c in raw_cards:
         if not isinstance(c, dict):
             continue
-
         title = str(c.get("title", "")).strip()
         body = str(c.get("body") or c.get("summary") or "").strip()
         if not title or not body:
-            # если salvage уже подставил body/title, сюда не попадём,
-            # но для честного JSON лучше фильтровать
             continue
-
         card_tags = c.get("tags") or tags
         if not isinstance(card_tags, list):
             card_tags = [str(card_tags)] if card_tags else tags
-
         try:
             importance = float(c.get("importance_score", c.get("importance", 1.0)))
         except (TypeError, ValueError):
@@ -445,6 +348,7 @@ def generate_cards_for_tags(
                 "body": body,
                 "tags": [str(t).strip() for t in card_tags if t],
                 "importance_score": importance,
+                "language": language,
             }
         )
 
@@ -456,9 +360,6 @@ def generate_cards_for_tags(
 # ==========
 
 def _normalize_tag_list(tags: Any) -> List[str]:
-    """
-    Нормализует поле tags к списку строк в нижнем регистре.
-    """
     if not tags:
         return []
     if isinstance(tags, str):
@@ -474,7 +375,6 @@ def _normalize_tag_list(tags: Any) -> List[str]:
         if v:
             result.append(v)
 
-    # убираем дубликаты, сохраняя порядок
     seen = set()
     deduped: List[str] = []
     for t in result:
@@ -484,27 +384,9 @@ def _normalize_tag_list(tags: Any) -> List[str]:
     return deduped
 
 
-def normalize_telegram_post(
-    raw_text: str,
-    channel_title: str,
-    language: str = "ru",
-) -> Dict[str, Any]:
-    """
-    Нормализация сырого Telegram-поста в EYYE-карточку с помощью OpenAI.
-
-    Возвращает dict:
-      {
-        "title": str,
-        "body": str,
-        "tags": [str, ...],
-        "importance_score": float,
-        "language": str,
-        "source_name": Optional[str],
-      }
-    """
+def normalize_telegram_post(raw_text: str, channel_title: str, language: str = "ru") -> Dict[str, Any]:
     if not OPENAI_API_KEY:
         logger.warning("OPENAI_API_KEY is not set, skip normalize_telegram_post")
-        # Минимальный фоллбек: тупо заворачиваем сырой текст
         first_line = (raw_text or "").strip().split("\n")[0] or "Новость"
         return {
             "title": first_line[:200],
@@ -517,43 +399,36 @@ def normalize_telegram_post(
 
     system_prompt = (
         "Ты модуль нормализации новостной ленты EYYE.\n"
-        "На вход ты получаешь сырой пост из Telegram-канала и название канала.\n"
-        "Твоя задача — вернуть ОДНУ аккуратную новостную карточку в формате JSON.\n\n"
+        "Верни ОДНУ аккуратную новостную карточку в формате JSON.\n\n"
         "Правила:\n"
-        "1) НЕ придумывай новости, работай только с предоставленным текстом.\n"
-        "2) title — одно краткое предложение, передающее суть новости без кликбейта.\n"
-        "3) body — 2–4 абзаца по 1–3 предложения, без воды, без эмодзи, без обращений к читателю.\n"
-        "4) tags — список из 1–6 тематических тегов.\n"
-        "   Используй ТОЛЬКО следующий список тегов (строго так, латиницей, нижний регистр):\n"
+        "1) НЕ придумывай новости.\n"
+        "2) title — одно краткое предложение без кликбейта.\n"
+        "3) body — 2–4 абзаца по 1–3 предложения, без эмодзи.\n"
+        "4) tags — 1–6 тегов только из списка:\n"
         "   world_news, business, finance, tech, science, history, politics, society,\n"
         "   entertainment, gaming, sports, lifestyle, education, city, uk_students.\n"
-        "   Выбирай теги, которые лучше всего описывают новость; если ничего не подходит,\n"
-        "   используй world_news.\n"
-        "5) importance_score — число от 0 до 1 (0.1 — мелкая заметка, 0.9 — очень важная/масштабная новость).\n"
-        "6) language — ISO-код исходного языка ('ru', 'en' и т.п.).\n"
-        "7) source_name — заполняй ТОЛЬКО если в тексте явно есть название издания/бренда\n"
-        "   (например, 'Bloomberg', 'Reuters', 'Медуза', 'РБК', 'Forbes' и т.п.). Ничего не выдумывай.\n"
-        "8) НЕ упоминай Telegram, каналы, подписи вида 'подпишись', 'читать в полном виде' и т.п.\n"
-        "9) Стиль текста — как у коротких новостных заметок независимого медиа (в духе Meduza / Meduza LIVE):\n"
-        "   нейтральный тон, без оценочных суждений, компактно и по делу.\n\n"
-        "Верни СТРОГО один JSON-объект БЕЗ пояснений вокруг."
+        "5) importance_score — 0..1\n"
+        "6) language — 'ru'/'en'...\n"
+        "7) source_name — только если явно есть название издания в тексте.\n"
+        "8) НЕ упоминай Telegram.\n"
+        "Верни СТРОГО один JSON-объект."
     )
 
     user_prompt = (
         f"Язык оригинала (hint): {language}\n"
         f"Название Telegram-канала: {channel_title}\n\n"
-        "Сырой текст поста из Telegram:\n"
+        "Сырой текст поста:\n"
         "-------------------\n"
         f"{(raw_text or '').strip()}\n"
         "-------------------\n\n"
-        "Верни JSON вида:\n"
+        "Верни JSON:\n"
         "{\n"
         '  \"title\": \"...\",\n'
         '  \"body\": \"...\",\n'
         '  \"tags\": [\"world_news\"],\n'
         '  \"importance_score\": 0.7,\n'
         '  \"language\": \"ru\",\n'
-        '  \"source_name\": \"...\" // опционально\n'
+        '  \"source_name\": \"...\"\n'
         "}"
     )
 
@@ -571,13 +446,8 @@ def normalize_telegram_post(
     started = time.monotonic()
     resp_json = call_openai_chat(payload)
     elapsed = time.monotonic() - started
-    logger.info(
-        "OpenAI normalize_telegram_post call finished in %.2fs (channel_title=%r)",
-        elapsed,
-        channel_title,
-    )
+    logger.info("OpenAI normalize_telegram_post call finished in %.2fs (channel_title=%r)", elapsed, channel_title)
 
-    # Фоллбек, если совсем ничего не вернулось
     first_line = (raw_text or "").strip().split("\n")[0] or "Новость"
     fallback = {
         "title": first_line[:200],
@@ -593,30 +463,19 @@ def normalize_telegram_post(
 
     content_str = _extract_message_content(resp_json)
     if not content_str.strip():
-        logger.error("Empty content in normalize_telegram_post response")
         return fallback
 
-    # Пытаемся честно распарсить JSON
     data: Dict[str, Any] | None = None
     try:
         parsed = json.loads(content_str)
         if isinstance(parsed, dict):
             data = parsed
         elif isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
-            # На всякий случай, если модель вернула список из одного объекта
             data = parsed[0]
     except json.JSONDecodeError:
-        logger.warning(
-            "Failed to json.loads normalize_telegram_post content, trying loose JSON parse",
-            exc_info=True,
-        )
         data = _try_loose_json_parse(content_str)
 
-    # Если JSON так и не распарсился — salvage из текстового блока
     if data is None:
-        logger.error(
-            "normalize_telegram_post JSON parsing failed, trying salvage via CARD_BLOCK_RE"
-        )
         salvaged_cards = _parse_openai_cards_from_text(content_str, [])
         if salvaged_cards:
             c = salvaged_cards[0]
@@ -637,13 +496,10 @@ def normalize_telegram_post(
                 "language": language,
                 "source_name": None,
             }
-        else:
-            logger.error("normalize_telegram_post salvage parser also failed, using fallback")
-            return fallback
+        return fallback
 
-    # Нормализация полей
-    title = str(data.get("title") or "").strip()
-    body = str(data.get("body") or "").strip()
+    title = str(data.get("title") or "").strip() or fallback["title"]
+    body = str(data.get("body") or "").strip() or fallback["body"]
     tags = _normalize_tag_list(data.get("tags"))
     try:
         importance_score = float(data.get("importance_score", data.get("importance", 0.5)))
@@ -654,11 +510,6 @@ def normalize_telegram_post(
     lang_value = str(data.get("language") or "").strip() or language
     source_name = (data.get("source_name") or "").strip() or None
 
-    if not title:
-        title = fallback["title"]
-    if not body:
-        body = fallback["body"]
-
     return {
         "title": title,
         "body": body,
@@ -666,4 +517,137 @@ def normalize_telegram_post(
         "importance_score": importance_score,
         "language": lang_value,
         "source_name": source_name,
+    }
+
+
+# ==========
+# Нормализация Wikipedia extract → EYYE-карточка (дешёвый режим + why_now)
+# ==========
+
+def normalize_wikipedia_article(
+    *,
+    title_hint: str,
+    raw_text: str,
+    language: str,
+    why_now: str,
+) -> Dict[str, Any]:
+    """
+    Дешёвый нормалайзер под Wikipedia:
+    - короткий output budget
+    - строгий why_now: НЕЛЬЗЯ выдумывать причину — только по переданному why_now
+    """
+    if not OPENAI_API_KEY:
+        first = (title_hint or "").strip() or "Статья"
+        body = (raw_text or "").strip()
+        body = body[:1200] if body else first
+        return {
+            "title": first[:200],
+            "body": body,
+            "tags": [],
+            "importance_score": 0.6,
+            "language": language,
+            "source_name": None,
+            "why_now": why_now,
+        }
+
+    system_prompt = (
+        "Ты нормализуешь выдержку из Wikipedia в формат карточки EYYE.\n"
+        "Важно:\n"
+        "- НЕ выдумывай факты.\n"
+        "- Пиши как короткая новостная заметка: нейтрально, компактно.\n"
+        "- why_now: используй СТРОГО переданный hint, ничего не добавляй от себя.\n"
+        "- tags: только из списка:\n"
+        "  world_news, business, finance, tech, science, history, politics, society,\n"
+        "  entertainment, gaming, sports, lifestyle, education, city, uk_students.\n"
+        "Верни валидный JSON-объект."
+    )
+
+    user_prompt = (
+        f"language: {language}\n"
+        f"title_hint: {title_hint}\n"
+        f"why_now_hint: {why_now}\n\n"
+        "text:\n"
+        "-------------------\n"
+        f"{(raw_text or '').strip()}\n"
+        "-------------------\n\n"
+        "JSON:\n"
+        "{\n"
+        '  \"title\": \"...\",\n'
+        '  \"body\": \"...\",\n'
+        '  \"tags\": [\"world_news\"],\n'
+        '  \"importance_score\": 0.7,\n'
+        '  \"language\": \"ru\",\n'
+        '  \"source_name\": null,\n'
+        '  \"why_now\": \"...\"\n'
+        "}"
+    )
+
+    payload: Dict[str, Any] = {
+        "model": OPENAI_WIKIPEDIA_MODEL or OPENAI_MODEL or "gpt-4.1-mini",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_output_tokens": 420,
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+
+    resp_json = call_openai_chat(payload)
+    if not resp_json:
+        return {
+            "title": (title_hint or "Статья")[:200],
+            "body": (raw_text or "").strip()[:1400],
+            "tags": [],
+            "importance_score": 0.6,
+            "language": language,
+            "source_name": None,
+            "why_now": why_now,
+        }
+
+    content_str = _extract_message_content(resp_json).strip()
+    if not content_str:
+        return {
+            "title": (title_hint or "Статья")[:200],
+            "body": (raw_text or "").strip()[:1400],
+            "tags": [],
+            "importance_score": 0.6,
+            "language": language,
+            "source_name": None,
+            "why_now": why_now,
+        }
+
+    parsed = None
+    try:
+        parsed = json.loads(content_str)
+    except Exception:
+        parsed = _try_loose_json_parse(content_str)
+
+    if not isinstance(parsed, dict):
+        parsed = {}
+
+    out_title = str(parsed.get("title") or "").strip() or (title_hint or "Статья")
+    out_body = str(parsed.get("body") or "").strip() or (raw_text or "").strip()[:1400]
+    out_tags = _normalize_tag_list(parsed.get("tags"))
+    try:
+        out_importance = float(parsed.get("importance_score", 0.6))
+    except Exception:
+        out_importance = 0.6
+    out_importance = max(0.0, min(1.0, out_importance))
+
+    out_lang = str(parsed.get("language") or "").strip() or language
+    out_source = (parsed.get("source_name") or None)
+    if isinstance(out_source, str):
+        out_source = out_source.strip() or None
+
+    out_why = str(parsed.get("why_now") or "").strip() or why_now
+
+    return {
+        "title": out_title[:220],
+        "body": out_body[:2600],
+        "tags": out_tags,
+        "importance_score": out_importance,
+        "language": out_lang,
+        "source_name": out_source,
+        "why_now": out_why,
     }
