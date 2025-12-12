@@ -160,16 +160,18 @@ def _normalize_title_for_duplicate(title: str) -> str:
 
 
 def _extract_source_key(card: Dict[str, Any]) -> str:
-    """
-    Ключ источника для диверсификации – в идеале название медиа/канала.
-    """
     meta = card.get("meta") or {}
+    src_type = (card.get("source_type") or "").strip().lower()
+
+    # Wikipedia как отдельный источник (иначе всё свалится в "EYYE • AI-подборка")
+    if src_type == "wikipedia":
+        wiki_lang = (meta.get("wiki_lang") or "").strip() or "unknown"
+        return f"wikipedia:{wiki_lang}"
+
     source_name = (meta.get("source_name") or "").strip()
     if source_name:
         return source_name
 
-    # Фоллбек – тип источника + ссылка
-    src_type = (card.get("source_type") or "").strip()
     src_ref = (card.get("source_ref") or "").strip()
     if src_type and src_ref:
         return f"{src_type}:{src_ref}"
@@ -178,6 +180,8 @@ def _extract_source_key(card: Dict[str, Any]) -> str:
     if src_ref:
         return src_ref
     return "unknown"
+
+
 
 
 def _extract_main_tag(card: Dict[str, Any], base_tags: List[str]) -> str:
@@ -561,6 +565,134 @@ def _apply_dedup_and_diversity(
     selected: List[Dict[str, Any]] = []
     deferred: List[Dict[str, Any]] = []
     removed_duplicates = 0
+
+    def violates_diversity(
+        current: List[Dict[str, Any]],
+        source_key: str,
+        main_tag: str,
+        card: Dict[str, Any],
+    ) -> bool:
+        window = current[-4:]
+        same_source = 0
+        same_tag = 0
+        for c in window:
+            if _extract_source_key(c) == source_key:
+                same_source += 1
+            if _extract_main_tag(c, base_tags) == main_tag:
+                same_tag += 1
+
+        if same_source >= max_consecutive_source or same_tag >= max_consecutive_tag:
+            return True
+
+        # Wiki-ограничение: в последних WIKI_WINDOW_SIZE карточках не более WIKI_MAX_IN_WINDOW wiki-карт
+        if _is_wikipedia_card(card) and WIKI_WINDOW_SIZE > 0:
+            wiki_window = current[-WIKI_WINDOW_SIZE:]
+            wiki_count = 0
+            for c in wiki_window:
+                if _is_wikipedia_card(c):
+                    wiki_count += 1
+            if wiki_count >= WIKI_MAX_IN_WINDOW:
+                return True
+
+        return False
+
+    # 1) Первый проход: дедуп по заголовкам + диверсификация "здесь и сейчас"
+    for card in ranked:
+        title = (card.get("title") or "").strip()
+        norm_title = _normalize_title_for_duplicate(title)
+
+        if norm_title and norm_title in seen_titles:
+            removed_duplicates += 1
+            continue
+
+        source_key = _extract_source_key(card)
+        main_tag = _extract_main_tag(card, base_tags)
+
+        if violates_diversity(selected, source_key, main_tag, card):
+            deferred.append(card)
+            continue
+
+        selected.append(card)
+        if norm_title:
+            seen_titles.add(norm_title)
+
+    # 2) Второй проход: пробуем домешать deferred
+    still_deferred: List[Dict[str, Any]] = []
+    used_deferred = 0
+
+    for card in deferred:
+        source_key = _extract_source_key(card)
+        main_tag = _extract_main_tag(card, base_tags)
+
+        if violates_diversity(selected, source_key, main_tag, card):
+            still_deferred.append(card)
+            continue
+
+        title = (card.get("title") or "").strip()
+        norm_title = _normalize_title_for_duplicate(title)
+        if norm_title and norm_title in seen_titles:
+            removed_duplicates += 1
+            continue
+
+        selected.append(card)
+        if norm_title:
+            seen_titles.add(norm_title)
+        used_deferred += 1
+
+    # 3) Третий проход: хвост.
+    # Расслабляем source/tag, НО не допускаем 2 wiki подряд, если есть чем разбавить.
+    tail_queue = list(still_deferred)
+    tail_added = 0
+    rotations = 0
+    max_rotations = max(len(tail_queue) * 2, 50)
+
+    while tail_queue and rotations < max_rotations:
+        card = tail_queue.pop(0)
+
+        title = (card.get("title") or "").strip()
+        norm_title = _normalize_title_for_duplicate(title)
+        if norm_title and norm_title in seen_titles:
+            removed_duplicates += 1
+            continue
+
+        # 🚫 запрет wiki-wiki подряд (если можно — прокручиваем в конец очереди)
+        if selected and _is_wikipedia_card(selected[-1]) and _is_wikipedia_card(card):
+            tail_queue.append(card)
+            rotations += 1
+            continue
+
+        selected.append(card)
+        if norm_title:
+            seen_titles.add(norm_title)
+        tail_added += 1
+        rotations = 0  # есть прогресс — сброс
+
+    # Если остались карточки (обычно когда остались только wiki) — докидываем как есть (последний fallback)
+    for card in tail_queue:
+        title = (card.get("title") or "").strip()
+        norm_title = _normalize_title_for_duplicate(title)
+        if norm_title and norm_title in seen_titles:
+            removed_duplicates += 1
+            continue
+        selected.append(card)
+        if norm_title:
+            seen_titles.add(norm_title)
+        tail_added += 1
+
+    debug_postprocess = {
+        "initial": total_ranked_raw,
+        "after_dedup_and_diversity": len(selected),
+        "removed_as_duplicates": removed_duplicates,
+        "deferred_count": len(deferred),
+        "used_deferred": used_deferred,
+        "tail_added": tail_added,
+        "total_ranked_raw": total_ranked_raw,
+        "wiki_window_size": WIKI_WINDOW_SIZE,
+        "wiki_max_in_window": WIKI_MAX_IN_WINDOW,
+    }
+
+    return selected, debug_postprocess
+
 
     def violates_diversity(
         current: List[Dict[str, Any]],
