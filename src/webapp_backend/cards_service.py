@@ -152,18 +152,35 @@ def _normalize_title_for_duplicate(title: str) -> str:
     if not title:
         return ""
     t = title.lower()
-    # выкидываем простую пунктуацию
     for ch in ",.!?;:«»\"'()[]{}—–-":
         t = t.replace(ch, " ")
     t = " ".join(t.split())
     return t
 
 
+def _tg_channel_from_ref(ref: str) -> str | None:
+    """
+    Пытаемся достать tg channel из https://t.me/<channel>/<msg_id>
+    """
+    if not ref:
+        return None
+    ref = ref.strip()
+    if "t.me/" not in ref:
+        return None
+    try:
+        tail = ref.split("t.me/", 1)[1]
+        channel = tail.split("/", 1)[0].strip()
+        return channel or None
+    except Exception:
+        return None
+
+
 def _extract_source_key(card: Dict[str, Any]) -> str:
     meta = card.get("meta") or {}
     src_type = (card.get("source_type") or "").strip().lower()
+    src_ref = (card.get("source_ref") or "").strip()
 
-    # Wikipedia как отдельный источник (иначе всё свалится в "EYYE • AI-подборка")
+    # Wikipedia как отдельный источник
     if src_type == "wikipedia":
         wiki_lang = (meta.get("wiki_lang") or "").strip() or "unknown"
         return f"wikipedia:{wiki_lang}"
@@ -172,7 +189,12 @@ def _extract_source_key(card: Dict[str, Any]) -> str:
     if source_name:
         return source_name
 
-    src_ref = (card.get("source_ref") or "").strip()
+    # ✅ Telegram: если meta.source_name нет — берём @channel из ссылки
+    if src_type == "telegram" and src_ref:
+        ch = _tg_channel_from_ref(src_ref)
+        if ch:
+            return f"tg:{ch}"
+
     if src_type and src_ref:
         return f"{src_type}:{src_ref}"
     if src_type:
@@ -180,8 +202,6 @@ def _extract_source_key(card: Dict[str, Any]) -> str:
     if src_ref:
         return src_ref
     return "unknown"
-
-
 
 
 def _extract_main_tag(card: Dict[str, Any], base_tags: List[str]) -> str:
@@ -347,8 +367,7 @@ def _load_user_topic_weights(
 
     Возвращаем:
       - weights: {tag -> weight}
-      - rows: сырые строки [{"tag": ..., "weight": ...}, ...] — их будем
-        передавать в build_base_tags_from_weights.
+      - rows: сырые строки [{"tag": ..., "weight": ...}, ...]
     """
     weights: Dict[str, float] = {}
     rows: List[Dict[str, Any]] = []
@@ -417,8 +436,6 @@ def _mark_cards_as_seen(
         return 0
 
     try:
-        # Обычно Supabase возвращает вставленные строки,
-        # но на всякий случай обрабатываем оба варианта.
         resp = supabase.table("user_seen_cards").insert(payload).execute()
     except Exception:
         logger.exception("Error inserting user_seen_cards for user_id=%s", user_id)
@@ -431,7 +448,6 @@ def _mark_cards_as_seen(
     if isinstance(data, list):
         inserted = len(data)
     else:
-        # если вернули что-то иное (или returning=minimal) – считаем по payload
         inserted = len(payload)
 
     logger.info(
@@ -482,7 +498,7 @@ def _score_cards_for_user(
         for t in card_tags:
             interest_score += float(topic_weights.get(t, 0.0))
 
-        # Бонус за совпадение с тегами онбординга (простой fallback)
+        # Бонус за совпадение с тегами онбординга
         overlap_count = sum(1 for t in card_tags if t in base_tag_set)
         overlap_bonus = 0.3 * overlap_count
 
@@ -509,13 +525,9 @@ def _score_cards_for_user(
             uid = int(user_id or 0)
             seed_str = f"{uid}:{cid}:{today_str}"
             h = hashlib.sha256(seed_str.encode("utf-8")).digest()
-            # Значение в диапазоне [0, 1]
             value = int.from_bytes(h[:4], "big") / float(2**32 - 1)
-            # Преобразуем в [-1, 1] и масштабируем
             rand_bonus = (value * 2.0 - 1.0) * FEED_RANDOMNESS_STRENGTH
 
-        # Финальный скор: интересы пользователя доминируют,
-        # importance и свежесть — поддерживающие факторы.
         score = (
             importance
             + 1.5 * interest_score
@@ -537,14 +549,9 @@ def _apply_dedup_and_diversity(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Постобработка уже отсортированного списка:
-    - убираем дубли по заголовкам;
-    - стараемся развести карточки по источникам и основным тегам;
-    - контролируем долю Wikipedia-карточек:
-      по умолчанию не более 1 wiki-карточки в окне из 4 подряд (≈ 25% ленты локально);
-    - НО при этом не выбрасываем карточки полностью, а сначала откладываем
-      и пытаемся вставить позже, затем — в хвост.
-
-    Важно: дублям по заголовкам всё равно запрещено попадать в итоговый список.
+    - дедуп по заголовку + дедуп по "fingerprint" (title+body);
+    - диверсификация по ИСТОЧНИКУ/ТЕГУ (контроль подряд);
+    - ограничение доли Wikipedia в локальном окне.
     """
     if not ranked:
         return [], {
@@ -562,100 +569,126 @@ def _apply_dedup_and_diversity(
     total_ranked_raw = len(ranked)
 
     seen_titles: Set[str] = set()
+    seen_fps: Set[str] = set()
     selected: List[Dict[str, Any]] = []
     deferred: List[Dict[str, Any]] = []
     removed_duplicates = 0
 
-    def violates_diversity(
-        current: List[Dict[str, Any]],
-        source_key: str,
-        main_tag: str,
-        card: Dict[str, Any],
-    ) -> bool:
-        window = current[-4:]
-        same_source = 0
-        same_tag = 0
-        for c in window:
-            if _extract_source_key(c) == source_key:
-                same_source += 1
-            if _extract_main_tag(c, base_tags) == main_tag:
-                same_tag += 1
+    def _fingerprint(card: Dict[str, Any]) -> str:
+        t = _normalize_title_for_duplicate((card.get("title") or "").strip())
+        b = _normalize_title_for_duplicate(((card.get("body") or "")[:280]).strip())
+        s = f"{t}|{b}"
+        return hashlib.sha1(s.encode("utf-8")).hexdigest()
 
-        if same_source >= max_consecutive_source or same_tag >= max_consecutive_tag:
+    def _consecutive_tail_count(current: List[Dict[str, Any]], kind: str, value: str) -> int:
+        n = 0
+        for c in reversed(current):
+            v = _extract_source_key(c) if kind == "source" else _extract_main_tag(c, base_tags)
+            if v == value:
+                n += 1
+            else:
+                break
+        return n
+
+    def violates(current: List[Dict[str, Any]], card: Dict[str, Any], strict: bool = True) -> bool:
+        source_key = _extract_source_key(card)
+        main_tag = _extract_main_tag(card, base_tags)
+
+        # подряд по источнику/тегу
+        if _consecutive_tail_count(current, "source", source_key) >= max_consecutive_source:
+            return True
+        if _consecutive_tail_count(current, "tag", main_tag) >= max_consecutive_tag:
             return True
 
-        # Wiki-ограничение: в последних WIKI_WINDOW_SIZE карточках не более WIKI_MAX_IN_WINDOW wiki-карт
+        # Wiki quota (локально)
         if _is_wikipedia_card(card) and WIKI_WINDOW_SIZE > 0:
             wiki_window = current[-WIKI_WINDOW_SIZE:]
-            wiki_count = 0
-            for c in wiki_window:
-                if _is_wikipedia_card(c):
-                    wiki_count += 1
+            wiki_count = sum(1 for c in wiki_window if _is_wikipedia_card(c))
             if wiki_count >= WIKI_MAX_IN_WINDOW:
                 return True
 
+        # в строгом режиме запретим wiki-wiki подряд
+        if strict and current and _is_wikipedia_card(current[-1]) and _is_wikipedia_card(card):
+            return True
+
         return False
 
-    # 1) Первый проход: дедуп по заголовкам + диверсификация "здесь и сейчас"
+    # 1) основной проход: дедуп + строгая диверсификация
     for card in ranked:
         title = (card.get("title") or "").strip()
         norm_title = _normalize_title_for_duplicate(title)
+        fp = _fingerprint(card)
 
         if norm_title and norm_title in seen_titles:
             removed_duplicates += 1
             continue
+        if fp in seen_fps:
+            removed_duplicates += 1
+            continue
 
-        source_key = _extract_source_key(card)
-        main_tag = _extract_main_tag(card, base_tags)
-
-        if violates_diversity(selected, source_key, main_tag, card):
+        if violates(selected, card, strict=True):
             deferred.append(card)
             continue
 
         selected.append(card)
         if norm_title:
             seen_titles.add(norm_title)
+        seen_fps.add(fp)
 
-    # 2) Второй проход: пробуем домешать deferred
+    # 2) домешиваем deferred (строго)
     still_deferred: List[Dict[str, Any]] = []
     used_deferred = 0
 
     for card in deferred:
-        source_key = _extract_source_key(card)
-        main_tag = _extract_main_tag(card, base_tags)
-
-        if violates_diversity(selected, source_key, main_tag, card):
-            still_deferred.append(card)
-            continue
-
         title = (card.get("title") or "").strip()
         norm_title = _normalize_title_for_duplicate(title)
+        fp = _fingerprint(card)
+
         if norm_title and norm_title in seen_titles:
             removed_duplicates += 1
+            continue
+        if fp in seen_fps:
+            removed_duplicates += 1
+            continue
+
+        if violates(selected, card, strict=True):
+            still_deferred.append(card)
             continue
 
         selected.append(card)
         if norm_title:
             seen_titles.add(norm_title)
+        seen_fps.add(fp)
         used_deferred += 1
 
-    # 3) Третий проход: хвост.
-    # Расслабляем source/tag, НО не допускаем 2 wiki подряд, если есть чем разбавить.
-    tail_queue = list(still_deferred)
+    # 3) хвост: расслабляем, но не даём длинных серий по источнику
     tail_added = 0
+    tail_queue = list(still_deferred)
     rotations = 0
-    max_rotations = max(len(tail_queue) * 2, 50)
+    max_rot = max(len(tail_queue) * 2, 50)
 
-    while tail_queue and rotations < max_rotations:
+    while tail_queue and rotations < max_rot:
         card = tail_queue.pop(0)
 
         title = (card.get("title") or "").strip()
         norm_title = _normalize_title_for_duplicate(title)
+        fp = _fingerprint(card)
+
         if norm_title and norm_title in seen_titles:
             removed_duplicates += 1
             continue
+        if fp in seen_fps:
+            removed_duplicates += 1
+            continue
 
-        # 🚫 запрет wiki-wiki подряд (если можно — прокручиваем в конец очереди)
+        # хвостовой лимит: максимум 3 подряд одного источника
+        src = _extract_source_key(card)
+        if _consecutive_tail_count(selected, "source", src) >= max(max_consecutive_source, 3):
+            tail_queue.append(card)
+            rotations += 1
+            continue
+
+        # wiki-wiki подряд избегаем если можно
         if selected and _is_wikipedia_card(selected[-1]) and _is_wikipedia_card(card):
             tail_queue.append(card)
             rotations += 1
@@ -664,132 +697,25 @@ def _apply_dedup_and_diversity(
         selected.append(card)
         if norm_title:
             seen_titles.add(norm_title)
+        seen_fps.add(fp)
         tail_added += 1
-        rotations = 0  # есть прогресс — сброс
+        rotations = 0
 
-    # Если остались карточки (обычно когда остались только wiki) — докидываем как есть (последний fallback)
+    # последний fallback: докидываем остаток (без дублей)
     for card in tail_queue:
         title = (card.get("title") or "").strip()
         norm_title = _normalize_title_for_duplicate(title)
+        fp = _fingerprint(card)
         if norm_title and norm_title in seen_titles:
+            removed_duplicates += 1
+            continue
+        if fp in seen_fps:
             removed_duplicates += 1
             continue
         selected.append(card)
         if norm_title:
             seen_titles.add(norm_title)
-        tail_added += 1
-
-    debug_postprocess = {
-        "initial": total_ranked_raw,
-        "after_dedup_and_diversity": len(selected),
-        "removed_as_duplicates": removed_duplicates,
-        "deferred_count": len(deferred),
-        "used_deferred": used_deferred,
-        "tail_added": tail_added,
-        "total_ranked_raw": total_ranked_raw,
-        "wiki_window_size": WIKI_WINDOW_SIZE,
-        "wiki_max_in_window": WIKI_MAX_IN_WINDOW,
-    }
-
-    return selected, debug_postprocess
-
-
-    def violates_diversity(
-        current: List[Dict[str, Any]],
-        source_key: str,
-        main_tag: str,
-        card: Dict[str, Any],
-    ) -> bool:
-        # Смотрим на последние несколько карточек
-        window = current[-4:]
-        same_source = 0
-        same_tag = 0
-        for c in window:
-            if _extract_source_key(c) == source_key:
-                same_source += 1
-            if _extract_main_tag(c, base_tags) == main_tag:
-                same_tag += 1
-
-        if same_source >= max_consecutive_source or same_tag >= max_consecutive_tag:
-            return True
-
-        # Дополнительное правило для Wikipedia:
-        # среди последних WIKI_WINDOW_SIZE карточек не должно быть больше
-        # WIKI_MAX_IN_WINDOW wiki-карт.
-        if _is_wikipedia_card(card) and WIKI_WINDOW_SIZE > 0:
-            wiki_window = current[-WIKI_WINDOW_SIZE:]
-            wiki_count = 0
-            for c in wiki_window:
-                if _is_wikipedia_card(c):
-                    wiki_count += 1
-            if wiki_count >= WIKI_MAX_IN_WINDOW:
-                return True
-
-        return False
-
-    # Первый проход: отбираем всё, что:
-    # - не дубликат по заголовку;
-    # - не ломает диверсификацию "здесь и сейчас".
-    for card in ranked:
-        title = (card.get("title") or "").strip()
-        norm_title = _normalize_title_for_duplicate(title)
-
-        # Жёсткий дедуп по заголовкам
-        if norm_title and norm_title in seen_titles:
-            removed_duplicates += 1
-            continue
-
-        source_key = _extract_source_key(card)
-        main_tag = _extract_main_tag(card, base_tags)
-
-        if violates_diversity(selected, source_key, main_tag, card):
-            # Откладываем, попробуем вставить позже
-            deferred.append(card)
-            continue
-
-        selected.append(card)
-        if norm_title:
-            seen_titles.add(norm_title)
-
-    # Второй проход: пробуем домешать отложенные карточки
-    still_deferred: List[Dict[str, Any]] = []
-    used_deferred = 0
-
-    for card in deferred:
-        source_key = _extract_source_key(card)
-        main_tag = _extract_main_tag(card, base_tags)
-
-        if violates_diversity(selected, source_key, main_tag, card):
-            # Всё ещё ломает диверсификацию – пока держим отдельно
-            still_deferred.append(card)
-            continue
-
-        title = (card.get("title") or "").strip()
-        norm_title = _normalize_title_for_duplicate(title)
-        if norm_title and norm_title in seen_titles:
-            removed_duplicates += 1
-            continue
-
-        selected.append(card)
-        if norm_title:
-            seen_titles.add(norm_title)
-        used_deferred += 1
-
-    # Третий проход: всё, что так и не вписалось по "красоте",
-    # просто докидываем в хвост (кроме дублей по заголовкам).
-    # Здесь мы уже НЕ применяем ограничения по источнику/тегам,
-    # но по-прежнему соблюдаем дедуп по заголовкам.
-    tail_added = 0
-    for card in still_deferred:
-        title = (card.get("title") or "").strip()
-        norm_title = _normalize_title_for_duplicate(title)
-        if norm_title and norm_title in seen_titles:
-            removed_duplicates += 1
-            continue
-
-        selected.append(card)
-        if norm_title:
-            seen_titles.add(norm_title)
+        seen_fps.add(fp)
         tail_added += 1
 
     debug_postprocess = {
@@ -821,24 +747,12 @@ def _insert_cards_into_db(
 ) -> List[Dict[str, Any]]:
     """
     Вставляем сгенерированные/переформатированные карточки в таблицу cards.
-
-    Приоритет источника:
-    1) c["source_name"] / c["source"] / c["channel_name"], если модель вернула.
-    2) fallback_source_name (например, название телеграм-канала, из которого мы спарсили пост).
-    3) DEFAULT_SOURCE_NAME ("EYYE • AI-подборка") — только если нет реального источника.
-
-    language / source_type / source_ref:
-    - language: язык карточки ("ru", "en", ...) — можно указать по умолчанию
-      или положить в саму карточку c["language"].
-    - source_type: "telegram", "rss", "llm", "wikipedia" и т.п.
-    - source_ref: например, ссылка или message_id канала.
     """
     if not cards:
         return []
 
     payload: List[Dict[str, Any]] = []
 
-    # Язык по умолчанию, если в самой карточке не указан
     default_lang: str | None
     if isinstance(language, str):
         default_lang = language.strip() or None
@@ -860,7 +774,6 @@ def _insert_cards_into_db(
         except (TypeError, ValueError):
             importance = 1.0
 
-        # 1) Пытаемся взять источник из ответа модели / препроцессора
         raw_source_name = (
             c.get("source_name")
             or c.get("source")
@@ -868,21 +781,17 @@ def _insert_cards_into_db(
             or c.get("channel_title")
         )
 
-        # 2) Если модель ничего не дала — используем fallback_source_name
         if not raw_source_name and fallback_source_name:
             raw_source_name = fallback_source_name
 
-        # 3) Если вообще ничего нет — используем дефолтный источник для чистого LLM
         if not raw_source_name:
             raw_source_name = DEFAULT_SOURCE_NAME
 
         source_name = str(raw_source_name).strip()
 
-        # Если у самой карточки есть source_ref/url — используем его как референс
         card_source_ref = c.get("source_ref") or c.get("url") or c.get("link")
         final_source_ref = source_ref or card_source_ref
 
-        # Язык карточки: сначала из самой карточки, потом дефолт, потом "ru"
         card_lang_raw = c.get("language")
         if isinstance(card_lang_raw, str):
             card_lang = card_lang_raw.strip() or None
@@ -936,10 +845,6 @@ def build_feed_for_user(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
     Основная точка входа для /api/feed.
-
-    Возвращает:
-    - items: список карточек для пользователя (страница с учётом offset/limit)
-    - debug: отладочная информация.
     """
     debug: Dict[str, Any] = {
         "offset": offset,
@@ -980,20 +885,18 @@ def build_feed_for_user(
     page_index = offset // limit
     debug["page_index"] = page_index
 
-    # 1. Загружаем веса интересов пользователя по тегам (user_topic_weights) + base_tags
+    # 1. Загружаем веса интересов пользователя + base_tags
     user_topic_weights, user_topic_rows = _load_user_topic_weights(supabase, user_id)
 
     base_tags: List[str] = []
     used_default_tags = False
 
     if user_topic_rows:
-        # Есть реальные веса по тегам — строим base_tags из них
         base_tags, used_default_tags_from_builder, user_topics_debug = (
             build_base_tags_from_weights(user_topic_rows)
         )
         used_default_tags = used_default_tags_from_builder
     else:
-        # Нет весов (новый пользователь) — используем онбординг или дефолт
         base_tags = get_interest_tags_for_user(supabase, user_id)
         if not base_tags:
             base_tags = DEFAULT_FEED_TAGS
@@ -1016,6 +919,7 @@ def build_feed_for_user(
     debug["base_tags"] = base_tags
     debug["used_default_tags"] = used_default_tags
     debug["user_topic_weights"] = user_topics_debug
+    debug["topic_weights"] = user_topic_weights  # удобно для debug=1
 
     # 2. Загружаем просмотренные карточки
     seen_info = _load_seen_cards_for_user(supabase, user_id)
@@ -1033,50 +937,28 @@ def build_feed_for_user(
         "marked": 0,
     }
 
-    # 3. Собираем кандидатов несколькими "слоями" (tiered fallback)
-    # Берём с запасом: (limit + offset) * 3, чтобы хватило на пропуск offset.
+    # 3. Собираем кандидатов несколькими "слоями"
     fetch_limit = (limit + offset) * 3
-    fetch_limit = max(fetch_limit, limit)  # на всякий случай
+    fetch_limit = max(fetch_limit, limit)
     fetch_limit = min(fetch_limit, FEED_MAX_FETCH_LIMIT)
 
     mixed_tags = sorted({*base_tags, *DEFAULT_FEED_TAGS})
 
-    phases_config: List[Dict[str, Any]] = []
+    phases_config: List[Dict[str, Any]] = [
+        {"stage": "personal_recent", "tags": base_tags, "age_hours": FEED_MAX_CARD_AGE_HOURS},
+    ]
 
-    # Персональные теги, свежее окно
-    phases_config.append(
-        {
-            "stage": "personal_recent",
-            "tags": base_tags,
-            "age_hours": FEED_MAX_CARD_AGE_HOURS,
-        }
-    )
-
-    # Персональные теги, широкое окно по времени
     if FEED_WIDE_AGE_HOURS > FEED_MAX_CARD_AGE_HOURS:
         phases_config.append(
-            {
-                "stage": "personal_wide",
-                "tags": base_tags,
-                "age_hours": FEED_WIDE_AGE_HOURS,
-            }
+            {"stage": "personal_wide", "tags": base_tags, "age_hours": FEED_WIDE_AGE_HOURS}
         )
 
-    # Персональные + дефолтные теги
     if mixed_tags and mixed_tags != base_tags:
         phases_config.append(
-            {
-                "stage": "mixed_recent",
-                "tags": mixed_tags,
-                "age_hours": FEED_MAX_CARD_AGE_HOURS,
-            }
+            {"stage": "mixed_recent", "tags": mixed_tags, "age_hours": FEED_MAX_CARD_AGE_HOURS}
         )
         phases_config.append(
-            {
-                "stage": "mixed_wide",
-                "tags": mixed_tags,
-                "age_hours": FEED_WIDE_AGE_HOURS,
-            }
+            {"stage": "mixed_wide", "tags": mixed_tags, "age_hours": FEED_WIDE_AGE_HOURS}
         )
 
     candidates_by_id: Dict[str, Dict[str, Any]] = {}
@@ -1096,8 +978,6 @@ def build_feed_for_user(
             if remaining <= 0:
                 break
 
-            # Фазы без тегов считаем явным fallback (label="fallback"),
-            # поэтому в initial-раунде мы их не задаём.
             if label == "initial" and not tags:
                 phases_debug.append(
                     {
@@ -1137,7 +1017,6 @@ def build_feed_for_user(
                 }
             )
 
-    # Основные фазы (персональные и дефолтные теги)
     _run_phases(phases_config, label="initial")
 
     candidates_all: List[Dict[str, Any]] = list(candidates_by_id.values())
@@ -1147,32 +1026,18 @@ def build_feed_for_user(
 
     required_for_page = offset + limit
 
-    # 3.1. Если даже в широком окне по тегам не хватает кандидатов для этой страницы —
-    # добавляем fallback-фазы "любой тег".
+    # 3.1 fallback "любые теги", если кандидатов мало
     if total_candidates_raw < required_for_page and total_candidates_raw < fetch_limit:
-        fallback_phases: List[Dict[str, Any]] = []
-
-        # Любые теги, широкое окно (например, 30 дней)
-        fallback_phases.append(
-            {
-                "stage": "any_recent_wide",
-                "tags": [],
-                "age_hours": FEED_WIDE_AGE_HOURS,
-            }
-        )
-
-        # Любые теги, вообще без ограничения по времени
-        deep_hours = FEED_DEEP_AGE_HOURS if FEED_DEEP_AGE_HOURS > 0 else 0
-        fallback_phases.append(
+        fallback_phases: List[Dict[str, Any]] = [
+            {"stage": "any_recent_wide", "tags": [], "age_hours": FEED_WIDE_AGE_HOURS},
             {
                 "stage": "any_all_time",
                 "tags": [],
-                "age_hours": deep_hours,
-            }
-        )
+                "age_hours": FEED_DEEP_AGE_HOURS if FEED_DEEP_AGE_HOURS > 0 else 0,
+            },
+        ]
 
         _run_phases(fallback_phases, label="fallback")
-
         candidates_all = list(candidates_by_id.values())
         total_candidates_raw = len(candidates_all)
         debug["total_candidates_raw_after_fallback"] = total_candidates_raw
@@ -1181,7 +1046,7 @@ def build_feed_for_user(
 
     debug["total_candidates_raw"] = total_candidates_raw
 
-    # 4. Если в БД вообще ничего не нашли — пробуем сгенерировать карточки через OpenAI.
+    # 4. Если в БД вообще ничего не нашли — пробуем OpenAI
     if total_candidates_raw == 0:
         if LLM_CARD_GENERATION_ENABLED and openai_is_configured():
             need_count = max(required_for_page * 2, 20)
@@ -1221,9 +1086,7 @@ def build_feed_for_user(
     else:
         debug["reason"] = "cards_from_db"
 
-    # 5. Фильтрация просмотренных карточек.
-    # Сначала пробуем отдать только "unseen", но если их не хватает даже для текущей страницы —
-    # возвращаем весь пул (включая seen), чтобы лента не обрывалась.
+    # 5. Фильтрация просмотренных карточек
     if exclude_ids:
         unseen: List[Dict[str, Any]] = []
         for c in candidates_all:
@@ -1238,18 +1101,16 @@ def build_feed_for_user(
     debug["removed_seen"] = total_candidates_raw - unseen_count
 
     if unseen_count >= required_for_page:
-        # unseen-кандидатов достаточно для этой страницы – используем их.
         candidates = unseen
         debug["seen"]["relaxed"] = False
     else:
-        # unseen недостаточно – используем весь пул кандидатов (seen + unseen).
         candidates = candidates_all
         debug["seen"]["relaxed"] = True
 
     total_candidates = len(candidates)
     debug["total_candidates"] = total_candidates
 
-    # 6. Ранжируем (TikTok-lite) и применяем дедуп/диверсификацию
+    # 6. Ранжируем и применяем дедуп/диверсификацию
     ranked_raw = _score_cards_for_user(
         candidates,
         base_tags,
@@ -1262,7 +1123,7 @@ def build_feed_for_user(
     total_ranked = len(ranked)
     debug["total_ranked"] = total_ranked
 
-    # Дополнительно считаем распределение источников во всём ranked
+    # распределение источников во всём ranked
     source_counts: Dict[str, int] = {}
     wiki_count_total = 0
     for c in ranked:
@@ -1280,7 +1141,7 @@ def build_feed_for_user(
         debug["next_offset"] = None
         return [], debug
 
-    # 7. Пагинация по offset/limit + wrap-around fallback для маленьких корпусов.
+    # 7. Пагинация по offset/limit (БЕЗ wrap, чтобы не было повторов)
     if offset < total_ranked:
         start = offset
         end = min(start + limit, total_ranked)
@@ -1289,21 +1150,12 @@ def build_feed_for_user(
         next_offset = end if has_more else None
         debug["pagination_mode"] = "linear"
     else:
-        # offset вышел за пределы доступных карточек – включаем "круговую" пагинацию,
-        # чтобы лента не обрывалась даже при маленьком количестве контента.
-        wrapped_offset = offset % total_ranked
         page = []
-        idx = wrapped_offset
-        while len(page) < limit and len(page) < total_ranked:
-            page.append(ranked[idx])
-            idx = (idx + 1) % total_ranked
+        has_more = False
+        next_offset = None
+        debug["pagination_mode"] = "end"
 
-        has_more = True  # круговая лента по сути бесконечна
-        next_offset = offset + limit
-        debug["pagination_mode"] = "wrapped"
-        debug["wrapped_offset"] = wrapped_offset
-
-    # Источники только на текущей странице
+    # источники на странице
     page_source_counts: Dict[str, int] = {}
     page_wiki_count = 0
     for c in page:
@@ -1318,7 +1170,7 @@ def build_feed_for_user(
     debug["has_more"] = has_more
     debug["next_offset"] = next_offset
 
-    # 8. Отмечаем карточки как просмотренные
+    # 8. Отмечаем карточки как просмотренные (как сейчас в MVP)
     seen_marked = _mark_cards_as_seen(supabase, user_id, page)
     debug["seen"]["marked"] = int(seen_marked)
 
@@ -1333,18 +1185,12 @@ def build_feed_for_user_paginated(
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
     """
     Обёртка над build_feed_for_user с явными метаданными пагинации.
-
-    Возвращает:
-    - items: карточки для текущей "страницы"
-    - debug: отладочная информация (reason, base_tags, offset, limit, has_more, ...)
-    - cursor: метаданные пагинации (offset, next_offset, has_more)
     """
     if limit is None or limit <= 0:
         limit = FEED_CARDS_LIMIT_DEFAULT
     limit = min(max(limit, 1), 50)
     offset = max(0, int(offset))
 
-    # Используем базовую функцию, которая уже умеет учитывать offset/limit
     items, base_debug = build_feed_for_user(
         supabase=supabase,
         user_id=user_id,

@@ -1,3 +1,4 @@
+# file: src/webapp_backend/main.py
 import logging
 import os
 from datetime import datetime, timezone
@@ -9,9 +10,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from supabase import Client, create_client
 
-from .cards_service import build_feed_for_user
 from .profile_service import get_profile_summary, save_onboarding
 from .telemetry_service import EventsRequest, log_events
+
+# Важно: используем пагинированный фид с явным курсором
+try:
+    from .cards_service import build_feed_for_user_paginated  # type: ignore
+except Exception:
+    build_feed_for_user_paginated = None  # type: ignore
+    from .cards_service import build_feed_for_user  # type: ignore
 
 logger = logging.getLogger("eyye.webapp_backend")
 logging.basicConfig(level=logging.INFO)
@@ -81,50 +88,9 @@ if SUPABASE_URL and SUPABASE_KEY:
         logger.exception("Failed to init Supabase client")
         supabase = None
 else:
-    logger.warning("Supabase URL/KEY are not set. /api/feed and /api/profile will not work.")
-
-# ==========
-# Optional ranker (must not crash service)
-# ==========
-try:
-    from .feed_ranker import rank_cards_for_user  # type: ignore
-except Exception:
-    rank_cards_for_user = None  # type: ignore
-    logger.info("feed_ranker not available (ok for MVP)")
-
-# ==========
-# Helpers
-# ==========
-def load_user_topic_weights_for_user(tg_id: int) -> Dict[str, float]:
-    if supabase is None:
-        return {}
-
-    try:
-        resp = (
-            supabase.table("user_topic_weights")
-            .select("tag, weight")
-            .eq("tg_id", tg_id)
-            .execute()
-        )
-    except Exception:
-        logger.exception("Failed to load user_topic_weights for tg_id=%s", tg_id)
-        return {}
-
-    rows = getattr(resp, "data", None) or []
-    out: Dict[str, float] = {}
-    for row in rows:
-        tag = row.get("tag")
-        weight = row.get("weight")
-        if not tag:
-            continue
-        try:
-            w = float(weight)
-        except (TypeError, ValueError):
-            continue
-        tag_str = str(tag).strip()
-        if tag_str:
-            out[tag_str] = w
-    return out
+    logger.warning(
+        "Supabase URL/KEY are not set. /api/feed and /api/profile will not work."
+    )
 
 # ==========
 # App
@@ -143,11 +109,16 @@ api = APIRouter(prefix="/api")
 
 @app.on_event("startup")
 async def _startup_log() -> None:
-    logger.info("FastAPI startup OK. ROOT_DIR=%s WEBAPP_DIR=%s", str(ROOT_DIR), str(WEBAPP_DIR))
+    logger.info(
+        "FastAPI startup OK. ROOT_DIR=%s WEBAPP_DIR=%s",
+        str(ROOT_DIR),
+        str(WEBAPP_DIR),
+    )
     if not WEBAPP_DIR.exists():
         logger.warning("WEBAPP_DIR not found: %s", WEBAPP_DIR)
     if not INDEX_HTML_PATH.exists():
         logger.warning("index.html not found at %s", INDEX_HTML_PATH)
+
 
 # ==========
 # Non-API routes
@@ -155,6 +126,7 @@ async def _startup_log() -> None:
 @app.get("/ping")
 async def ping() -> Dict[str, Any]:
     return {"status": "ok", "service": "eyye-webapp-backend"}
+
 
 # ==========
 # API routes
@@ -220,20 +192,22 @@ async def api_feed(
     limit: int = Query(20, ge=1, le=50),
     offset: int = Query(0, ge=0),
 ) -> Dict[str, Any]:
+    """
+    Важно:
+    - Ранжирование + дедуп + диверсификация уже сделаны в cards_service.
+    - НЕ делаем второй ranker здесь (он ломал микс источников и порядок).
+    """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase is not configured")
 
+    if build_feed_for_user_paginated is not None:
+        items, debug, cursor = build_feed_for_user_paginated(
+            supabase, tg_id, limit=limit, offset=offset
+        )
+        return {"items": items, "debug": debug, "cursor": cursor}
+
+    # fallback (если вдруг нет paginated)
     items, debug = build_feed_for_user(supabase, tg_id, limit=limit, offset=offset)
-
-    topic_weights = load_user_topic_weights_for_user(tg_id)
-    if topic_weights and rank_cards_for_user is not None:
-        try:
-            items = rank_cards_for_user(items, topic_weights)
-            debug = debug or {}
-            debug.setdefault("topic_weights", topic_weights)
-        except Exception:
-            logger.exception("Failed to rank feed for tg_id=%s", tg_id)
-
     return {"items": items, "debug": debug}
 
 

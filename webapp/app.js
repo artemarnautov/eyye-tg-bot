@@ -395,23 +395,31 @@
     }
   }
 
-  function loadFeed(initial) {
+  function loadFeed(initial, opts) {
+    opts = opts || {};
+  
+    var force = opts.force === true; // разрешаем загрузку даже если hasMore=false
+    var forceOffsetZero = opts.forceOffsetZero === true; // refresh с offset=0
+    var onDone = typeof opts.onDone === "function" ? opts.onDone : null;
+  
     if (!state.tgId) {
       renderEmptyFeed(
         "Не удалось получить твой Telegram ID. Открой WebApp через кнопку в боте и попробуй снова."
       );
       return;
     }
-
+  
     if (state.loadingFeed) {
       return;
     }
-    if (!initial && !state.hasMore) {
+  
+    // раньше тут был стоп, из-за которого мы зависали на последней карточке
+    if (!initial && !state.hasMore && !force) {
       return;
     }
-
+  
     state.loadingFeed = true;
-
+  
     if (initial) {
       state.feedItems = [];
       state.currentIndex = 0;
@@ -419,10 +427,10 @@
       state.nextOffset = 0;
       state.seenIds = {};
     }
-
+  
     var limit = 20;
-    var offset = state.nextOffset;
-
+    var offset = forceOffsetZero ? 0 : state.nextOffset;
+  
     var url =
       "/api/feed?tg_id=" +
       encodeURIComponent(String(state.tgId)) +
@@ -430,9 +438,9 @@
       String(limit) +
       "&offset=" +
       String(offset);
-
-    logDebug("Loading feed:", url);
-
+  
+    logDebug("Loading feed:", url, "opts:", opts);
+  
     apiFetch(url, { method: "GET" })
       .then(function (resp) {
         if (!resp.ok) {
@@ -441,34 +449,38 @@
             "Не получилось загрузить ленту. Попробуй открыть WebApp чуть позже."
           );
           state.loadingFeed = false;
+          if (onDone) onDone(0, [], null);
           return null;
         }
         return resp.json();
       })
       .then(function (data) {
         if (!data) return;
+  
         var items = data.items || [];
         var debug = data.debug || {};
         logDebug("Feed items batch:", items.length, "debug:", debug);
-
+  
+        // считаем сколько реально добавили (appendNewItems уже делает dedup по seenIds)
+        var beforeLen = state.feedItems.length;
         appendNewItems(items);
-
-        // Используем серверную логику пагинации, если она есть
+        var afterLen = state.feedItems.length;
+        var addedCount = afterLen - beforeLen;
+  
+        // серверная пагинация
         if (typeof debug.has_more === "boolean") {
           state.hasMore = debug.has_more;
         } else {
-          // Fallback на старое поведение
           state.hasMore = items.length >= limit;
         }
-
+  
         if (typeof debug.next_offset === "number") {
           state.nextOffset = debug.next_offset;
         } else {
           state.nextOffset = offset + items.length;
         }
-
+  
         if (state.feedItems.length === 0) {
-          // Спец-сообщение, если сервер честно сказал, что карточек нет
           if (debug.reason === "no_cards") {
             renderEmptyFeed(
               "Пока нет новостей по выбранным темам. Я обновлю ленту, как только появятся свежие карточки."
@@ -477,10 +489,17 @@
             renderEmptyFeed();
           }
         } else {
-          renderCurrentCard();
+          // если это initial или мы ещё ничего не рендерили — покажем карточку
+          if (initial) {
+            renderCurrentCard();
+          }
         }
-
+  
         state.loadingFeed = false;
+  
+        if (onDone) {
+          onDone(addedCount, items, debug);
+        }
       })
       .catch(function (err) {
         logDebug("GET /api/feed error:", err);
@@ -488,8 +507,10 @@
           "Не получилось загрузить ленту. Проверь интернет и попробуй ещё раз."
         );
         state.loadingFeed = false;
+        if (onDone) onDone(0, [], null);
       });
   }
+  
 
   function goToNextCard() {
     if (!state.feedItems || state.feedItems.length === 0) {
