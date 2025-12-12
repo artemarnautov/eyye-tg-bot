@@ -1,4 +1,3 @@
-# file: src/webapp_backend/telemetry_service.py
 import logging
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -152,7 +151,6 @@ def _delta_for_view(dwell_ms: Optional[int]) -> float:
     return 1.2
 
 
-
 def _delta_for_event(ev: Event) -> float:
     """
     Переводим событие в dW по тегам карточки.
@@ -271,35 +269,37 @@ def _insert_user_events(
     """
     Пишем сырые события в таблицу user_events.
 
-    Рекомендуемая схема user_events (для справки):
-    - id (uuid / serial, PK)
-    - tg_id (bigint)
-    - card_id (int)
-    - event_type (text)
-    - event_ts (timestamptz)
-    - dwell_ms (int, nullable)
+    ВАЖНО (фикс текущего прод-бага):
+    - НЕ отправляем event_ts, потому что в твоей таблице user_events сейчас
+      НЕТ колонки event_ts (PGRST204).
+    - Полагаемся на дефолтный created_at в БД (если он есть).
     """
     if not events:
         return
 
-    now = _now_utc()
     payload: List[Dict[str, Any]] = []
-
     for ev in events:
-        ts = ev.ts or now
-        payload.append(
-            {
-                "tg_id": tg_id,
-                "card_id": ev.card_id,
-                "event_type": ev.type,
-                "event_ts": ts.isoformat(),
-                "dwell_ms": ev.dwell_ms,
-            }
-        )
+        row: Dict[str, Any] = {
+            "tg_id": tg_id,
+            "card_id": ev.card_id,
+            "event_type": ev.type,
+        }
+        # dwell_ms полезен только для view, но колонка может быть nullable — оставляем как есть
+        if ev.dwell_ms is not None:
+            row["dwell_ms"] = int(ev.dwell_ms)
+        payload.append(row)
+
+    if not payload:
+        return
 
     try:
         supabase.table("user_events").insert(payload).execute()
-    except Exception:
+    except Exception as e:
+        # Телеметрия не должна ломать UX и не должна спамить огромными трейсами из-за схемы.
+        msg = str(e)
+        if "PGRST204" in msg or "event_ts" in msg:
+            logger.warning("user_events schema mismatch (skipping insert): %s", msg)
+            return
         logger.exception("Failed to insert user_events for tg_id=%s", tg_id)
 
 
@@ -312,10 +312,8 @@ def _insert_seen_cards_from_events(
     Помечаем карточки как увиденные в user_seen_cards,
     если есть событие view с dwell >= 1 секунды.
 
-    Схема user_seen_cards ожидается такой же, как уже используется в cards_service:
-    - user_id (bigint) — Telegram ID
-    - card_id (int)
-    - seen_at (timestamptz)
+    FIX:
+    - Используем upsert по (user_id, card_id), чтобы не ловить 409 duplicate key.
     """
     if not events:
         return
@@ -344,11 +342,13 @@ def _insert_seen_cards_from_events(
         return
 
     try:
-        supabase.table("user_seen_cards").insert(payload).execute()
+        supabase.table("user_seen_cards").upsert(
+            payload,
+            on_conflict="user_id,card_id",
+        ).execute()
     except Exception:
-        # Дубликаты по (user_id, card_id) нам не страшны: cards_service берёт set(card_id)
         logger.exception(
-            "Failed to insert into user_seen_cards for tg_id=%s (rows=%d)",
+            "Failed to upsert into user_seen_cards for tg_id=%s (rows=%d)",
             tg_id,
             len(payload),
         )
