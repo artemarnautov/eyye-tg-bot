@@ -2,6 +2,8 @@
 import logging
 import os
 import hashlib
+import base64
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple, Set
 
@@ -14,39 +16,30 @@ logger = logging.getLogger(__name__)
 
 # ===================== Теги / топики =====================
 
-MAX_BASE_TAGS = 4  # сколько тегов максимум берём в базовый фильтр
-
-# дефолтный набор, если про юзера ещё ничего не знаем
+MAX_BASE_TAGS = 4  # (оставлено для debug/top, но НЕ режем реальный фильтр по интересам)
 DEFAULT_BASE_TAGS = ["entertainment", "society", "business", "politics"]
 
 
-def build_base_tags_from_weights(user_rows: List[Dict[str, Any]]) -> Tuple[List[str], bool, Dict[str, Any]]:
+def build_base_tags_from_weights(
+    user_rows: List[Dict[str, Any]],
+) -> Tuple[List[str], bool, Dict[str, Any]]:
     """
     user_rows: список dict с ключами 'tag' и 'weight' из user_topic_weights.
     Возвращает (base_tags, used_default_tags, debug_info).
     """
     user_rows = user_rows or []
-    debug_info: Dict[str, Any] = {
-        "count": len(user_rows),
-        "top": [],
-    }
+    debug_info: Dict[str, Any] = {"count": len(user_rows), "top": []}
 
     if user_rows:
-        # сортируем по убыванию веса
         sorted_rows = sorted(
             (r for r in user_rows if r.get("tag")),
             key=lambda r: r.get("weight") or 0.0,
             reverse=True,
         )
 
-        # для debug.top оставим первые 5
-        debug_info["top"] = [
-            [r["tag"], float(r.get("weight") or 0.0)] for r in sorted_rows[:5]
-        ]
+        debug_info["top"] = [[r["tag"], float(r.get("weight") or 0.0)] for r in sorted_rows[:5]]
 
         personal_tags: List[str] = []
-
-        # собираем персональные теги (оставляем 1 слот под общие)
         for r in sorted_rows:
             tag = r["tag"]
             if tag not in personal_tags:
@@ -55,15 +48,12 @@ def build_base_tags_from_weights(user_rows: List[Dict[str, Any]]) -> Tuple[List[
                 break
 
         base_tags: List[str] = []
-
-        # сначала персональные
         for tag in personal_tags:
             if len(base_tags) >= MAX_BASE_TAGS:
                 break
             if tag not in base_tags:
                 base_tags.append(tag)
 
-        # добиваем до MAX_BASE_TAGS дефолтными
         for tag in DEFAULT_BASE_TAGS:
             if len(base_tags) >= MAX_BASE_TAGS:
                 break
@@ -72,7 +62,6 @@ def build_base_tags_from_weights(user_rows: List[Dict[str, Any]]) -> Tuple[List[
 
         return base_tags, False, debug_info
 
-    # если по юзеру нет данных — чистый дефолт
     debug_info["top"] = []
     return DEFAULT_BASE_TAGS[:MAX_BASE_TAGS], True, debug_info
 
@@ -81,7 +70,6 @@ def build_base_tags_from_weights(user_rows: List[Dict[str, Any]]) -> Tuple[List[
 
 FEED_CARDS_LIMIT_DEFAULT = int(os.getenv("FEED_CARDS_LIMIT", "20"))
 
-# "Свежее" окно по времени (часов) — по умолчанию 72 часа (3 дня)
 FEED_MAX_CARD_AGE_HOURS = int(os.getenv("FEED_MAX_CARD_AGE_HOURS", "72"))
 
 LLM_CARD_GENERATION_ENABLED = (
@@ -90,34 +78,19 @@ LLM_CARD_GENERATION_ENABLED = (
 
 DEFAULT_FEED_TAGS: List[str] = ["world_news", "business", "tech", "uk_students"]
 
-# Максимальное количество карточек, которое мы вообще готовы тащить в ранжирование
 FEED_MAX_FETCH_LIMIT = int(os.getenv("FEED_MAX_FETCH_LIMIT", "300"))
 
-# Широкое окно по времени для "добора" карточек, если в пределах FEED_MAX_CARD_AGE_HOURS мало.
-# По умолчанию 30 дней (720 часов).
 FEED_WIDE_AGE_HOURS = int(os.getenv("FEED_WIDE_AGE_HOURS", "720"))
-
-# Глубокое окно по времени для all-time fallback (по умолчанию ~1 год).
 FEED_DEEP_AGE_HOURS = int(os.getenv("FEED_DEEP_AGE_HOURS", "8760"))
 
-# Дефолтный источник только для чисто LLM-карточек,
-# когда у нас нет реального канала/СМИ.
 DEFAULT_SOURCE_NAME = os.getenv("DEFAULT_SOURCE_NAME", "EYYE • AI-подборка")
 
 # ===================== Память о просмотренных карточках =====================
 
-# Через сколько дней мы перестаём учитывать просмотренные карточки
 FEED_SEEN_EXCLUDE_DAYS = int(os.getenv("FEED_SEEN_EXCLUDE_DAYS", "7"))
-
-# Грейс-период на "текущую сессию" (минуты)
-FEED_SEEN_SESSION_GRACE_MINUTES = int(
-    os.getenv("FEED_SEEN_SESSION_GRACE_MINUTES", "30")
-)
-
-# Максимум строк просмотренных карточек, которые мы тащим за раз
+FEED_SEEN_SESSION_GRACE_MINUTES = int(os.getenv("FEED_SEEN_SESSION_GRACE_MINUTES", "30"))
 FEED_SEEN_MAX_ROWS = int(os.getenv("FEED_SEEN_MAX_ROWS", "5000"))
 
-# Сила рандома в скоре (0.0–0.5; 0.15 — комфортно)
 try:
     FEED_RANDOMNESS_STRENGTH = float(os.getenv("FEED_RANDOMNESS_STRENGTH", "0.15"))
 except ValueError:
@@ -125,10 +98,30 @@ except ValueError:
 
 # ===================== Настройки для Wikipedia-источника =====================
 
-# В каком окне по длине фрагмента ленты контролируем долю wiki-карт
 WIKI_WINDOW_SIZE = int(os.getenv("FEED_WIKI_WINDOW_SIZE", "4"))
-# Максимальное количество wiki-карт в этом окне (по умолчанию 1 wiki на 4 карточки)
 WIKI_MAX_IN_WINDOW = int(os.getenv("FEED_WIKI_MAX_IN_WINDOW", "1"))
+
+# ===================== Cursor helpers =====================
+
+
+def _encode_cursor(before_id: int | None) -> str | None:
+    if before_id is None:
+        return None
+    raw = json.dumps({"before_id": int(before_id)}, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
+
+
+def _decode_cursor(token: str | None) -> int | None:
+    if not token:
+        return None
+    try:
+        pad = "=" * (-len(token) % 4)
+        raw = base64.urlsafe_b64decode((token + pad).encode("utf-8")).decode("utf-8")
+        obj = json.loads(raw)
+        return _safe_int_id(obj.get("before_id"))
+    except Exception:
+        return None
+
 
 # ===================== Вспомогательные функции =====================
 
@@ -143,12 +136,6 @@ def _safe_int_id(value: Any) -> int | None:
 
 
 def _normalize_title_for_duplicate(title: str) -> str:
-    """
-    Нормализуем заголовок для дедупликации:
-    - нижний регистр;
-    - убираем пунктуацию;
-    - схлопываем пробелы.
-    """
     if not title:
         return ""
     t = title.lower()
@@ -159,9 +146,6 @@ def _normalize_title_for_duplicate(title: str) -> str:
 
 
 def _tg_channel_from_ref(ref: str) -> str | None:
-    """
-    Пытаемся достать tg channel из https://t.me/<channel>/<msg_id>
-    """
     if not ref:
         return None
     ref = ref.strip()
@@ -180,7 +164,6 @@ def _extract_source_key(card: Dict[str, Any]) -> str:
     src_type = (card.get("source_type") or "").strip().lower()
     src_ref = (card.get("source_ref") or "").strip()
 
-    # Wikipedia как отдельный источник
     if src_type == "wikipedia":
         wiki_lang = (meta.get("wiki_lang") or "").strip() or "unknown"
         return f"wikipedia:{wiki_lang}"
@@ -189,7 +172,6 @@ def _extract_source_key(card: Dict[str, Any]) -> str:
     if source_name:
         return source_name
 
-    # ✅ Telegram: если meta.source_name нет — берём @channel из ссылки
     if src_type == "telegram" and src_ref:
         ch = _tg_channel_from_ref(src_ref)
         if ch:
@@ -205,10 +187,6 @@ def _extract_source_key(card: Dict[str, Any]) -> str:
 
 
 def _extract_main_tag(card: Dict[str, Any], base_tags: List[str]) -> str:
-    """
-    Основной тег карточки – для диверсификации по темам.
-    Сначала ищем пересечение с интересами пользователя, потом первый тег.
-    """
     tags = card.get("tags") or []
     if not isinstance(tags, list):
         tags = []
@@ -221,9 +199,6 @@ def _extract_main_tag(card: Dict[str, Any], base_tags: List[str]) -> str:
 
 
 def _is_wikipedia_card(card: Dict[str, Any]) -> bool:
-    """
-    Простая проверка, что карточка из Wikipedia.
-    """
     src_type = (card.get("source_type") or "").strip().lower()
     return src_type == "wikipedia"
 
@@ -237,12 +212,14 @@ def _fetch_candidate_cards(
     limit: int,
     *,
     max_age_hours: int,
+    before_id: int | None = None,
 ) -> List[Dict[str, Any]]:
     """
     Берём кандидатов из таблицы cards:
-    - только is_active = true
-    - только достаточно свежие (created_at >= now - max_age_hours), если max_age_hours > 0
-    - если есть теги, используем overlaps(tags, tags_array).
+    - is_active = true
+    - created_at >= now - max_age_hours (если max_age_hours > 0)
+    - overlaps(tags, tags_array) если tags задан
+    - cursor: id < before_id (если before_id задан)
     """
     if limit <= 0:
         return []
@@ -262,11 +239,19 @@ def _fetch_candidate_cards(
         min_created_at = now - timedelta(hours=max_age_hours)
         query = query.gte("created_at", min_created_at.isoformat())
 
+    if before_id is not None:
+        query = query.lt("id", int(before_id))
+
     if tags:
         query = query.overlaps("tags", tags)
 
     try:
-        resp = query.order("created_at", desc=True).limit(limit).execute()
+        resp = (
+            query.order("created_at", desc=True)
+            .order("id", desc=True)
+            .limit(limit)
+            .execute()
+        )
     except Exception:
         logger.exception("Error fetching candidate cards from Supabase")
         return []
@@ -286,15 +271,6 @@ def _load_seen_cards_for_user(
 ) -> Dict[str, Any]:
     """
     Загружаем из user_seen_cards всё, что пользователь видел за последние FEED_SEEN_EXCLUDE_DAYS.
-    Возвращаем:
-    {
-      "rows": int,
-      "exclude_ids": set[int],
-      "recent_ids": set[int],
-      "window_days": int,
-      "grace_minutes": int,
-      "error": Optional[str],
-    }
     """
     result: Dict[str, Any] = {
         "rows": 0,
@@ -304,10 +280,6 @@ def _load_seen_cards_for_user(
         "grace_minutes": FEED_SEEN_SESSION_GRACE_MINUTES,
         "error": None,
     }
-
-    if supabase is None:
-        result["error"] = "no_supabase"
-        return result
 
     now = datetime.now(timezone.utc)
     window_cutoff = now - timedelta(days=FEED_SEEN_EXCLUDE_DAYS)
@@ -319,6 +291,7 @@ def _load_seen_cards_for_user(
             .select("card_id, seen_at")
             .eq("user_id", user_id)
             .gte("seen_at", window_cutoff.isoformat())
+            .order("seen_at", desc=True)
             .limit(FEED_SEEN_MAX_ROWS)
             .execute()
         )
@@ -364,10 +337,6 @@ def _load_user_topic_weights(
     """
     Загружаем веса интересов по тегам из user_topic_weights.
     tg_id в таблице = user_id (Telegram ID).
-
-    Возвращаем:
-      - weights: {tag -> weight}
-      - rows: сырые строки [{"tag": ..., "weight": ...}, ...]
     """
     weights: Dict[str, float] = {}
     rows: List[Dict[str, Any]] = []
@@ -411,8 +380,7 @@ def _mark_cards_as_seen(
     cards: List[Dict[str, Any]],
 ) -> int:
     """
-    Записываем факт просмотра карточек пользователем в user_seen_cards.
-    Возвращаем количество вставленных строк (по данным Supabase).
+    Записываем просмотр в user_seen_cards через UPSERT (нужен unique index по user_id,card_id).
     """
     if supabase is None or not cards:
         return 0
@@ -424,39 +392,26 @@ def _mark_cards_as_seen(
         cid = _safe_int_id(card.get("id"))
         if cid is None:
             continue
-        payload.append(
-            {
-                "user_id": user_id,
-                "card_id": cid,
-                "seen_at": now,
-            }
-        )
+        payload.append({"user_id": user_id, "card_id": cid, "seen_at": now})
 
     if not payload:
         return 0
 
     try:
-        resp = supabase.table("user_seen_cards").insert(payload).execute()
+        resp = (
+            supabase.table("user_seen_cards")
+            .upsert(payload, on_conflict="user_id,card_id")
+            .execute()
+        )
     except Exception:
-        logger.exception("Error inserting user_seen_cards for user_id=%s", user_id)
+        logger.exception("Error upserting user_seen_cards for user_id=%s", user_id)
         return 0
 
     data = getattr(resp, "data", None)
     if data is None:
         data = getattr(resp, "model", None)
 
-    if isinstance(data, list):
-        inserted = len(data)
-    else:
-        inserted = len(payload)
-
-    logger.info(
-        "Marked %d cards as seen for user_id=%s (payload=%d)",
-        inserted,
-        user_id,
-        len(payload),
-    )
-    return inserted
+    return len(data) if isinstance(data, list) else len(payload)
 
 
 # ===================== Скоринг и постобработка =====================
@@ -468,14 +423,6 @@ def _score_cards_for_user(
     user_id: int | None = None,
     user_topic_weights: Dict[str, float] | None = None,
 ) -> List[Dict[str, Any]]:
-    """
-    TikTok-lite скоринг:
-    - importance_score (базовый вес карточки)
-    - персональные веса по тегам из user_topic_weights
-    - совпадение тегов с интересами онбординга
-    - свежесть
-    - лёгкий детерминированный рандом
-    """
     now = datetime.now(timezone.utc)
     base_tag_set = set(base_tags)
     today_str = now.strftime("%Y-%m-%d")
@@ -493,16 +440,13 @@ def _score_cards_for_user(
         except (TypeError, ValueError):
             importance = 1.0
 
-        # Сигнал по пользовательским весам тегов (user_topic_weights)
         interest_score = 0.0
         for t in card_tags:
             interest_score += float(topic_weights.get(t, 0.0))
 
-        # Бонус за совпадение с тегами онбординга
         overlap_count = sum(1 for t in card_tags if t in base_tag_set)
         overlap_bonus = 0.3 * overlap_count
 
-        # Бонус за свежесть (0..1)
         recency_score = 0.0
         created_at = card.get("created_at")
         if isinstance(created_at, str):
@@ -510,15 +454,12 @@ def _score_cards_for_user(
                 dt = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
                 age_hours = (now - dt).total_seconds() / 3600.0
                 if age_hours < FEED_MAX_CARD_AGE_HOURS:
-                    recency_score = (
-                        FEED_MAX_CARD_AGE_HOURS - age_hours
-                    ) / FEED_MAX_CARD_AGE_HOURS
+                    recency_score = (FEED_MAX_CARD_AGE_HOURS - age_hours) / FEED_MAX_CARD_AGE_HOURS
                 else:
                     recency_score = 0.0
             except Exception:
                 recency_score = 0.0
 
-        # Лёгкий детерминированный рандом для этого пользователя и карточки
         rand_bonus = 0.0
         if FEED_RANDOMNESS_STRENGTH > 0.0:
             cid = _safe_int_id(card.get("id")) or 0
@@ -528,13 +469,7 @@ def _score_cards_for_user(
             value = int.from_bytes(h[:4], "big") / float(2**32 - 1)
             rand_bonus = (value * 2.0 - 1.0) * FEED_RANDOMNESS_STRENGTH
 
-        score = (
-            importance
-            + 1.5 * interest_score
-            + overlap_bonus
-            + recency_score
-            + rand_bonus
-        )
+        score = importance + 1.5 * interest_score + overlap_bonus + recency_score + rand_bonus
         scored.append((score, card))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -547,12 +482,6 @@ def _apply_dedup_and_diversity(
     max_consecutive_source: int = 2,
     max_consecutive_tag: int = 2,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Постобработка уже отсортированного списка:
-    - дедуп по заголовку + дедуп по "fingerprint" (title+body);
-    - диверсификация по ИСТОЧНИКУ/ТЕГУ (контроль подряд);
-    - ограничение доли Wikipedia в локальном окне.
-    """
     if not ranked:
         return [], {
             "initial": 0,
@@ -594,26 +523,22 @@ def _apply_dedup_and_diversity(
         source_key = _extract_source_key(card)
         main_tag = _extract_main_tag(card, base_tags)
 
-        # подряд по источнику/тегу
         if _consecutive_tail_count(current, "source", source_key) >= max_consecutive_source:
             return True
         if _consecutive_tail_count(current, "tag", main_tag) >= max_consecutive_tag:
             return True
 
-        # Wiki quota (локально)
         if _is_wikipedia_card(card) and WIKI_WINDOW_SIZE > 0:
             wiki_window = current[-WIKI_WINDOW_SIZE:]
             wiki_count = sum(1 for c in wiki_window if _is_wikipedia_card(c))
             if wiki_count >= WIKI_MAX_IN_WINDOW:
                 return True
 
-        # в строгом режиме запретим wiki-wiki подряд
         if strict and current and _is_wikipedia_card(current[-1]) and _is_wikipedia_card(card):
             return True
 
         return False
 
-    # 1) основной проход: дедуп + строгая диверсификация
     for card in ranked:
         title = (card.get("title") or "").strip()
         norm_title = _normalize_title_for_duplicate(title)
@@ -635,7 +560,6 @@ def _apply_dedup_and_diversity(
             seen_titles.add(norm_title)
         seen_fps.add(fp)
 
-    # 2) домешиваем deferred (строго)
     still_deferred: List[Dict[str, Any]] = []
     used_deferred = 0
 
@@ -661,7 +585,6 @@ def _apply_dedup_and_diversity(
         seen_fps.add(fp)
         used_deferred += 1
 
-    # 3) хвост: расслабляем, но не даём длинных серий по источнику
     tail_added = 0
     tail_queue = list(still_deferred)
     rotations = 0
@@ -681,14 +604,12 @@ def _apply_dedup_and_diversity(
             removed_duplicates += 1
             continue
 
-        # хвостовой лимит: максимум 3 подряд одного источника
         src = _extract_source_key(card)
         if _consecutive_tail_count(selected, "source", src) >= max(max_consecutive_source, 3):
             tail_queue.append(card)
             rotations += 1
             continue
 
-        # wiki-wiki подряд избегаем если можно
         if selected and _is_wikipedia_card(selected[-1]) and _is_wikipedia_card(card):
             tail_queue.append(card)
             rotations += 1
@@ -701,7 +622,6 @@ def _apply_dedup_and_diversity(
         tail_added += 1
         rotations = 0
 
-    # последний fallback: докидываем остаток (без дублей)
     for card in tail_queue:
         title = (card.get("title") or "").strip()
         norm_title = _normalize_title_for_duplicate(title)
@@ -745,9 +665,6 @@ def _insert_cards_into_db(
     fallback_source_name: str | None = None,
     source_ref: str | None = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Вставляем сгенерированные/переформатированные карточки в таблицу cards.
-    """
     if not cards:
         return []
 
@@ -775,10 +692,7 @@ def _insert_cards_into_db(
             importance = 1.0
 
         raw_source_name = (
-            c.get("source_name")
-            or c.get("source")
-            or c.get("channel_name")
-            or c.get("channel_title")
+            c.get("source_name") or c.get("source") or c.get("channel_name") or c.get("channel_title")
         )
 
         if not raw_source_name and fallback_source_name:
@@ -799,9 +713,7 @@ def _insert_cards_into_db(
             card_lang = None
         final_language = card_lang or default_lang or "ru"
 
-        meta: Dict[str, Any] = {
-            "source_name": source_name,
-        }
+        meta: Dict[str, Any] = {"source_name": source_name}
 
         payload.append(
             {
@@ -834,7 +746,7 @@ def _insert_cards_into_db(
     return data
 
 
-# ===================== Основная логика фида =====================
+# ===================== Основная логика фида (OFFSET режим) =====================
 
 
 def build_feed_for_user(
@@ -843,34 +755,32 @@ def build_feed_for_user(
     limit: int | None = None,
     offset: int = 0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    """
-    Основная точка входа для /api/feed.
-    """
-    debug: Dict[str, Any] = {
-        "offset": offset,
-    }
+    debug: Dict[str, Any] = {"offset": offset}
 
     if supabase is None:
-        debug["reason"] = "no_supabase"
-        debug["base_tags"] = []
-        debug["limit"] = limit or FEED_CARDS_LIMIT_DEFAULT
-        debug["total_candidates"] = 0
-        debug["returned"] = 0
-        debug["has_more"] = False
-        debug["next_offset"] = None
-        debug["seen"] = {
-            "rows": 0,
-            "exclude_ids": 0,
-            "recent_ids": 0,
-            "window_days": FEED_SEEN_EXCLUDE_DAYS,
-            "grace_minutes": FEED_SEEN_SESSION_GRACE_MINUTES,
-            "error": "no_supabase",
-            "relaxed": False,
-            "marked": 0,
-        }
+        debug.update(
+            {
+                "reason": "no_supabase",
+                "base_tags": [],
+                "limit": limit or FEED_CARDS_LIMIT_DEFAULT,
+                "total_candidates": 0,
+                "returned": 0,
+                "has_more": False,
+                "next_offset": None,
+                "seen": {
+                    "rows": 0,
+                    "exclude_ids": 0,
+                    "recent_ids": 0,
+                    "window_days": FEED_SEEN_EXCLUDE_DAYS,
+                    "grace_minutes": FEED_SEEN_SESSION_GRACE_MINUTES,
+                    "error": "no_supabase",
+                    "relaxed": False,
+                    "marked": 0,
+                },
+            }
+        )
         return [], debug
 
-    # --- нормализуем offset/limit ---
     try:
         offset = int(offset)
     except (TypeError, ValueError):
@@ -885,43 +795,31 @@ def build_feed_for_user(
     page_index = offset // limit
     debug["page_index"] = page_index
 
-    # 1. Загружаем веса интересов пользователя + base_tags
+    # 1) Всегда берём интересы из профиля (полный список)
     user_topic_weights, user_topic_rows = _load_user_topic_weights(supabase, user_id)
 
-    base_tags: List[str] = []
+    base_tags = get_interest_tags_for_user(supabase, user_id)
     used_default_tags = False
+    if not base_tags:
+        base_tags = DEFAULT_FEED_TAGS
+        used_default_tags = True
 
+    # top/debug из весов оставляем отдельно
     if user_topic_rows:
-        base_tags, used_default_tags_from_builder, user_topics_debug = (
-            build_base_tags_from_weights(user_topic_rows)
-        )
-        used_default_tags = used_default_tags_from_builder
+        _top_tags, _, user_topics_debug = build_base_tags_from_weights(user_topic_rows)
     else:
-        base_tags = get_interest_tags_for_user(supabase, user_id)
-        if not base_tags:
-            base_tags = DEFAULT_FEED_TAGS
-            used_default_tags = True
-
         if user_topic_weights:
-            sorted_items = sorted(
-                user_topic_weights.items(), key=lambda kv: kv[1], reverse=True
-            )
-            user_topics_debug = {
-                "count": len(user_topic_weights),
-                "top": sorted_items[:20],
-            }
+            sorted_items = sorted(user_topic_weights.items(), key=lambda kv: kv[1], reverse=True)
+            user_topics_debug = {"count": len(user_topic_weights), "top": sorted_items[:20]}
         else:
-            user_topics_debug = {
-                "count": 0,
-                "top": [],
-            }
+            user_topics_debug = {"count": 0, "top": []}
 
     debug["base_tags"] = base_tags
     debug["used_default_tags"] = used_default_tags
     debug["user_topic_weights"] = user_topics_debug
-    debug["topic_weights"] = user_topic_weights  # удобно для debug=1
+    debug["topic_weights"] = user_topic_weights  # удобно для debug
 
-    # 2. Загружаем просмотренные карточки
+    # 2) seen
     seen_info = _load_seen_cards_for_user(supabase, user_id)
     exclude_ids: Set[int] = seen_info.get("exclude_ids") or set()
     recent_ids: Set[int] = seen_info.get("recent_ids") or set()
@@ -937,7 +835,7 @@ def build_feed_for_user(
         "marked": 0,
     }
 
-    # 3. Собираем кандидатов несколькими "слоями"
+    # 3) кандидаты слоями (OFFSET режим ограничен FEED_MAX_FETCH_LIMIT => может закончиться)
     fetch_limit = (limit + offset) * 3
     fetch_limit = max(fetch_limit, limit)
     fetch_limit = min(fetch_limit, FEED_MAX_FETCH_LIMIT)
@@ -949,17 +847,11 @@ def build_feed_for_user(
     ]
 
     if FEED_WIDE_AGE_HOURS > FEED_MAX_CARD_AGE_HOURS:
-        phases_config.append(
-            {"stage": "personal_wide", "tags": base_tags, "age_hours": FEED_WIDE_AGE_HOURS}
-        )
+        phases_config.append({"stage": "personal_wide", "tags": base_tags, "age_hours": FEED_WIDE_AGE_HOURS})
 
     if mixed_tags and mixed_tags != base_tags:
-        phases_config.append(
-            {"stage": "mixed_recent", "tags": mixed_tags, "age_hours": FEED_MAX_CARD_AGE_HOURS}
-        )
-        phases_config.append(
-            {"stage": "mixed_wide", "tags": mixed_tags, "age_hours": FEED_WIDE_AGE_HOURS}
-        )
+        phases_config.append({"stage": "mixed_recent", "tags": mixed_tags, "age_hours": FEED_MAX_CARD_AGE_HOURS})
+        phases_config.append({"stage": "mixed_wide", "tags": mixed_tags, "age_hours": FEED_WIDE_AGE_HOURS})
 
     candidates_by_id: Dict[str, Dict[str, Any]] = {}
     phases_debug: List[Dict[str, Any]] = []
@@ -980,14 +872,7 @@ def build_feed_for_user(
 
             if label == "initial" and not tags:
                 phases_debug.append(
-                    {
-                        "stage": stage_name,
-                        "label": label,
-                        "tags_count": 0,
-                        "age_hours": age_hours,
-                        "fetched": 0,
-                        "skipped": True,
-                    }
+                    {"stage": stage_name, "label": label, "tags_count": 0, "age_hours": age_hours, "fetched": 0, "skipped": True}
                 )
                 continue
 
@@ -996,6 +881,7 @@ def build_feed_for_user(
                 tags=tags,
                 limit=remaining,
                 max_age_hours=age_hours,
+                before_id=None,
             )
 
             for card in fetched:
@@ -1026,7 +912,6 @@ def build_feed_for_user(
 
     required_for_page = offset + limit
 
-    # 3.1 fallback "любые теги", если кандидатов мало
     if total_candidates_raw < required_for_page and total_candidates_raw < fetch_limit:
         fallback_phases: List[Dict[str, Any]] = [
             {"stage": "any_recent_wide", "tags": [], "age_hours": FEED_WIDE_AGE_HOURS},
@@ -1036,7 +921,6 @@ def build_feed_for_user(
                 "age_hours": FEED_DEEP_AGE_HOURS if FEED_DEEP_AGE_HOURS > 0 else 0,
             },
         ]
-
         _run_phases(fallback_phases, label="fallback")
         candidates_all = list(candidates_by_id.values())
         total_candidates_raw = len(candidates_all)
@@ -1046,47 +930,28 @@ def build_feed_for_user(
 
     debug["total_candidates_raw"] = total_candidates_raw
 
-    # 4. Если в БД вообще ничего не нашли — пробуем OpenAI
+    # 4) если вообще пусто — OpenAI
     if total_candidates_raw == 0:
         if LLM_CARD_GENERATION_ENABLED and openai_is_configured():
             need_count = max(required_for_page * 2, 20)
-            logger.info(
-                "No cards in DB for user_id=%s. Generating ~%d cards via OpenAI.",
-                user_id,
-                need_count,
-            )
-            generated = generate_cards_for_tags(
-                tags=base_tags,
-                language="ru",
-                count=need_count,
-            )
+            logger.info("No cards in DB for user_id=%s. Generating ~%d cards via OpenAI.", user_id, need_count)
+            generated = generate_cards_for_tags(tags=base_tags, language="ru", count=need_count)
             if generated:
-                inserted = _insert_cards_into_db(
-                    supabase,
-                    generated,
-                    language="ru",
-                    source_type="llm",
-                )
+                inserted = _insert_cards_into_db(supabase, generated, language="ru", source_type="llm")
                 candidates_all = inserted or []
                 total_candidates_raw = len(candidates_all)
                 debug["reason"] = "generated_via_openai"
                 debug["generated"] = total_candidates_raw
             else:
-                debug["reason"] = "no_cards"
-                debug["returned"] = 0
-                debug["has_more"] = False
-                debug["next_offset"] = None
+                debug.update({"reason": "no_cards", "returned": 0, "has_more": False, "next_offset": None})
                 return [], debug
         else:
-            debug["reason"] = "no_cards"
-            debug["returned"] = 0
-            debug["has_more"] = False
-            debug["next_offset"] = None
+            debug.update({"reason": "no_cards", "returned": 0, "has_more": False, "next_offset": None})
             return [], debug
     else:
         debug["reason"] = "cards_from_db"
 
-    # 5. Фильтрация просмотренных карточек
+    # 5) seen filter
     if exclude_ids:
         unseen: List[Dict[str, Any]] = []
         for c in candidates_all:
@@ -1107,23 +972,14 @@ def build_feed_for_user(
         candidates = candidates_all
         debug["seen"]["relaxed"] = True
 
-    total_candidates = len(candidates)
-    debug["total_candidates"] = total_candidates
+    debug["total_candidates"] = len(candidates)
 
-    # 6. Ранжируем и применяем дедуп/диверсификацию
-    ranked_raw = _score_cards_for_user(
-        candidates,
-        base_tags,
-        user_id=user_id,
-        user_topic_weights=user_topic_weights,
-    )
+    # 6) rank + postprocess
+    ranked_raw = _score_cards_for_user(candidates, base_tags, user_id=user_id, user_topic_weights=user_topic_weights)
     ranked, postprocess_debug = _apply_dedup_and_diversity(ranked_raw, base_tags)
     debug["postprocess"] = postprocess_debug
+    debug["total_ranked"] = len(ranked)
 
-    total_ranked = len(ranked)
-    debug["total_ranked"] = total_ranked
-
-    # распределение источников во всём ranked
     source_counts: Dict[str, int] = {}
     wiki_count_total = 0
     for c in ranked:
@@ -1134,19 +990,16 @@ def build_feed_for_user(
     debug["sources_ranked"] = source_counts
     debug["wiki_count_ranked"] = wiki_count_total
 
-    if total_ranked == 0:
-        debug["reason"] = "no_ranked_cards"
-        debug["returned"] = 0
-        debug["has_more"] = False
-        debug["next_offset"] = None
+    if not ranked:
+        debug.update({"reason": "no_ranked_cards", "returned": 0, "has_more": False, "next_offset": None})
         return [], debug
 
-    # 7. Пагинация по offset/limit (БЕЗ wrap, чтобы не было повторов)
-    if offset < total_ranked:
+    # 7) пагинация offset/limit (может закончиться при offset > total_ranked)
+    if offset < len(ranked):
         start = offset
-        end = min(start + limit, total_ranked)
+        end = min(start + limit, len(ranked))
         page = ranked[start:end]
-        has_more = total_ranked > end
+        has_more = len(ranked) > end
         next_offset = end if has_more else None
         debug["pagination_mode"] = "linear"
     else:
@@ -1155,7 +1008,6 @@ def build_feed_for_user(
         next_offset = None
         debug["pagination_mode"] = "end"
 
-    # источники на странице
     page_source_counts: Dict[str, int] = {}
     page_wiki_count = 0
     for c in page:
@@ -1170,11 +1022,132 @@ def build_feed_for_user(
     debug["has_more"] = has_more
     debug["next_offset"] = next_offset
 
-    # 8. Отмечаем карточки как просмотренные (как сейчас в MVP)
-    seen_marked = _mark_cards_as_seen(supabase, user_id, page)
-    debug["seen"]["marked"] = int(seen_marked)
+    # 8) mark seen (upsert)
+    debug["seen"]["marked"] = int(_mark_cards_as_seen(supabase, user_id, page))
 
     return page, debug
+
+
+# ===================== Cursor режим (реально бесконечный) =====================
+
+
+def build_feed_for_user_cursor(
+    supabase: Client | None,
+    user_id: int,
+    limit: int | None = None,
+    cursor: str | None = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str | None]:
+    debug: Dict[str, Any] = {"cursor_in": cursor}
+
+    if supabase is None:
+        return [], {"reason": "no_supabase", **debug}, None
+
+    if limit is None or limit <= 0:
+        limit = FEED_CARDS_LIMIT_DEFAULT
+    limit = min(max(int(limit), 1), 50)
+    debug["limit"] = limit
+
+    before_id = _decode_cursor(cursor)
+    debug["before_id"] = before_id
+
+    user_topic_weights, user_topic_rows = _load_user_topic_weights(supabase, user_id)
+    base_tags = get_interest_tags_for_user(supabase, user_id) or DEFAULT_FEED_TAGS
+    debug["base_tags"] = base_tags
+
+    if user_topic_rows:
+        _top_tags, _, user_topics_debug = build_base_tags_from_weights(user_topic_rows)
+    else:
+        if user_topic_weights:
+            sorted_items = sorted(user_topic_weights.items(), key=lambda kv: kv[1], reverse=True)
+            user_topics_debug = {"count": len(user_topic_weights), "top": sorted_items[:20]}
+        else:
+            user_topics_debug = {"count": 0, "top": []}
+    debug["user_topic_weights"] = user_topics_debug
+
+    seen_info = _load_seen_cards_for_user(supabase, user_id)
+    exclude_ids: Set[int] = seen_info.get("exclude_ids") or set()
+    debug["seen_rows"] = int(seen_info.get("rows") or 0)
+    debug["seen_exclude"] = len(exclude_ids)
+
+    fetch_limit = min(max(limit * 12, 80), FEED_MAX_FETCH_LIMIT)
+    mixed_tags = sorted({*base_tags, *DEFAULT_FEED_TAGS})
+
+    phases_config: List[Dict[str, Any]] = [
+        {"stage": "personal_recent", "tags": base_tags, "age_hours": FEED_MAX_CARD_AGE_HOURS},
+        {"stage": "personal_wide", "tags": base_tags, "age_hours": FEED_WIDE_AGE_HOURS},
+        {"stage": "mixed_wide", "tags": mixed_tags, "age_hours": FEED_WIDE_AGE_HOURS},
+        {
+            "stage": "any_all_time",
+            "tags": [],
+            "age_hours": FEED_DEEP_AGE_HOURS if FEED_DEEP_AGE_HOURS > 0 else 0,
+        },
+    ]
+
+    candidates_by_id: Dict[str, Dict[str, Any]] = {}
+    phases_debug: List[Dict[str, Any]] = []
+
+    for phase in phases_config:
+        if len(candidates_by_id) >= fetch_limit:
+            break
+        remaining = fetch_limit - len(candidates_by_id)
+        fetched = _fetch_candidate_cards(
+            supabase=supabase,
+            tags=phase.get("tags") or [],
+            limit=remaining,
+            max_age_hours=int(phase.get("age_hours") or 0),
+            before_id=before_id,
+        )
+        for card in fetched:
+            cid = card.get("id")
+            if cid is None:
+                continue
+            key = str(cid)
+            if key not in candidates_by_id:
+                candidates_by_id[key] = card
+
+        phases_debug.append({"stage": phase.get("stage"), "fetched": len(fetched), "unique": len(candidates_by_id)})
+
+    candidates_all = list(candidates_by_id.values())
+    debug["phases"] = phases_debug
+    debug["total_candidates_raw"] = len(candidates_all)
+
+    if exclude_ids:
+        unseen = []
+        for c in candidates_all:
+            cid = _safe_int_id(c.get("id"))
+            if cid is None or cid not in exclude_ids:
+                unseen.append(c)
+    else:
+        unseen = candidates_all
+
+    candidates = unseen if len(unseen) >= limit else candidates_all
+    debug["seen_relaxed"] = len(unseen) < limit
+
+    ranked_raw = _score_cards_for_user(
+        candidates,
+        base_tags,
+        user_id=user_id,
+        user_topic_weights=user_topic_weights,
+    )
+    ranked, postprocess_debug = _apply_dedup_and_diversity(ranked_raw, base_tags)
+    debug["postprocess"] = postprocess_debug
+
+    page = ranked[:limit]
+    debug["returned"] = len(page)
+
+    next_before = None
+    if page:
+        ids = [(_safe_int_id(x.get("id")) or 0) for x in page]
+        next_before = min(ids) if ids else None
+
+    next_cursor = _encode_cursor(next_before)
+
+    debug["seen_marked"] = int(_mark_cards_as_seen(supabase, user_id, page))
+
+    return page, debug, next_cursor
+
+
+# ===================== Public wrapper =====================
 
 
 def build_feed_for_user_paginated(
@@ -1182,14 +1155,25 @@ def build_feed_for_user_paginated(
     user_id: int,
     limit: int | None = None,
     offset: int = 0,
+    cursor: str | None = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
-    """
-    Обёртка над build_feed_for_user с явными метаданными пагинации.
-    """
     if limit is None or limit <= 0:
         limit = FEED_CARDS_LIMIT_DEFAULT
     limit = min(max(limit, 1), 50)
     offset = max(0, int(offset))
+
+    if cursor:
+        items, debug, next_cursor = build_feed_for_user_cursor(
+            supabase=supabase, user_id=user_id, limit=limit, cursor=cursor
+        )
+        cursor_meta = {
+            "mode": "cursor",
+            "cursor": cursor,
+            "next_cursor": next_cursor,
+            "limit": limit,
+            "has_more": bool(next_cursor),
+        }
+        return items, debug, cursor_meta
 
     items, base_debug = build_feed_for_user(
         supabase=supabase,
@@ -1201,7 +1185,8 @@ def build_feed_for_user_paginated(
     has_more = bool(base_debug.get("has_more"))
     next_offset = base_debug.get("next_offset")
 
-    cursor: Dict[str, Any] = {
+    cursor_meta = {
+        "mode": "offset",
         "limit": limit,
         "offset": offset,
         "next_offset": next_offset,
@@ -1215,4 +1200,4 @@ def build_feed_for_user_paginated(
         "has_more": has_more,
     }
 
-    return items, debug, cursor
+    return items, debug, cursor_meta

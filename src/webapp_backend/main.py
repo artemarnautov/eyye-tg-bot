@@ -191,7 +191,9 @@ async def api_feed(
     tg_id: int = Query(..., alias="tg_id"),
     limit: int = Query(20, ge=1, le=50),
     offset: int = Query(0, ge=0),
+    cursor: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
+
     """
     Важно:
     - Ранжирование + дедуп + диверсификация уже сделаны в cards_service.
@@ -207,7 +209,7 @@ async def api_feed(
         return {"items": items, "debug": debug, "cursor": cursor}
 
     # fallback (если вдруг нет paginated)
-    items, debug = build_feed_for_user(supabase, tg_id, limit=limit, offset=offset)
+    items, debug, cursor_obj = build_feed_for_user_paginated(supabase, tg_id, limit=limit, offset=offset, cursor=cursor)
     return {"items": items, "debug": debug}
 
 
