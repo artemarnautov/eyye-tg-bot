@@ -1,16 +1,13 @@
 """
 Wikipedia ingest package for EYYE.
 
-Новая логика (MVP, hourly):
-- Не быть "бездушной энциклопедией".
-- Собирать кандидатов из:
-  1) RecentChanges (свежие правки) — сигнал "why now"
-  2) Wikimedia Pageviews Top — сигнал "why now" по трендам
-- Дальше пропускать кандидата через OpenAI-гейт:
-  - is_newsworthy=true/false
-  - why_now обязателен
-  - если нет "почему сейчас" -> SKIP
+Назначение (MVP):
+- Подтягивать самые читаемые страницы Wikipedia (en/ru) (hourly/daily),
+- превращать их в cards,
+- давать строгий "why_now" (почему эта карточка попала в ленту именно сейчас),
+- держать небольшой бюджет (лимиты на количество LLM-нормализаций за запуск),
+- смешивать Wikipedia с Telegram карточками в общей таблице cards.
 
 Точка входа:
-- fetch_wikipedia_articles.py
+- fetch_wikipedia_articles.py — запуск через systemd / runner.
 """
