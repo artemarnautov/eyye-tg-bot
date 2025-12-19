@@ -11,17 +11,6 @@ from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 
-# ==========
-# Конфиг OpenAI
-# ==========
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-OPENAI_WIKIPEDIA_MODEL = os.getenv("OPENAI_WIKIPEDIA_MODEL", OPENAI_MODEL)
-
-OPENAI_API_BASE = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-OPENAI_CHAT_COMPLETIONS_URL = OPENAI_API_BASE.rstrip("/") + "/chat/completions"
-
-OPENAI_TIMEOUT_SECONDS = float(os.getenv("OPENAI_TIMEOUT_SECONDS", "30"))
 RAW_LOG_MAX_LEN = 4000
 
 DEFAULT_FEED_TAGS = ["world_news", "business", "tech", "uk_students"]
@@ -45,7 +34,6 @@ ALLOWED_TAGS_CANONICAL = [
 ]
 ALLOWED_TAGS_SET = set(ALLOWED_TAGS_CANONICAL)
 
-# лёгкие алиасы (чтобы модельные “crypto/ai/movies” не вылетали в пустоту)
 TAG_ALIASES = {
     "crypto": "finance",
     "cryptocurrency": "finance",
@@ -59,9 +47,41 @@ TAG_ALIASES = {
     "education_career": "education",
 }
 
+# ==========
+# ДИНАМИЧЕСКИЙ конфиг (важно: env читается во время вызова)
+# ==========
+
+def _env_str(name: str, default: str = "") -> str:
+    return (os.getenv(name, default) or "").strip()
+
+def _openai_api_key() -> str:
+    return _env_str("OPENAI_API_KEY", "")
+
+def _openai_model() -> str:
+    return _env_str("OPENAI_MODEL", "gpt-4.1-mini") or "gpt-4.1-mini"
+
+def _openai_wikipedia_model() -> str:
+    return _env_str("OPENAI_WIKIPEDIA_MODEL", _openai_model()) or _openai_model()
+
+def _openai_api_base() -> str:
+    return _env_str("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+def _openai_chat_completions_url() -> str:
+    return _openai_api_base().rstrip("/") + "/chat/completions"
+
+def _openai_timeout_seconds() -> float:
+    try:
+        return float(_env_str("OPENAI_TIMEOUT_SECONDS", "30"))
+    except Exception:
+        return 30.0
+
+def _output_language() -> str:
+    # Всегда русский по умолчанию
+    lang = _env_str("EYYE_OUTPUT_LANGUAGE", "ru").lower()
+    return "ru" if lang not in ("ru", "en") else lang
 
 def is_configured() -> bool:
-    return bool(OPENAI_API_KEY)
+    return bool(_openai_api_key())
 
 
 def _clamp01(x: float) -> float:
@@ -76,19 +96,12 @@ def _clean_text(s: Any, max_len: int) -> str:
     text = str(s or "").strip()
     if not text:
         return ""
-    # убираем лишние пробелы
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text[:max_len].strip()
 
 
 def _normalize_tag_list(tags: Any, fallback: List[str] | None = None) -> List[str]:
-    """
-    1) приводим к list[str]
-    2) lower + алиасы
-    3) фильтр по allowlist
-    4) дедуп
-    """
     fallback = fallback or []
     if not tags:
         tags_list: List[str] = []
@@ -108,7 +121,6 @@ def _normalize_tag_list(tags: Any, fallback: List[str] | None = None) -> List[st
         if v in ALLOWED_TAGS_SET:
             out.append(v)
 
-    # дедуп
     seen = set()
     deduped: List[str] = []
     for t in out:
@@ -117,14 +129,12 @@ def _normalize_tag_list(tags: Any, fallback: List[str] | None = None) -> List[st
             deduped.append(t)
 
     if not deduped:
-        # fallback тоже фильтруем по allowlist
         fb = []
         for t in fallback:
             v = str(t or "").strip().lower()
             v = TAG_ALIASES.get(v, v)
             if v in ALLOWED_TAGS_SET:
                 fb.append(v)
-        # дедуп fallback
         seen2 = set()
         deduped2 = []
         for t in fb:
@@ -137,17 +147,18 @@ def _normalize_tag_list(tags: Any, fallback: List[str] | None = None) -> List[st
 
 
 def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if not OPENAI_API_KEY:
+    api_key = _openai_api_key()
+    if not api_key:
         logger.warning("OPENAI_API_KEY is not set, skipping OpenAI call")
         return {}
 
-    url = OPENAI_CHAT_COMPLETIONS_URL
+    url = _openai_chat_completions_url()
     headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
 
-    model = payload.get("model") or OPENAI_MODEL or "gpt-4.1-mini"
+    model = (payload.get("model") or _openai_model()).strip() or _openai_model()
 
     messages = payload.get("messages")
     if not messages:
@@ -186,15 +197,11 @@ def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
     started_at = datetime.now(timezone.utc)
     try:
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=OPENAI_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(req, timeout=_openai_timeout_seconds()) as resp:
             raw = resp.read().decode("utf-8")
         elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
         logger.info("OpenAI chat.completions call OK (%.2fs)", elapsed)
-        logger.debug(
-            "OpenAI raw response (first %d chars): %s",
-            RAW_LOG_MAX_LEN,
-            raw[:RAW_LOG_MAX_LEN],
-        )
+        logger.debug("OpenAI raw response (first %d chars): %s", RAW_LOG_MAX_LEN, raw[:RAW_LOG_MAX_LEN])
         return json.loads(raw)
     except urllib.error.HTTPError as e:
         elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
@@ -218,12 +225,10 @@ def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
 def _extract_message_content(resp_json: Dict[str, Any]) -> str:
     if not resp_json:
         return ""
-
     choices = resp_json.get("choices")
     if not isinstance(choices, list) or not choices:
         logger.error("No choices in OpenAI response")
         return ""
-
     message = choices[0].get("message") or {}
     content = message.get("content")
 
@@ -251,13 +256,11 @@ def _extract_message_content(resp_json: Dict[str, Any]) -> str:
 def _try_loose_json_parse(content: str) -> Dict[str, Any] | None:
     if not content:
         return None
-
     text = content.strip()
     first = text.find("{")
     last = text.rfind("}")
     if first == -1 or last == -1 or last <= first:
         return None
-
     candidate = text[first : last + 1]
     try:
         parsed = json.loads(candidate)
@@ -269,18 +272,20 @@ def _try_loose_json_parse(content: str) -> Dict[str, Any] | None:
 
 
 # ==========
-# Генерация карточек “с нуля”
+# Генерация карточек “с нуля” (всегда RU)
 # ==========
 
 def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[Dict[str, Any]]:
-    if not OPENAI_API_KEY:
+    if not is_configured():
         logger.warning("OPENAI_API_KEY is not set, skip OpenAI card generation")
         return []
+
+    # принудительно выводим на русском
+    language = _output_language()
 
     if not tags:
         tags = list(DEFAULT_FEED_TAGS)
 
-    # фильтруем входные теги
     tags = _normalize_tag_list(tags, fallback=DEFAULT_FEED_TAGS)
     if not tags:
         tags = list(DEFAULT_FEED_TAGS)
@@ -289,7 +294,7 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
         "Ты – движок новостной ленты EYYE.\n"
         "Сгенерируй короткие новостные карточки.\n"
         "Каждая карточка: заголовок + 2–4 абзаца текста.\n"
-        "Пиши на языке параметра (ru или en).\n"
+        "ВАЖНО: пиши ТОЛЬКО на русском языке.\n"
         "Отвечай строго валидным JSON без лишнего текста.\n\n"
         "Теги можно использовать ТОЛЬКО из этого списка:\n"
         + ", ".join(ALLOWED_TAGS_CANONICAL)
@@ -309,7 +314,7 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
     )
 
     user_payload = {
-        "language": language,
+        "output_language": "ru",
         "count": count,
         "tags": tags,
         "requirements": [
@@ -321,7 +326,7 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
     }
 
     payload: Dict[str, Any] = {
-        "model": OPENAI_MODEL or "gpt-4.1-mini",
+        "model": _openai_model(),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
@@ -359,7 +364,6 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
     if not raw_cards:
         return []
 
-    # пост-валидация + дедуп заголовков
     seen_titles = set()
     result: List[Dict[str, Any]] = []
 
@@ -390,7 +394,7 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
                 "body": body,
                 "tags": tags_out,
                 "importance_score": importance,
-                "language": language,
+                "language": "ru",
                 "quality": "ok",
             }
         )
@@ -401,35 +405,35 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
 
 
 # ==========
-# Нормализация Telegram-постов → EYYE-карточка
+# Нормализация Telegram → карточка (вывод всегда RU)
 # ==========
 
 def normalize_telegram_post(raw_text: str, channel_title: str, language: str = "ru") -> Dict[str, Any]:
-    """
-    Возвращает dict:
-      {title, body, tags, importance_score, language, source_name, quality}
-    quality:
-      - "ok" (если нормализация удалась)
-      - "fallback_raw" (если OpenAI недоступен/сломался)
-    """
+    input_lang_hint = (language or "ru").strip().lower()
+    out_lang = _output_language()  # будет ru
+
     first_line = (raw_text or "").strip().split("\n")[0] or "Новость"
     fallback = {
         "title": _clean_text(first_line, 200) or "Новость",
         "body": _clean_text(raw_text, 2000) or _clean_text(first_line, 200),
         "tags": [],
         "importance_score": 0.5,
-        "language": language,
+        "language": out_lang,
         "source_name": None,
         "quality": "fallback_raw",
+        "input_language_hint": input_lang_hint,
     }
 
-    if not OPENAI_API_KEY:
+    if not is_configured():
         logger.warning("OPENAI_API_KEY is not set, skip normalize_telegram_post")
         return fallback
 
     system_prompt = (
         "Ты модуль нормализации новостной ленты EYYE.\n"
         "Верни ОДНУ аккуратную новостную карточку в формате JSON.\n\n"
+        "КРИТИЧНО:\n"
+        "- Пиши итоговую карточку ТОЛЬКО на русском языке.\n"
+        "- Если исходный текст на другом языке, перескажи/переведи смысл на русский без добавления фактов.\n\n"
         "Правила:\n"
         "1) НЕ придумывай новости.\n"
         "2) title — одно краткое предложение без кликбейта.\n"
@@ -438,15 +442,16 @@ def normalize_telegram_post(raw_text: str, channel_title: str, language: str = "
         "   world_news, business, finance, tech, science, history, politics, society,\n"
         "   entertainment, gaming, sports, lifestyle, education, city, uk_students.\n"
         "5) importance_score — 0..1\n"
-        "6) language — 'ru'/'en'...\n"
+        "6) language — всегда 'ru'\n"
         "7) source_name — только если явно есть название издания в тексте.\n"
         "8) НЕ упоминай Telegram.\n"
         "Верни СТРОГО один JSON-объект."
     )
 
     user_prompt = (
-        f"Язык оригинала (hint): {language}\n"
-        f"Название Telegram-канала: {channel_title}\n\n"
+        f"Язык оригинала (hint): {input_lang_hint}\n"
+        f"Язык вывода: ru\n"
+        f"Название источника (Telegram-канала): {channel_title}\n\n"
         "Сырой текст поста:\n"
         "-------------------\n"
         f"{(raw_text or '').strip()}\n"
@@ -463,7 +468,7 @@ def normalize_telegram_post(raw_text: str, channel_title: str, language: str = "
     )
 
     payload: Dict[str, Any] = {
-        "model": OPENAI_MODEL or "gpt-4.1-mini",
+        "model": _openai_model(),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -476,11 +481,7 @@ def normalize_telegram_post(raw_text: str, channel_title: str, language: str = "
     started = time.monotonic()
     resp_json = call_openai_chat(payload)
     elapsed = time.monotonic() - started
-    logger.info(
-        "OpenAI normalize_telegram_post call finished in %.2fs (channel_title=%r)",
-        elapsed,
-        channel_title,
-    )
+    logger.info("OpenAI normalize_telegram_post call finished in %.2fs (channel_title=%r)", elapsed, channel_title)
 
     if not resp_json:
         return fallback
@@ -506,7 +507,6 @@ def normalize_telegram_post(raw_text: str, channel_title: str, language: str = "
     tags = _normalize_tag_list(parsed.get("tags"), fallback=[])
     importance_score = _clamp01(parsed.get("importance_score", parsed.get("importance", 0.5)))
 
-    lang_value = str(parsed.get("language") or "").strip() or language
     source_name = parsed.get("source_name")
     if isinstance(source_name, str):
         source_name = source_name.strip() or None
@@ -518,24 +518,22 @@ def normalize_telegram_post(raw_text: str, channel_title: str, language: str = "
         "body": body,
         "tags": tags,
         "importance_score": importance_score,
-        "language": lang_value,
+        "language": "ru",
         "source_name": source_name,
         "quality": "ok",
+        "input_language_hint": input_lang_hint,
     }
 
 
 # ==========
-# Нормализация Wikipedia extract → EYYE-карточка
+# Нормализация Wikipedia → карточка (вывод всегда RU)
 # ==========
 
-def normalize_wikipedia_article(
-    *,
-    title_hint: str,
-    raw_text: str,
-    language: str,
-    why_now: str,
-) -> Dict[str, Any]:
-    if not OPENAI_API_KEY:
+def normalize_wikipedia_article(*, title_hint: str, raw_text: str, language: str, why_now: str) -> Dict[str, Any]:
+    input_lang_hint = (language or "ru").strip().lower()
+    out_lang = _output_language()
+
+    if not is_configured():
         first = (title_hint or "").strip() or "Статья"
         body = _clean_text(raw_text, 1400) or first
         return {
@@ -543,28 +541,33 @@ def normalize_wikipedia_article(
             "body": body,
             "tags": [],
             "importance_score": 0.6,
-            "language": language,
+            "language": out_lang,
             "source_name": None,
-            "why_now": why_now,
+            "why_now": _clean_text(why_now, 220),
             "quality": "fallback_raw",
+            "input_language_hint": input_lang_hint,
         }
 
     system_prompt = (
         "Ты нормализуешь выдержку из Wikipedia в формат карточки EYYE.\n"
+        "КРИТИЧНО:\n"
+        "- Пиши итоговую карточку ТОЛЬКО на русском языке.\n"
+        "- Если исходный текст/why_now на другом языке, переведи смысл на русский, не добавляя фактов.\n"
         "Важно:\n"
         "- НЕ выдумывай факты.\n"
         "- Пиши как короткая новостная заметка: нейтрально, компактно.\n"
-        "- why_now: используй СТРОГО переданный hint, ничего не добавляй от себя.\n"
         "- tags: только из списка:\n"
         "  world_news, business, finance, tech, science, history, politics, society,\n"
         "  entertainment, gaming, sports, lifestyle, education, city, uk_students.\n"
+        "- language: всегда 'ru'\n"
         "Верни валидный JSON-объект."
     )
 
     user_prompt = (
-        f"language: {language}\n"
+        f"input_language_hint: {input_lang_hint}\n"
+        f"output_language: ru\n"
         f"title_hint: {title_hint}\n"
-        f"why_now_hint: {why_now}\n\n"
+        f"why_now_hint (translate to ru, keep meaning): {why_now}\n\n"
         "text:\n"
         "-------------------\n"
         f"{(raw_text or '').strip()}\n"
@@ -582,7 +585,7 @@ def normalize_wikipedia_article(
     )
 
     payload: Dict[str, Any] = {
-        "model": OPENAI_WIKIPEDIA_MODEL or OPENAI_MODEL or "gpt-4.1-mini",
+        "model": _openai_wikipedia_model(),
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -599,10 +602,11 @@ def normalize_wikipedia_article(
             "body": _clean_text(raw_text, 1400),
             "tags": [],
             "importance_score": 0.6,
-            "language": language,
+            "language": out_lang,
             "source_name": None,
-            "why_now": why_now,
+            "why_now": _clean_text(why_now, 220),
             "quality": "fallback_raw",
+            "input_language_hint": input_lang_hint,
         }
 
     content_str = _extract_message_content(resp_json).strip()
@@ -612,10 +616,11 @@ def normalize_wikipedia_article(
             "body": _clean_text(raw_text, 1400),
             "tags": [],
             "importance_score": 0.6,
-            "language": language,
+            "language": out_lang,
             "source_name": None,
-            "why_now": why_now,
+            "why_now": _clean_text(why_now, 220),
             "quality": "fallback_raw",
+            "input_language_hint": input_lang_hint,
         }
 
     parsed = None
@@ -633,7 +638,7 @@ def normalize_wikipedia_article(
     out_tags = _normalize_tag_list(parsed.get("tags"), fallback=[])
     out_importance = _clamp01(parsed.get("importance_score", 0.6))
 
-    out_lang = str(parsed.get("language") or "").strip() or language
+    out_why = _clean_text(parsed.get("why_now"), 220) or _clean_text(why_now, 220)
 
     out_source = parsed.get("source_name")
     if isinstance(out_source, str):
@@ -641,15 +646,14 @@ def normalize_wikipedia_article(
     else:
         out_source = None
 
-    out_why = _clean_text(parsed.get("why_now"), 220) or _clean_text(why_now, 220)
-
     return {
         "title": out_title,
         "body": out_body,
         "tags": out_tags,
         "importance_score": out_importance,
-        "language": out_lang,
+        "language": "ru",
         "source_name": out_source,
         "why_now": out_why,
         "quality": "ok",
+        "input_language_hint": input_lang_hint,
     }
