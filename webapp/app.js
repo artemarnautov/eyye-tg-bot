@@ -130,6 +130,171 @@
 
     return fetch(API_BASE + path, options);
   }
+    // ==== Sources sheet (UI) ====
+
+    var sourcesSheetEl = null;
+    var sourcesSheetVisible = false;
+    var lastSourcesOpenAtMs = 0;
+  
+    function uniqueStrings(arr) {
+      var out = [];
+      var seen = {};
+      for (var i = 0; i < (arr || []).length; i++) {
+        var s = String(arr[i] || "").trim();
+        if (!s) continue;
+        if (seen[s]) continue;
+        seen[s] = true;
+        out.push(s);
+      }
+      return out;
+    }
+  
+    function guessSourceNameFromUrl(url) {
+      try {
+        var u = new URL(url);
+        var host = u.hostname || "";
+        host = host.replace(/^www\./, "");
+        return host || "Источник";
+      } catch (e) {
+        return "Источник";
+      }
+    }
+  
+    function extractSourcesForItem(item, fallbackSourceName) {
+      // Мы намеренно НЕ показываем ссылки. Только названия.
+      // Поддерживаем несколько форматов meta, чтобы не зависеть от структуры.
+      var sources = [];
+  
+      if (item && item.meta) {
+        // ожидаемые варианты
+        if (Array.isArray(item.meta.sources)) {
+          sources = sources.concat(item.meta.sources);
+        }
+        if (Array.isArray(item.meta.source_names)) {
+          sources = sources.concat(item.meta.source_names);
+        }
+        if (Array.isArray(item.meta.supporting_sources)) {
+          // supporting_sources может быть массивом строк или объектов
+          for (var i = 0; i < item.meta.supporting_sources.length; i++) {
+            var x = item.meta.supporting_sources[i];
+            if (typeof x === "string") sources.push(x);
+            else if (x && typeof x === "object") {
+              if (x.name) sources.push(String(x.name));
+              else if (x.title) sources.push(String(x.title));
+              else if (x.source_name) sources.push(String(x.source_name));
+            }
+          }
+        }
+      }
+  
+      // если ничего нет — хотя бы основной источник карточки
+      if ((!sources || sources.length === 0) && fallbackSourceName) {
+        sources = [fallbackSourceName];
+      }
+  
+      // если и его нет, но есть source_ref — достанем домен (без клика)
+      if ((!sources || sources.length === 0) && item && item.source_ref) {
+        sources = [guessSourceNameFromUrl(String(item.source_ref))];
+      }
+  
+      return uniqueStrings(sources);
+    }
+  
+    function ensureSourcesSheet() {
+      if (sourcesSheetEl) return sourcesSheetEl;
+  
+      var el = document.createElement("div");
+      el.setAttribute("id", "sources-sheet");
+      el.style.position = "fixed";
+      el.style.right = "14px";
+      el.style.bottom = "14px";
+      el.style.width = "min(340px, 86vw)";
+      el.style.maxHeight = "46vh";
+      el.style.overflow = "hidden";
+      el.style.zIndex = "9999";
+      el.style.borderRadius = "14px";
+      el.style.boxShadow = "0 12px 30px rgba(0,0,0,0.35)";
+      el.style.border = "1px solid rgba(255,255,255,0.10)";
+      el.style.background = "rgba(18,18,18,0.92)";
+      el.style.backdropFilter = "blur(10px)";
+      el.style.color = "rgba(255,255,255,0.92)";
+      el.style.fontFamily = "system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif";
+      el.style.display = "none";
+  
+      el.innerHTML =
+      '<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,0.10)">' +
+      '<div style="font-weight:600;font-size:14px;letter-spacing:0.2px">Источники</div>' +
+      '<div style="opacity:0.55;font-size:12px">нажми Sources ещё раз, чтобы закрыть</div>' +
+      "</div>" +
+      '<div id="sources-sheet-body" style="padding:10px 12px;overflow:auto;max-height:calc(46vh - 44px)"></div>';
+
+  
+      document.body.appendChild(el);
+  
+      // закрытие по кнопке
+      var btnClose = el.querySelector("#sources-sheet-close");
+      if (btnClose) {
+        btnClose.addEventListener("click", function (e) {
+          e.preventDefault();
+          e.stopPropagation();
+          hideSourcesSheet();
+        });
+      }
+  
+      // закрытие по клику вне (легкий вариант)
+      document.addEventListener("click", function (e) {
+        if (!sourcesSheetVisible) return;
+        if (!sourcesSheetEl) return;
+        // если кликнули внутри — не закрываем
+        if (sourcesSheetEl.contains(e.target)) return;
+        hideSourcesSheet();
+      });
+  
+      // чтобы свайпы/скролл внутри работали и не “пробивали” фон
+      
+  
+      sourcesSheetEl = el;
+      return sourcesSheetEl;
+    }
+  
+    function showSourcesSheet(sourceNames) {
+      var el = ensureSourcesSheet();
+      var body = el.querySelector("#sources-sheet-body");
+      if (!body) return;
+  
+      var list = sourceNames || [];
+      if (!list.length) {
+        body.innerHTML =
+          '<div style="opacity:0.75;font-size:13px;line-height:1.4">Источники для этой карточки не указаны.</div>';
+      } else {
+        var html = "";
+        for (var i = 0; i < list.length; i++) {
+          html +=
+            '<div style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.08)">' +
+            '<div style="font-size:13px;line-height:1.35;opacity:0.92;user-select:text;pointer-events:none">' +
+            escapeHtml(list[i]) +
+            "</div>" +
+            "</div>";
+        }
+        // убираем последнюю границу визуально
+        body.innerHTML = html.replace(/border-bottom[^"]+"$/, "");
+      }
+  
+      el.style.display = "block";
+      sourcesSheetVisible = true;
+    }
+  
+    function hideSourcesSheet() {
+      if (!sourcesSheetEl) return;
+      sourcesSheetEl.style.display = "none";
+      sourcesSheetVisible = false;
+    }
+  
+    function toggleSourcesSheet(sourceNames) {
+      if (sourcesSheetVisible) hideSourcesSheet();
+      else showSourcesSheet(sourceNames);
+    }
+  
 
   function showScreen(name) {
     if (!elOnboardingScreen || !elFeedScreen) return;
@@ -342,28 +507,63 @@
     } else if (item.source_type === "llm") {
       sourceName = "EYYE • AI-подборка";
     }
+    var sourcesList = extractSourcesForItem(item, sourceName);
+    var hasSources = sourcesList && sourcesList.length > 0;
+
 
     var html =
-      '<div class="card">' +
-      '<div class="card-header">' +
-      '<div class="card-source">' +
-      (sourceName ? "Источник: " + escapeHtml(sourceName) : "") +
-      "</div>" +
-      "</div>" +
-      '<div class="card-content">' +
-      '<h2 class="card-title">' +
-      title +
-      "</h2>" +
-      '<p class="card-body">' +
-      body +
-      "</p>" +
-      "</div>" +
-      '<div class="card-footer">' +
-      '<div class="card-tagline">Свайпай вверх/вниз, чтобы листать ленту</div>' +
-      "</div>" +
-      "</div>";
+    '<div class="card">' +
+    '<div class="card-header">' +
+    '<div class="card-source">' +
+    (sourceName ? "Источник: " + escapeHtml(sourceName) : "") +
+    "</div>" +
+    "</div>" +
+    '<div class="card-content">' +
+    '<h2 class="card-title">' +
+    title +
+    "</h2>" +
+    '<p class="card-body">' +
+    body +
+    "</p>" +
+    "</div>" +
+    '<div class="card-footer">' +
+    '<div style="display:flex;gap:10px;align-items:center;justify-content:flex-end;margin-bottom:10px;">' +
+    (hasSources
+      ? '<button id="btn-sources" type="button" style="appearance:none;border:0;border-radius:12px;padding:10px 12px;font-weight:600;font-size:13px;cursor:pointer;background:rgba(255,255,255,0.10);color:rgba(255,255,255,0.92)">Sources</button>'
+      : "") +
+    "</div>" +
+    '<div class="card-tagline">Свайпай вверх/вниз, чтобы листать ленту</div>' +
+    "</div>" +
+    "</div>";
+
 
     elFeedCardContainer.innerHTML = html;
+        // закрываем sources sheet при перерисовке карточки (чтобы не висел от прошлой)
+        hideSourcesSheet();
+
+        if (hasSources) {
+          var btnSources = elFeedCardContainer.querySelector("#btn-sources");
+          if (btnSources) {
+            btnSources.addEventListener("click", function (e) {
+              e.preventDefault();
+              e.stopPropagation();
+    
+              // анти-даблклик: не спамим событиями
+              var nowMs = Date.now();
+              if (nowMs - lastSourcesOpenAtMs < 350) return;
+              lastSourcesOpenAtMs = nowMs;
+    
+              // ✅ телеметрия: "пошёл смотреть источники" = сильный сигнал интереса
+              if (window.EYYETelemetry && typeof window.EYYETelemetry.clickSource === "function") {
+                window.EYYETelemetry.clickSource(item.id, state.currentIndex);
+              }
+    
+              // ✅ показываем аккуратный список названий (НЕ кликабельно)
+              toggleSourcesSheet(sourcesList);
+            });
+          }
+        }
+    
 
     if (
       window.EYYETelemetry &&
@@ -551,6 +751,7 @@
 
   // ✅ REPLACE THIS FUNCTION COMPLETELY
   function goToNextCard() {
+    hideSourcesSheet();
     if (!state.feedItems || state.feedItems.length === 0) return;
 
     // telemetry: swipe next
@@ -631,6 +832,7 @@
   }
 
   function goToPrevCard() {
+    hideSourcesSheet();
     if (!state.feedItems || state.feedItems.length === 0) return;
     if (state.currentIndex > 0) {
       state.currentIndex -= 1;

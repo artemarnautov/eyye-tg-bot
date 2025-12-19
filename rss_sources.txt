@@ -1,14 +1,126 @@
-# Add RSS feed URLs here (one per line). Lines starting with # are ignored.
+# =========================
+# world_news
+# =========================
+https://feeds.bbci.co.uk/news/world/rss.xml
+https://www.theguardian.com/world/rss
+https://www.aljazeera.com/xml/rss/all.xml
+https://feeds.skynews.com/feeds/rss/world.xml
+https://rss.dw.com/rdf/rss-en-top
+https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-AE&gl=AE&ceid=AE:en
 
-# Global / Tech / Business (examples)
-# https://www.reuters.com/rssFeed/topNews
-# https://feeds.bbci.co.uk/news/rss.xml
-# https://www.theverge.com/rss/index.xml
-# https://techcrunch.com/feed/
+# =========================
+# politics
+# =========================
+https://feeds.bbci.co.uk/news/politics/rss.xml
+https://www.theguardian.com/politics/rss
+https://feeds.skynews.com/feeds/rss/politics.xml
+https://news.google.com/rss/search?q=UAE%20politics%20when:7d&hl=en-AE&gl=AE&ceid=AE:en
+https://news.google.com/rss/search?q=MENA%20politics%20when:7d&hl=en-AE&gl=AE&ceid=AE:en
 
-# UAE / MENA (examples)
-# (проверь/замени на реальные RSS этих изданий)
-# https://www.thenationalnews.com/rss
-# https://gulfnews.com/rss
-# https://www.khaleejtimes.com/rss
-# https://www.aljazeera.com/xml/rss/all.xml
+# =========================
+# business
+# =========================
+https://feeds.bbci.co.uk/news/business/rss.xml
+https://www.theguardian.com/business/rss
+https://feeds.skynews.com/feeds/rss/business.xml
+https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-AE&gl=AE&ceid=AE:en
+https://news.google.com/rss/search?q=startup%20funding%20when:7d&hl=en-AE&gl=AE&ceid=AE:en
+
+# =========================
+# finance
+# =========================
+https://feeds.bloomberg.com/markets/news.rss
+https://news.google.com/rss/search?q=markets%20OR%20stocks%20OR%20inflation%20when:7d&hl=en-AE&gl=AE&ceid=AE:en
+https://news.google.com/rss/search?q=UAE%20economy%20OR%20Dubai%20economy%20when:14d&hl=en-AE&gl=AE&ceid=AE:en
+https://news.google.com/rss/search?q=crypto%20regulation%20when:7d&hl=en-AE&gl=AE&ceid=AE:en
+
+# =========================
+# tech
+# =========================
+https://feeds.bbci.co.uk/news/technology/rss.xml
+https://www.theguardian.com/technology/rss
+https://www.theverge.com/rss/index.xml
+https://techcrunch.com/feed/
+http://feeds.arstechnica.com/arstechnica/index/
+https://www.technologyreview.com/feed/
+https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-AE&gl=AE&ceid=AE:en
+
+# =========================
+# science
+# =========================
+https://feeds.bbci.co.uk/news/science_and_environment/rss.xml
+https://www.theguardian.com/science/rss
+https://www.nature.com/nature.rss
+https://www.nasa.gov/rss/dyn/breaking_news.rss
+https://www.esa.int/rssfeed/Our_Activities/Space_Science
+https://news.google.com/rss/headlines/section/topic/SCIENCE?hl=en-AE&gl=AE&ceid=AE:en
+
+# =========================
+# history
+# =========================
+https://www.smithsonianmag.com/rss/
+https://theconversation.com/uk/rss
+https://news.google.com/rss/search?q=archaeology%20OR%20history%20discovery%20when:30d&hl=en-AE&gl=AE&ceid=AE:en
+
+# =========================
+# society
+# =========================
+https://www.theguardian.com/society/rss
+https://news.un.org/feed/subscribe/en/news/all/rss.xml
+https://theconversation.com/uk/rss
+https://news.google.com/rss/search?q=UAE%20society%20OR%20Dubai%20community%20when:14d&hl=en-AE&gl=AE&ceid=AE:en
+
+# =========================
+# entertainment
+# =========================
+https://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml
+https://feeds.skynews.com/feeds/rss/entertainment.xml
+https://www.theguardian.com/culture/rss
+https://variety.com/feed/
+https://www.rollingstone.com/feed/
+https://news.google.com/rss/headlines/section/topic/ENTERTAINMENT?hl=en-AE&gl=AE&ceid=AE:en
+
+# =========================
+# gaming
+# =========================
+http://feeds.ign.com/ign/all
+https://kotaku.com/rss
+http://feeds.feedburner.com/RockPaperShotgun
+https://www.eurogamer.net/feed
+https://www.destructoid.com/feed/
+https://toucharcade.com/feed/
+https://www.polygon.com/rss/index.xml
+
+# =========================
+# sports
+# =========================
+https://feeds.bbci.co.uk/sport/rss.xml
+https://www.espn.com/espn/rss/news
+https://feeds.skynews.com/feeds/rss/strange.xml
+https://news.google.com/rss/headlines/section/topic/SPORTS?hl=en-AE&gl=AE&ceid=AE:en
+
+# =========================
+# lifestyle
+# =========================
+https://www.theguardian.com/lifeandstyle/rss
+https://news.google.com/rss/search?q=wellbeing%20OR%20lifestyle%20when:14d&hl=en-AE&gl=AE&ceid=AE:en
+https://news.google.com/rss/search?q=UAE%20lifestyle%20OR%20Dubai%20events%20when:14d&hl=en-AE&gl=AE&ceid=AE:en
+
+# =========================
+# education
+# =========================
+https://www.insidehighered.com/rss.xml
+https://thepienews.com/feed/
+https://wonkhe.com/feed/
+https://www.theguardian.com/education/rss
+https://www.gov.uk/government/organisations/department-for-education.atom
+
+# =========================
+# city (UAE / Dubai focus)
+# =========================
+https://www.gulftoday.ae/rss
+https://news.google.com/rss/search?q=Dubai%20when:7d&hl=en-AE&gl=AE&ceid=AE:en
+https://news.google.com/rss/search?q=Abu%20Dhabi%20when:7d&hl=en-AE&gl=AE&ceid=AE:en
+https://news.google.com/rss/search?q=UAE%20when:7d&hl=en-AE&gl=AE&ceid=AE:en
+https://news.google.com/rss/search?q=site:thenationalnews.com%20UAE%20when:14d&hl=en-AE&gl=AE&ceid=AE:en
+

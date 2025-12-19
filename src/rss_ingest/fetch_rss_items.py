@@ -40,13 +40,16 @@ RSS_SOURCES_FILE = os.getenv("RSS_SOURCES_FILE", "rss_sources.txt")
 RSS_FEEDS = os.getenv("RSS_FEEDS", "").strip()  # comma-separated, optional
 
 RSS_FETCH_LIMIT_PER_FEED = int(os.getenv("RSS_FETCH_LIMIT_PER_FEED", "20"))
-RSS_TITLE_DEDUP_HOURS = int(os.getenv("RSS_TITLE_DEDUP_HOURS", "168"))  # 7 дней
+RSS_TITLE_DEDUP_HOURS = int(os.getenv("RSS_TITLE_DEDUP_HOURS", "168"))  # 7 days
 RSS_OPENAI_BATCH_SIZE = int(os.getenv("RSS_OPENAI_BATCH_SIZE", os.getenv("RSS_OPENAI_BATCH", "8")))
 RSS_FALLBACK_INSERT = os.getenv("RSS_FALLBACK_INSERT", "true").lower() in ("1", "true", "yes")
 
 RSS_DEFAULT_LANGUAGE = os.getenv("RSS_DEFAULT_LANGUAGE") or os.getenv("EYYE_OUTPUT_LANGUAGE") or "en"
 
-# Google News RSS “как поиск”
+# Network timeouts
+RSS_FETCH_TIMEOUT_SECONDS = float(os.getenv("RSS_FETCH_TIMEOUT_SECONDS", "15"))
+
+# Google News RSS “as search”
 RSS_ENABLE_GOOGLE_NEWS = os.getenv("RSS_ENABLE_GOOGLE_NEWS", "true").lower() in ("1", "true", "yes")
 GOOGLE_NEWS_HL = os.getenv("GOOGLE_NEWS_HL", "en-AE")
 GOOGLE_NEWS_GL = os.getenv("GOOGLE_NEWS_GL", "AE")
@@ -54,16 +57,18 @@ GOOGLE_NEWS_CEID = os.getenv("GOOGLE_NEWS_CEID", "AE:en")
 
 # NEW: режим генерации queries
 GOOGLE_NEWS_QUERIES_MODE = (os.getenv("GOOGLE_NEWS_QUERIES_MODE", "auto") or "auto").strip().lower()
-GOOGLE_NEWS_QUERIES = (os.getenv("GOOGLE_NEWS_QUERIES", "AUTO") or "AUTO").strip()  # "AUTO" = автогенерация
+GOOGLE_NEWS_QUERIES = (os.getenv("GOOGLE_NEWS_QUERIES", "AUTO") or "AUTO").strip()  # "AUTO" = auto generation
 GOOGLE_NEWS_MAX_FEEDS = int(os.getenv("GOOGLE_NEWS_MAX_FEEDS", "60"))  # safety cap
+GOOGLE_NEWS_PER_TOPIC_MAX = int(os.getenv("GOOGLE_NEWS_PER_TOPIC_MAX", "10"))  # safety cap per topic
 
 GOOGLE_NEWS_LOCAL_HINTS = [
-    x.strip() for x in (os.getenv("GOOGLE_NEWS_LOCAL_HINTS", "UAE,Dubai,Abu Dhabi,Middle East,MENA") or "").split(",")
+    x.strip()
+    for x in (os.getenv("GOOGLE_NEWS_LOCAL_HINTS", "UAE,Dubai,Abu Dhabi,Middle East,MENA") or "").split(",")
     if x.strip()
 ]
 GOOGLE_NEWS_LOCAL_HINTS_PER_TOPIC = int(os.getenv("GOOGLE_NEWS_LOCAL_HINTS_PER_TOPIC", "2"))
 
-CANONICAL_TOPICS = get_canonical_topics()
+CANONICAL_TOPICS = get_canonical_topics()  # single source of truth
 
 
 # -----------------------------
@@ -120,6 +125,10 @@ def _title_fp(title: str, url: str = "") -> str:
     return hashlib.sha1(base.encode("utf-8")).hexdigest()[:16]
 
 def _stable_item_key(url: str) -> str:
+    """
+    Very important: key MUST be short and stable.
+    Never use a huge Google News URL as-is — model may not return it byte-to-byte.
+    """
     u = (url or "").strip()
     return hashlib.sha1(u.encode("utf-8")).hexdigest()[:16] if u else ""
 
@@ -132,10 +141,26 @@ def _google_news_rss_url(query: str) -> str:
         f"&ceid={urllib.parse.quote_plus(GOOGLE_NEWS_CEID)}"
     )
 
-def _fetch_xml(url: str, timeout: float = 15.0) -> str:
+def _fetch_xml(url: str, timeout: float = RSS_FETCH_TIMEOUT_SECONDS) -> str:
     req = urllib.request.Request(url, headers={"User-Agent": "EYYE-Ingest/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
+
+def _short(s: Optional[str], n: int = 80) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    return (s[:n] + "...") if len(s) > n else s
+
+def _seed_tag_or_empty(seed_topic: Optional[str]) -> List[str]:
+    """
+    For raw fallback we still want *some* minimal tagging so personalization starts working.
+    """
+    seed = (seed_topic or "").strip().lower()
+    if not seed:
+        return []
+    tags = _normalize_tag_list([seed], fallback=[])
+    return tags
 
 
 # -----------------------------
@@ -144,20 +169,19 @@ def _fetch_xml(url: str, timeout: float = 15.0) -> str:
 
 def _read_feed_jobs() -> List[Dict[str, str]]:
     """
-    Читает статические RSS фиды.
-    Поддерживает секции вида:
+    Reads static RSS feeds and supports sections:
       # =========================
       # world_news
       # =========================
       https://...
-    Возвращает jobs: [{feed_url, seed_topic}]
+    Returns jobs: [{feed_url, seed_topic}]
     """
     jobs: List[Dict[str, str]] = []
 
-    # RSS_FEEDS env -> просто список
+    # RSS_FEEDS env -> just list
     if RSS_FEEDS:
         for f in [x.strip() for x in RSS_FEEDS.split(",") if x.strip()]:
-            jobs.append({"feed_url": f})
+            jobs.append({"feed_url": f, "seed_topic": "manual"})
         return jobs
 
     path = os.path.join(os.getcwd(), RSS_SOURCES_FILE)
@@ -203,6 +227,7 @@ def _read_feed_jobs() -> List[Dict[str, str]]:
 # Topic -> Google News query generator
 # -----------------------------
 
+# NOTE: we are NOT collecting uk_students right now, so no mapping for it.
 _TOPIC_TO_QUERY = {
     "world_news": ["world news", "top stories"],
     "business": ["business", "startups", "companies"],
@@ -211,14 +236,13 @@ _TOPIC_TO_QUERY = {
     "science": ["science", "space", "climate"],
     "history": ["history", "archaeology"],
     "politics": ["politics", "government"],
-    "society": ["society", "migration", "human rights"],
+    "society": ["society", "human rights", "migration"],
     "entertainment": ["entertainment", "movies", "music"],
     "gaming": ["gaming", "video games"],
     "sports": ["sports", "football"],
     "lifestyle": ["lifestyle", "health", "travel"],
-    "education": ["education", "universities", "students"],
+    "education": ["education", "universities"],
     "city": ["Dubai", "Abu Dhabi", "UAE events"],
-    "uk_students": ["UK students", "UK universities", "student visa UK"],
 }
 
 def _build_google_news_query_jobs() -> List[Dict[str, str]]:
@@ -229,7 +253,7 @@ def _build_google_news_query_jobs() -> List[Dict[str, str]]:
         q = (query or "").strip()
         if not q:
             return
-        k = q.lower()
+        k = (seed_topic + "|" + q).lower()
         if k in seen:
             return
         seen.add(k)
@@ -239,18 +263,33 @@ def _build_google_news_query_jobs() -> List[Dict[str, str]]:
             "feed_url": _google_news_rss_url(q),
         })
 
+    # local hints per topic
+    local_hints = GOOGLE_NEWS_LOCAL_HINTS[:max(0, GOOGLE_NEWS_LOCAL_HINTS_PER_TOPIC)]
+
     for topic in CANONICAL_TOPICS:
+        # hard skip (defensive) if uk_students still present in canonical list somewhere
+        if topic == "uk_students":
+            continue
+
         bases = _TOPIC_TO_QUERY.get(topic) or [topic.replace("_", " ")]
+
+        per_topic_count = 0
+        def _inc() -> bool:
+            nonlocal per_topic_count
+            per_topic_count += 1
+            return (GOOGLE_NEWS_PER_TOPIC_MAX <= 0) or (per_topic_count <= GOOGLE_NEWS_PER_TOPIC_MAX)
 
         # global
         for b in bases:
+            if not _inc(): break
             _add(topic, b)
+            if not _inc(): break
             _add(topic, f"{b} news")
 
         # local
-        local_hints = GOOGLE_NEWS_LOCAL_HINTS[:max(0, GOOGLE_NEWS_LOCAL_HINTS_PER_TOPIC)]
         for hint in local_hints:
             for b in bases:
+                if not _inc(): break
                 _add(topic, f"{b} {hint}")
 
     if GOOGLE_NEWS_MAX_FEEDS > 0 and len(jobs) > GOOGLE_NEWS_MAX_FEEDS:
@@ -299,7 +338,7 @@ def _parse_rss_or_atom(xml_text: str) -> Tuple[str, List[Dict[str, Any]]]:
         return feed_title, items
 
     feed_title = _text(_find_child(root, "title")) or "Atom"
-    items: List[Dict[str, Any]] = []
+    items = []
     for e in _find_children(root, "entry"):
         title = _text(_find_child(e, "title"))
         link = ""
@@ -376,6 +415,10 @@ def _card_exists_by_title_fp(title_fp: str) -> Optional[int]:
 # -----------------------------
 
 def _openai_normalize_batch(items: List[Dict[str, Any]], language: str) -> List[Dict[str, Any]]:
+    """
+    items input: [{key,title,summary,url,source_name,seed_topic}]
+    returns: [{key,title,body,tags,primary_tag,importance_score,language,quality,url}]
+    """
     if not items:
         return []
 
@@ -383,18 +426,24 @@ def _openai_normalize_batch(items: List[Dict[str, Any]], language: str) -> List[
 
     system_prompt = (
         "Ты нормализуешь новости для ленты EYYE.\n"
-        "На вход дается список элементов (title+summary+url+source).\n"
+        "Главное: по СМЫСЛУ выбери корзину (primary_tag) и теги.\n"
+        "На вход: список items (key,title,summary,url,source_name,seed_topic).\n"
+        "seed_topic — слабая подсказка (может быть неверной). Если смысл не совпадает — игнорируй seed_topic.\n\n"
         "Верни валидный JSON строго формата {\"items\": [...]}.\n"
-        "Правила:\n"
-        "1) НЕ выдумывай факты и детали.\n"
-        "2) title: одно короткое нейтральное предложение.\n"
-        "3) body: 2–4 абзаца по 1–3 предложения, без эмодзи.\n"
-        "4) tags: 1–6 тегов только из allowlist.\n"
-        "5) importance_score: число 0..1\n"
-        f"6) language: строго '{language}'\n"
-        "7) ВАЖНО: поле key верни ТОЧНО таким же, как во входе (не меняй).\n"
-        "8) seed_topic — тема, по которой получен item. Используй как подсказку для tags.\n"
-        "Allowlist tags:\n" + allowlist
+        "Каждый элемент результата ОБЯЗАТЕЛЬНО содержит:\n"
+        "- key (верни ТОЧНО как во входе)\n"
+        "- title (коротко, нейтрально)\n"
+        "- body (2–4 абзаца по 1–3 предложения; можно перефразировать summary, без выдуманных фактов)\n"
+        "- primary_tag (ОДИН тег из allowlist)\n"
+        "- tags (1–6 тегов из allowlist; обязательно включает primary_tag)\n"
+        "- importance_score (0..1)\n"
+        f"- language (строго '{language}')\n"
+        "- url (повтори url из входа)\n\n"
+        "Запрещено:\n"
+        "- выдумывать факты, цифры, цитаты\n"
+        "- добавлять лишние поля вне JSON\n\n"
+        "Allowlist tags:\n"
+        + allowlist
     )
 
     user_payload = {"language": language, "items": items}
@@ -404,7 +453,7 @@ def _openai_normalize_batch(items: List[Dict[str, Any]], language: str) -> List[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
         ],
-        "max_output_tokens": 1400,
+        "max_output_tokens": 1600,
         "temperature": 0.25,
         "response_format": {"type": "json_object"},
     }
@@ -426,7 +475,17 @@ def _openai_normalize_batch(items: List[Dict[str, Any]], language: str) -> List[
     if not isinstance(parsed, dict):
         return []
 
-    out = parsed.get("items") or []
+    out: Any = parsed.get("items") or parsed.get("results") or []
+    # Some models may return {"items": {"<key>": {...}}}
+    if isinstance(out, dict):
+        tmp: List[Dict[str, Any]] = []
+        for k, v in out.items():
+            if isinstance(v, dict):
+                vv = dict(v)
+                vv.setdefault("key", k)
+                tmp.append(vv)
+        out = tmp
+
     if not isinstance(out, list):
         return []
 
@@ -435,14 +494,22 @@ def _openai_normalize_batch(items: List[Dict[str, Any]], language: str) -> List[
         if not isinstance(it, dict):
             continue
 
-        key = it.get("key") or it.get("id")
+        key = (it.get("key") or it.get("id") or "").strip()
         title = _clean_text(it.get("title"), 220)
         body = _clean_text(it.get("body") or it.get("summary"), 2600)
 
         if not key or not title or not body:
             continue
 
+        primary_tag = (it.get("primary_tag") or it.get("bucket") or "").strip().lower()
         tags = _normalize_tag_list(it.get("tags"), fallback=[])
+
+        # Ensure primary_tag is included if valid
+        if primary_tag:
+            tags = _normalize_tag_list([primary_tag] + tags, fallback=[])
+        if tags and not primary_tag:
+            primary_tag = tags[0]
+
         imp = _clamp01(it.get("importance_score", 0.6))
 
         results.append({
@@ -450,11 +517,13 @@ def _openai_normalize_batch(items: List[Dict[str, Any]], language: str) -> List[
             "title": title,
             "body": body,
             "tags": tags,
+            "primary_tag": primary_tag,
             "importance_score": imp,
             "language": language,
             "quality": "ok",
             "url": (it.get("url") or it.get("link") or "").strip(),
         })
+
     return results
 
 
@@ -473,6 +542,11 @@ def _insert_rss_card(norm: Dict[str, Any], raw: Dict[str, Any]) -> Optional[int]
     if existing_title:
         return existing_title
 
+    # If model returned no tags, keep at least seed_topic tag if possible
+    tags = norm.get("tags") or []
+    if not tags:
+        tags = _seed_tag_or_empty(raw.get("seed_topic"))
+
     meta = {
         "source_name": raw.get("source_name"),
         "feed_title": raw.get("feed_title"),
@@ -484,12 +558,14 @@ def _insert_rss_card(norm: Dict[str, Any], raw: Dict[str, Any]) -> Optional[int]
         "raw_title": raw.get("raw_title"),
         "seed_topic": raw.get("seed_topic"),
         "seed_query": raw.get("seed_query"),
+        "primary_tag": norm.get("primary_tag") or (tags[0] if tags else None),
+        "llm": True,
     }
 
     payload = {
         "title": title,
         "body": norm.get("body"),
-        "tags": norm.get("tags") or [],
+        "tags": tags,
         "importance_score": float(norm.get("importance_score", 0.6)),
         "language": norm.get("language") or RSS_DEFAULT_LANGUAGE,
         "is_active": True,
@@ -523,6 +599,8 @@ def _fallback_insert_raw_card(raw: Dict[str, Any], language: str) -> Optional[in
     if existing_title:
         return existing_title
 
+    tags = _seed_tag_or_empty(raw.get("seed_topic"))
+
     meta = {
         "source_name": raw.get("source_name"),
         "feed_title": raw.get("feed_title"),
@@ -534,12 +612,14 @@ def _fallback_insert_raw_card(raw: Dict[str, Any], language: str) -> Optional[in
         "raw_title": raw.get("raw_title") or title,
         "seed_topic": raw.get("seed_topic"),
         "seed_query": raw.get("seed_query"),
+        "primary_tag": tags[0] if tags else None,
+        "llm": False,
     }
 
     payload = {
         "title": title,
         "body": summary,
-        "tags": [],
+        "tags": tags,
         "importance_score": 0.45,
         "language": language,
         "is_active": True,
@@ -596,8 +676,12 @@ def main() -> None:
 
     for job in feed_jobs:
         feed_url = job.get("feed_url") or ""
-        seed_topic = job.get("seed_topic")
+        seed_topic = (job.get("seed_topic") or "").strip().lower() or None
         seed_query = job.get("query")
+
+        # hard skip uk_students (defensive)
+        if seed_topic == "uk_students":
+            continue
 
         try:
             xml_text = _fetch_xml(feed_url)
@@ -628,13 +712,17 @@ def main() -> None:
                 if _card_exists_by_source_ref(url):
                     continue
 
+                k = _stable_item_key(url)
+                if not k:
+                    continue
+
                 candidates.append({
-                    "key": _stable_item_key(url),
+                    "key": k,
                     "title": raw_title,
                     "summary": summary,
                     "url": url,
                     "source_name": feed_title,
-                    "seed_topic": seed_topic,
+                    "seed_topic": seed_topic,  # hint only
                 })
 
             if not candidates:
@@ -676,7 +764,7 @@ def main() -> None:
                             resolved.append(n)
                             continue
 
-                    bad_keys.append(k[:120])
+                    bad_keys.append(k[:120] if k else "<empty>")
 
                 if bad_keys:
                     log.warning("OpenAI returned %d items with keys not in batch (sample): %s", len(bad_keys), bad_keys[:5])
@@ -690,8 +778,6 @@ def main() -> None:
                         "OpenAI missing %d/%d items in batch. Will fallback raw for missing. seed_topic=%s feed=%s",
                         len(missing_keys), len(expected_keys), seed_topic, feed_title
                     )
-
-                inserted_this_batch = 0
 
                 # insert normalized
                 for n in resolved:
@@ -717,7 +803,6 @@ def main() -> None:
                     card_id = _insert_rss_card(n, raw2)
                     if card_id:
                         total_new += 1
-                        inserted_this_batch += 1
 
                 # fallback raw for missing items (точечно)
                 if RSS_FALLBACK_INSERT and missing_keys:
@@ -744,7 +829,10 @@ def main() -> None:
 
             log.info(
                 "RSS feed processed: %s candidates=%d seed_topic=%s query=%s",
-                feed_title, len(candidates), seed_topic, (seed_query[:60] + "..." if seed_query and len(seed_query) > 60 else seed_query)
+                feed_title,
+                len(candidates),
+                seed_topic,
+                _short(seed_query, 60),
             )
 
         except Exception:
