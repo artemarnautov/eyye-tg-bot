@@ -100,7 +100,45 @@ FEED_MAX_FETCH_LIMIT = int(os.getenv("FEED_MAX_FETCH_LIMIT", "600"))
 
 # wide/deep оставляем как fallback, но "news" всё равно стараемся не показывать глубже 7 дней
 FEED_WIDE_AGE_HOURS = int(os.getenv("FEED_WIDE_AGE_HOURS", "2160"))    # 90 дней
-FEED_DEEP_AGE_HOURS = int(os.getenv("FEED_DEEP_AGE_HOURS", "8760"))    # 1 год
+FEED_DEEP_AGE_HOURS = int(os.getenv("FEED_DEEP_AGE_HOURS", "8760")) 
+
+def _env_int(name: str, default: int, min_v: Optional[int] = None, max_v: Optional[int] = None) -> int:
+    try:
+        v = int(os.getenv(name, str(default)))
+    except Exception:
+        v = default
+    if min_v is not None:
+        v = max(min_v, v)
+    if max_v is not None:
+        v = min(max_v, v)
+    return v
+
+def _env_float(name: str, default: float, min_v: Optional[float] = None, max_v: Optional[float] = None) -> float:
+    try:
+        v = float(os.getenv(name, str(default)))
+    except Exception:
+        v = default
+    if min_v is not None:
+        v = max(min_v, v)
+    if max_v is not None:
+        v = min(max_v, v)
+    return v
+
+# pagination default: "cursor" (blend) или "offset"
+FEED_PAGINATION_MODE = (os.getenv("FEED_PAGINATION_MODE", "cursor") or "cursor").strip().lower()
+
+# buckets/квоты
+FEED_FRESH_BUCKET_HOURS = _env_int("FEED_FRESH_BUCKET_HOURS", 12, 1, 168)
+FEED_MID_BUCKET_HOURS = _env_int("FEED_MID_BUCKET_HOURS", 48, FEED_FRESH_BUCKET_HOURS + 1, 168)
+FEED_FRESH_RATIO = _env_float("FEED_FRESH_RATIO", 0.60, 0.20, 0.90)
+
+FEED_RELATED_MAX_PER_PAGE = _env_int("FEED_RELATED_MAX_PER_PAGE", 2, 0, 10)
+FEED_FOLLOWUP_MAX_PER_PAGE = _env_int("FEED_FOLLOWUP_MAX_PER_PAGE", 1, 0, 5)
+
+# storyline эвристика
+FEED_STORY_SIM_THRESHOLD = _env_float("FEED_STORY_SIM_THRESHOLD", 0.32, 0.0, 1.0)
+FEED_STORY_LOOKBACK_HOURS = _env_int("FEED_STORY_LOOKBACK_HOURS", 72, 1, FEED_MAX_CARD_AGE_HOURS)
+   # 1 год
 
 DEFAULT_SOURCE_NAME = os.getenv("DEFAULT_SOURCE_NAME", "EYYE • AI-подборка")
 
@@ -127,8 +165,9 @@ def _encode_cursor_obj(obj: Dict[str, Any]) -> str:
     return base64.urlsafe_b64encode(raw).decode("utf-8").rstrip("=")
 
 def _decode_cursor_obj(token: Optional[str]) -> Optional[Dict[str, Any]]:
+    # None => стартовая выдача (не ошибка)
     if token is None:
-        return None
+        return {}
     t = str(token).strip()
     if t == "":
         return {}  # пустой cursor = старт blend-ленты
@@ -139,6 +178,7 @@ def _decode_cursor_obj(token: Optional[str]) -> Optional[Dict[str, Any]]:
         return obj if isinstance(obj, dict) else None
     except Exception:
         return None
+
 
 # backward compatibility wrappers (если где-то ещё ожидают before_id)
 def _encode_cursor(before_id: Optional[int]) -> Optional[str]:
@@ -987,45 +1027,61 @@ def _build_age_bucket_plan(
     read_avg_age_hours: Optional[float],
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Идея:
-    - мешаем новое + чуть более старое, но не уводим глубоко "в прошлое"
-    - всё в пределах FEED_MAX_CARD_AGE_HOURS (для news)
-    Бакеты:
-      A: 0..12h
-      B: 12..48h
-      C: 48..168h (или меньше, если FEED_MAX_CARD_AGE_HOURS < 168)
+    Бакеты (внутри FEED_MAX_CARD_AGE_HOURS):
+      A: 0..FEED_FRESH_BUCKET_HOURS
+      B: FEED_FRESH_BUCKET_HOURS..FEED_MID_BUCKET_HOURS
+      C: FEED_MID_BUCKET_HOURS..cap
+    Доли: управляются FEED_FRESH_RATIO + авто-коррекция по read_avg_age_hours.
     """
-    max_h = max(24, FEED_MAX_CARD_AGE_HOURS)
-    c_max = min(max_h, 168)
+
+    max_hard = max(24, FEED_MAX_CARD_AGE_HOURS)
+
+    # мягкий cap, чтобы лента не "ползла" к границе 7 дней, если пользователь читает супер-свежее
+    cap = max_hard
+    if read_avg_age_hours is not None:
+        # если средний возраст недавно просмотренного небольшой — не даём tail слишком стареть
+        if read_avg_age_hours < 18:
+            cap = min(max_hard, 72)
+        elif read_avg_age_hours < 36:
+            cap = min(max_hard, 96)
+
+    fresh_h = min(FEED_FRESH_BUCKET_HOURS, cap)
+    mid_h = min(max(FEED_MID_BUCKET_HOURS, fresh_h + 1), cap)
 
     # базовые доли
-    wA, wB, wC = 0.50, 0.30, 0.20
+    wA = float(FEED_FRESH_RATIO)
+    wB = (1.0 - wA) * 0.60
+    wC = max(0.0, 1.0 - wA - wB)
 
-    # если пользователь уже "ушёл назад" (читает старое) — возвращаем больше свежего
+    # если пользователь уже "читает старое" — возвращаем больше свежего
     if read_avg_age_hours is not None:
         if read_avg_age_hours > 72:
-            wA, wB, wC = 0.65, 0.25, 0.10
+            wA, wB, wC = 0.70, 0.22, 0.08
         elif read_avg_age_hours > 48:
-            wA, wB, wC = 0.58, 0.28, 0.14
+            wA, wB, wC = 0.64, 0.24, 0.12
 
-    # превращаем доли в counts
     a = max(1, int(round(limit * wA)))
     b = max(1, int(round(limit * wB)))
     c = max(0, limit - a - b)
-    if c < 0:
-        c = 0
-        # подрежем b
-        b = max(1, limit - a)
-    if a + b + c < limit:
-        a = a + (limit - (a + b + c))
+    if a + b + c != limit:
+        # добиваем ровно до limit
+        a = max(1, limit - b - c)
 
     plan = [
-        {"name": "fresh_0_12h", "min_age": 0, "max_age": 12, "count": a},
-        {"name": "mid_12_48h", "min_age": 12, "max_age": 48, "count": b},
-        {"name": "old_48_cap", "min_age": 48, "max_age": c_max, "count": c},
+        {"name": "fresh", "min_age": 0, "max_age": fresh_h, "count": a},
+        {"name": "mid", "min_age": fresh_h, "max_age": mid_h, "count": b},
+        {"name": "old", "min_age": mid_h, "max_age": cap, "count": c},
     ]
-    debug = {"bucket_counts": {"A": a, "B": b, "C": c}, "max_news_age_hours": FEED_MAX_CARD_AGE_HOURS}
+    debug = {
+        "bucket_counts": {"A": a, "B": b, "C": c},
+        "fresh_h": fresh_h,
+        "mid_h": mid_h,
+        "cap_h": cap,
+        "max_news_age_hours": FEED_MAX_CARD_AGE_HOURS,
+        "fresh_ratio": FEED_FRESH_RATIO,
+    }
     return plan, debug
+
 
 
 def _collect_candidates_blend(
@@ -1604,7 +1660,155 @@ def build_feed_for_user_cursor(
     debug["postprocess"] = postprocess_debug
     debug["ranked_total"] = len(ranked)
 
-    page = ranked[:limit]
+        # ====== Storyline/Related injection (дозировано) ======
+
+    seed_ids: Set[int] = set(pos.get("seed_card_ids") or [])
+    seed_title_sets: List[Set[str]] = []
+    seed_tags_set: Set[str] = set(str(x).strip() for x in (seed_tags or []) if str(x).strip())
+
+    if seed_ids:
+        try:
+            resp_seed = (
+                supabase.table("cards")
+                .select("id,title,created_at")
+                .in_("id", sorted(seed_ids))
+                .execute()
+            )
+            data_seed = getattr(resp_seed, "data", None) or getattr(resp_seed, "model", None) or []
+            for r in data_seed:
+                ttl = str(r.get("title") or "")
+                s = _title_token_set(ttl)
+                if s:
+                    seed_title_sets.append(s)
+        except Exception:
+            logger.exception("Failed to load seed titles for tg_id=%s", user_id)
+
+    def _is_followup_candidate(card: Dict[str, Any]) -> bool:
+        cid = _safe_int_id(card.get("id"))
+        if cid is None or cid in seed_ids:
+            return False
+
+        # ограничиваем по времени (в пределах lookback и 7 дней)
+        ca = card.get("created_at")
+        if isinstance(ca, str):
+            try:
+                dt = datetime.fromisoformat(ca.replace("Z", "+00:00"))
+                age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+                if age_h > float(FEED_STORY_LOOKBACK_HOURS):
+                    return False
+            except Exception:
+                pass
+
+        tags = card.get("tags") or []
+        if not isinstance(tags, list):
+            tags = []
+        if seed_tags_set:
+            if not any(str(t).strip() in seed_tags_set for t in tags):
+                return False
+
+        if not seed_title_sets:
+            # если нет seed titles — fallback: просто tag overlap с seed_tags
+            return True
+
+        cand_set = _title_token_set(str(card.get("title") or ""))
+        if not cand_set:
+            return False
+
+        best = 0.0
+        for s in seed_title_sets:
+            best = max(best, _jaccard(cand_set, s))
+            if best >= float(FEED_STORY_SIM_THRESHOLD):
+                return True
+        return False
+
+    def _is_related_candidate(card: Dict[str, Any]) -> bool:
+        # related = пересечение с hot_tags, но не followup
+        if _is_followup_candidate(card):
+            return False
+        tags = card.get("tags") or []
+        if not isinstance(tags, list):
+            tags = []
+        return any(str(t).strip() in hot_tags_set for t in tags)
+
+    followup_pool = [c for c in ranked if _is_followup_candidate(c)]
+    related_pool = [c for c in ranked if _is_related_candidate(c)]
+
+    followup_take = followup_pool[: int(FEED_FOLLOWUP_MAX_PER_PAGE)]
+    related_take = related_pool[: int(FEED_RELATED_MAX_PER_PAGE)]
+
+    used_ids: Set[int] = set()
+    for x in followup_take + related_take:
+        cid = _safe_int_id(x.get("id"))
+        if cid is not None:
+            used_ids.add(cid)
+
+    # позиции вставки (чуть варьируем от seq, чтобы лента не выглядела "по шаблону")
+    def _shift(pos_list: List[int], shift: int) -> List[int]:
+        out = []
+        for p in pos_list:
+            out.append(max(0, min(limit - 1, p + shift)))
+        # уникализируем сохраняя порядок
+        seenp = set()
+        uniq = []
+        for p in out:
+            if p not in seenp:
+                seenp.add(p)
+                uniq.append(p)
+        return uniq
+
+    followup_positions = _shift([3], shift=(seq % 2))          # 3 или 4
+    related_positions = _shift([1, 6], shift=(seq % 3) - 1)    # чуть гуляем
+
+    slots: List[Optional[Dict[str, Any]]] = [None] * limit
+
+    # ставим followup
+    for i, card in enumerate(followup_take):
+        if i >= len(followup_positions):
+            break
+        p = followup_positions[i]
+        slots[p] = card
+
+    # ставим related
+    r_i = 0
+    for p in related_positions:
+        if r_i >= len(related_take):
+            break
+        if slots[p] is not None:
+            continue
+        slots[p] = related_take[r_i]
+        r_i += 1
+
+    # добиваем остальным ranked
+    fill_iter = iter(ranked)
+    for i in range(limit):
+        if slots[i] is not None:
+            continue
+        while True:
+            try:
+                c = next(fill_iter)
+            except StopIteration:
+                c = None
+            if c is None:
+                break
+            cid = _safe_int_id(c.get("id"))
+            if cid is not None and cid in used_ids:
+                continue
+            slots[i] = c
+            if cid is not None:
+                used_ids.add(cid)
+            break
+
+    page = [c for c in slots if c is not None][:limit]
+    debug["injections"] = {
+        "followup_max": int(FEED_FOLLOWUP_MAX_PER_PAGE),
+        "related_max": int(FEED_RELATED_MAX_PER_PAGE),
+        "followup_taken": len(followup_take),
+        "related_taken": len(related_take),
+        "seed_ids": list(seed_ids)[:8],
+        "story_sim_threshold": float(FEED_STORY_SIM_THRESHOLD),
+        "story_lookback_hours": int(FEED_STORY_LOOKBACK_HOURS),
+    }
+
     debug["returned"] = len(page)
 
     # 8) next cursor: всегда отдаём следующий seq (blend бесконечный)
@@ -1612,6 +1816,7 @@ def build_feed_for_user_cursor(
 
     debug["seen_marked"] = int(_mark_cards_as_seen(supabase, user_id, page))
     return page, debug, next_cursor
+
 
 
 # ===================== Public wrapper =====================
@@ -1628,18 +1833,20 @@ def build_feed_for_user_paginated(
     limit = min(max(limit, 1), 50)
     offset = max(0, int(offset))
 
-    if cursor is not None:
-        items, debug, next_cursor = build_feed_for_user_cursor(
-            supabase=supabase, user_id=user_id, limit=limit, cursor=cursor
-        )
-        cursor_meta = {
-            "mode": "cursor",
-            "cursor": cursor,
-            "next_cursor": next_cursor,
-            "limit": limit,
-            "has_more": True,  # blend считаем бесконечным
-        }
-        return items, debug, cursor_meta
+    use_cursor_default = (FEED_PAGINATION_MODE == "cursor")
+if cursor is not None or use_cursor_default:
+    items, debug, next_cursor = build_feed_for_user_cursor(
+        supabase=supabase, user_id=user_id, limit=limit, cursor=cursor
+    )
+    cursor_meta = {
+        "mode": "cursor",
+        "cursor": cursor,
+        "next_cursor": next_cursor,
+        "limit": limit,
+        "has_more": True,
+    }
+    return items, debug, cursor_meta
+
 
     items, base_debug = build_feed_for_user(
         supabase=supabase,

@@ -1,8 +1,42 @@
 // file: webapp/telemetry.js
 (function () {
+  "use strict";
+
   const API_PATH = "/api/events";
 
-  // Разбираем tg_id из query-параметра: ?tg_id=123 (фоллбек)
+  // ====== Настройки (профессиональная телеметрия под TikTok-UX) ======
+  const FLUSH_INTERVAL_MS = 2000; // как часто пытаемся отправлять пачку
+  const MAX_BATCH_SIZE = 50;
+
+  // Heartbeat: как часто обновляем dwell, пока карточка на экране
+  const HEARTBEAT_MS = 5000;
+
+  // Минимальный прирост dwell, чтобы отправлять очередной view (анти-спам)
+  const VIEW_SEND_STEP_MS = 1200;
+
+  // Жёсткий кламп (защита от вкладки в фоне / багов)
+  const MAX_DWELL_MS = 120000;
+
+  // Фикс: открытие списка источников — сильный сигнал.
+  // Перед этим иногда полезно "зафиксировать" view (вес сигнала на бэке).
+  const SEND_VIEW_BEFORE_SOURCES_OPEN = true;
+
+  // ====== session meta ======
+  const SESSION_ID = (function makeSessionId() {
+    try {
+      // короткий, но уникальный для текущей вкладки
+      return (
+        Date.now().toString(36) +
+        "-" +
+        Math.random().toString(36).slice(2, 10)
+      );
+    } catch (e) {
+      return String(Date.now());
+    }
+  })();
+
+  // ====== tg_id / source ======
+
   function getTgIdFromUrl() {
     try {
       const params = new URLSearchParams(window.location.search);
@@ -20,21 +54,24 @@
   let SOURCE = "webapp";
 
   if (!TG_ID) {
-    console.warn(
-      "[EYYE Telemetry] tg_id is missing in URL (will wait for init/setTgId)."
-    );
+    console.warn("[EYYE Telemetry] tg_id is missing (will wait for init/setTgId).");
   }
 
-  /** Очередь событий, которые ещё не отправлены */
+  // ====== Очередь/отправка ======
+
   const queue = [];
   let flushTimer = null;
-  const FLUSH_INTERVAL_MS = 2000; // раз в 2 секунды
-  const MAX_BATCH_SIZE = 50;
 
-  // Локальное состояние текущей карточки для расчёта dwell_ms
-  let currentCardId = null;
-  let currentPosition = null;
-  let currentShownAtMs = null;
+  function nowIso() {
+    return new Date().toISOString();
+  }
+
+  function clampInt(v, lo, hi) {
+    v = Math.round(Number(v) || 0);
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+  }
 
   function setTgIdInternal(newTgId) {
     const n = Number(newTgId);
@@ -45,19 +82,37 @@
     TG_ID = n;
   }
 
+  // Coalesce: если в очереди уже есть view по этой карточке — обновляем dwell, не создаём новую запись.
   function enqueue(event) {
-    if (!TG_ID) {
-      // Не знаем пользователя — не логируем
-      return;
-    }
+    if (!TG_ID) return;
 
-    queue.push(event);
-
-    // Ограничим очередь, чтобы не раздувать память
+    // Ограничим память
     if (queue.length > 3 * MAX_BATCH_SIZE) {
       queue.splice(0, queue.length - 3 * MAX_BATCH_SIZE);
     }
 
+    if (event && event.type === "view" && Number.isFinite(event.card_id)) {
+      const cid = event.card_id;
+
+      // ищем с конца ближайший view по этой карточке
+      for (let i = queue.length - 1; i >= 0; i--) {
+        const ev = queue[i];
+        if (ev && ev.type === "view" && ev.card_id === cid) {
+          // max dwell + обновим ts/position/source/extra (если есть)
+          const prev = Number(ev.dwell_ms || 0);
+          const cur = Number(event.dwell_ms || 0);
+          if (cur > prev) ev.dwell_ms = cur;
+          if (event.ts) ev.ts = event.ts;
+          if (event.position != null) ev.position = event.position;
+          if (event.source) ev.source = event.source;
+          if (event.extra != null) ev.extra = event.extra;
+          scheduleFlush();
+          return;
+        }
+      }
+    }
+
+    queue.push(event);
     scheduleFlush();
   }
 
@@ -83,22 +138,19 @@
     try {
       await fetch(API_PATH, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
-        keepalive: true, // на случай закрытия вкладки
+        keepalive: true,
       });
     } catch (e) {
       console.warn("[EYYE Telemetry] Failed to send events", e);
-      // На фейле можно вернуть часть событий обратно
-      const leftovers = batch.slice(-MAX_BATCH_SIZE);
-      queue.unshift(...leftovers);
+      // вернём события обратно (best-effort)
+      queue.unshift(...batch.slice(-MAX_BATCH_SIZE));
     }
   }
 
-  // Попытка дослать события при закрытии/перезагрузке
-  window.addEventListener("beforeunload", () => {
+  // Надёжнее beforeunload: pagehide + visibilitychange
+  function flushBeaconBestEffort() {
     if (!queue.length || !TG_ID) return;
 
     const payload = JSON.stringify({
@@ -106,29 +158,38 @@
       events: queue.slice(0, MAX_BATCH_SIZE),
     });
 
-    // Если есть sendBeacon — используем его
     if (navigator.sendBeacon) {
       try {
         const blob = new Blob([payload], { type: "application/json" });
         navigator.sendBeacon(API_PATH, blob);
         return;
       } catch (e) {
-        console.warn("[EYYE Telemetry] sendBeacon failed", e);
+        // fallthrough
       }
     }
 
-    // Фоллбек — синхронный XHR (не идеален, но лучше, чем ничего)
+    // фоллбек: sync XHR
     try {
       const xhr = new XMLHttpRequest();
-      xhr.open("POST", API_PATH, false); // false = sync
+      xhr.open("POST", API_PATH, false);
       xhr.setRequestHeader("Content-Type", "application/json");
       xhr.send(payload);
     } catch (e) {
-      // забиваем, вкладка всё равно закрывается
+      // ignore
     }
+  }
+
+  window.addEventListener("pagehide", () => {
+    finalizeCurrentCard("pagehide", { flushNow: true });
+    flushBeaconBestEffort();
   });
 
-  // ========= ВСПОМОГАТЕЛЬНОЕ =========
+  window.addEventListener("beforeunload", () => {
+    finalizeCurrentCard("beforeunload", { flushNow: true });
+    flushBeaconBestEffort();
+  });
+
+  // ====== Канонизация типов ======
 
   function normalizeCardId(cardId) {
     const n = Number(cardId);
@@ -136,16 +197,6 @@
     return n;
   }
 
-  /**
-   * Маппинг внешних типов событий (impression, swipe_next, click_source и т.п.)
-   * в "канонические" типы для backend-а.
-   *
-   * Backend сейчас знает:
-   *   - view
-   *   - like
-   *   - dislike
-   *   - open_source
-   */
   function mapEventTypeForBackend(eventType) {
     switch (eventType) {
       case "view":
@@ -154,11 +205,17 @@
         return "like";
       case "dislike":
         return "dislike";
-      case "click_source":
+
+      // ВАЖНО:
+      // В текущей схеме бэка есть только open_source.
+      // Мы используем open_source как “opened sources list” (а не клик по ссылке).
+      case "sources_open":
       case "open_source":
+      case "click_source": // legacy
         return "open_source";
+
       default:
-        return null; // эти события backend пока не обрабатывает
+        return null;
     }
   }
 
@@ -167,166 +224,281 @@
     if (cid === null) return;
 
     const backendType = mapEventTypeForBackend(eventType);
-    if (!backendType) {
-      // Для impression/swipe_next/click_more/share пока ничего не шлём на backend
-      return;
-    }
-
-    const nowIso = new Date().toISOString();
+    if (!backendType) return;
 
     enqueue({
-      type: backendType, // то, что ждёт backend (EventsRequest.Event.type)
+      type: backendType,
       card_id: cid,
-      ts: nowIso,
-      dwell_ms: dwellMs == null ? null : Math.round(dwellMs),
-      // доп. поля на будущее — backend их сейчас игнорирует
+      ts: nowIso(),
+      dwell_ms: dwellMs == null ? null : clampInt(dwellMs, 0, MAX_DWELL_MS),
+
+      // поля ниже бэк может игнорировать (если модель не принимает extra),
+      // но мы их держим для будущего расширения:
       position: typeof position === "number" ? position : null,
       source: SOURCE || "webapp",
       extra: extra || null,
+      session_id: SESSION_ID,
     });
   }
 
-  // ========= Публичный API =========
+  // ====== TikTok-like dwell engine ======
+  // Считаем только "видимое" время на карточке: пауза на hidden, финализация на swipe / hide / уход.
+  let currentCardId = null;
+  let currentPosition = null;
+
+  // (опционально) мета карточки — пригодится позже для нормализации “скорости чтения”
+  // если начнёшь передавать, например, word_count из app.js.
+  let currentCardMeta = null;
+
+  let isVisible = document.visibilityState === "visible";
+  let lastVisStartPerf = null; // performance.now() когда карточка стала видимой
+  let accumulatedVisibleMs = 0;
+
+  let heartbeatTimer = null;
+  let lastSentDwellMs = 0;
+
+  function perfNow() {
+    return (window.performance && performance.now) ? performance.now() : Date.now();
+  }
+
+  function startVisibleWindow() {
+    if (currentCardId == null) return;
+    if (!isVisible) return;
+    if (lastVisStartPerf != null) return;
+    lastVisStartPerf = perfNow();
+  }
+
+  function stopVisibleWindow() {
+    if (currentCardId == null) return;
+    if (lastVisStartPerf == null) return;
+    const delta = perfNow() - lastVisStartPerf;
+    if (delta > 0) accumulatedVisibleMs += delta;
+    lastVisStartPerf = null;
+  }
+
+  function getCurrentDwellMs() {
+    if (currentCardId == null) return 0;
+    let ms = accumulatedVisibleMs;
+    if (isVisible && lastVisStartPerf != null) {
+      ms += (perfNow() - lastVisStartPerf);
+    }
+    return clampInt(ms, 0, MAX_DWELL_MS);
+  }
+
+  function maybeSendView(reason, force) {
+    if (currentCardId == null) return;
+
+    const dwell = getCurrentDwellMs();
+
+    // анти-спам: отправляем только если dwell вырос заметно
+    if (!force && dwell < lastSentDwellMs + VIEW_SEND_STEP_MS) return;
+
+    lastSentDwellMs = dwell;
+
+    baseEvent(currentCardId, "view", currentPosition, dwell, {
+      reason: reason || "heartbeat",
+      visible: !!isVisible,
+      meta: currentCardMeta || null,
+    });
+  }
+
+  function startHeartbeat() {
+    stopHeartbeat();
+    heartbeatTimer = window.setInterval(() => {
+      if (currentCardId == null) return;
+      if (!isVisible) return;
+      maybeSendView("heartbeat", false);
+    }, HEARTBEAT_MS);
+  }
+
+  function stopHeartbeat() {
+    if (heartbeatTimer != null) {
+      window.clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+  }
+
+  function finalizeCurrentCard(reason, opts) {
+    opts = opts || {};
+    if (currentCardId == null) return;
+
+    stopVisibleWindow();
+    maybeSendView(reason || "finalize", true);
+
+    if (opts.flushNow) {
+      flushBeaconBestEffort();
+    }
+
+    // сброс состояния
+    currentCardId = null;
+    currentPosition = null;
+    currentCardMeta = null;
+    accumulatedVisibleMs = 0;
+    lastVisStartPerf = null;
+    lastSentDwellMs = 0;
+    stopHeartbeat();
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    const nowVisible = document.visibilityState === "visible";
+    if (nowVisible === isVisible) return;
+    isVisible = nowVisible;
+
+    if (isVisible) {
+      startVisibleWindow();
+    } else {
+      stopVisibleWindow();
+      maybeSendView("visibility_hidden", true);
+      flushBeaconBestEffort();
+    }
+  });
+
+  // ====== Событие: открытие/закрытие списка источников ======
+  // По твоей новой UX-логике:
+  // - источники не кликабельны
+  // - есть только toggle (open/close) по нажатию на поле “Sources”
+  // Мы логируем strong signal только на OPEN (по умолчанию), close — опционально.
+  function logSourcesToggle(cardId, position, opened, sourcesCount) {
+    if (currentCardId == null) return;
+    const cid = normalizeCardId(cardId);
+    if (cid == null) return;
+
+    // Если открыли список источников на текущей карточке —
+    // можно зафиксировать view прямо перед этим (чтобы не потерять dwell).
+    if (opened && SEND_VIEW_BEFORE_SOURCES_OPEN && cid === Number(currentCardId)) {
+      stopVisibleWindow();
+      maybeSendView("pre_sources_open", true);
+      // продолжим считать дальше
+      if (document.visibilityState === "visible") {
+        isVisible = true;
+        startVisibleWindow();
+      }
+    }
+
+    // ЛОГИРУЕМ ТОЛЬКО OPEN (чтобы не зашумлять события)
+    if (opened) {
+      baseEvent(cid, "sources_open", position, null, {
+        reason: "sources_list_open",
+        sources_count: Number.isFinite(Number(sourcesCount)) ? Number(sourcesCount) : null,
+      });
+    } else {
+      // Если захочешь логировать close — раскомментируй:
+      // baseEvent(cid, "sources_open", position, null, { reason: "sources_list_close" });
+    }
+  }
+
+  // ====== Публичный API ======
 
   const Telemetry = {
-    /** Инициализация из WebApp (предпочтительный способ) */
     init(options) {
       options = options || {};
-      if (options.tgId != null) {
-        setTgIdInternal(options.tgId);
-      }
-      if (options.source) {
-        SOURCE = String(options.source);
-      }
+      if (options.tgId != null) setTgIdInternal(options.tgId);
+      if (options.source) SOURCE = String(options.source);
     },
 
-    /** Можно вызвать, если хочешь явно установить tg_id (например, из JS) */
     setTgId(newTgId) {
       setTgIdInternal(newTgId);
     },
 
-    /** Простой логгер произвольного события, если захочешь что-то своё */
     logEvent(cardId, eventType, options = {}) {
-      baseEvent(
-        cardId,
-        eventType,
-        options.position,
-        options.dwellMs,
-        options.extra
-      );
+      baseEvent(cardId, eventType, options.position, options.dwellMs, options.extra);
     },
-
-    // ===== Специализированные сахарные методы =====
 
     view(cardId, position, dwellMs) {
       baseEvent(cardId, "view", position, dwellMs);
     },
 
-    impression(cardId, position) {
-      // Сейчас impression никак не используется на backend-е
-      baseEvent(cardId, "impression", position, null);
+    // ====== NEW: toggle источников (под новую UX-логику) ======
+    sourcesToggle(cardId, position, opened, sourcesCount) {
+      logSourcesToggle(cardId, position, !!opened, sourcesCount);
     },
 
-    swipeNext(cardId, position, dwellMs) {
-      // Сейчас swipe_next никак не используется на backend-е
-      baseEvent(cardId, "swipe_next", position, dwellMs);
-    },
-
-    clickMore(cardId, position) {
-      baseEvent(cardId, "click_more", position, null);
-    },
-
+    // ====== LEGACY: раньше это был “клик по источнику”.
+    // Теперь трактуем как “открыли список источников”, чтобы ничего не сломалось.
     clickSource(cardId, position) {
-      baseEvent(cardId, "click_source", position, null);
+      logSourcesToggle(cardId, position, true, null);
     },
 
     like(cardId, position) {
-      baseEvent(cardId, "like", position, null);
+      baseEvent(cardId, "like", position, null, null);
     },
 
     dislike(cardId, position) {
-      baseEvent(cardId, "dislike", position, null);
+      baseEvent(cardId, "dislike", position, null, null);
     },
 
-    share(cardId, position) {
-      baseEvent(cardId, "share", position, null);
-    },
-
-    // ===== Обёртки под текущий app.js =====
+    // ====== Интеграция с app.js ======
 
     /**
      * Вызывается при показе карточки (renderCurrentCard).
-     * Фиксируем момент появления карточки на экране.
+     * Стартуем “watch session”: считаем только видимое время.
+     *
+     * Можно расширять ctx:
+     * - ctx.wordCount / ctx.textLen / ctx.lang (для нормализации скорости чтения)
      */
     onCardShown(ctx) {
       ctx = ctx || {};
-      const cardId = ctx.cardId;
-      const position = ctx.position;
       const tgId = ctx.tgId;
+      if (tgId != null) setTgIdInternal(tgId);
 
-      if (tgId != null) {
-        setTgIdInternal(tgId);
-      }
-
-      const cid = normalizeCardId(cardId);
+      const cid = normalizeCardId(ctx.cardId);
       if (cid === null) return;
 
-      currentCardId = cid;
-      currentPosition = typeof position === "number" ? position : null;
-      currentShownAtMs = Date.now();
+      // если предыдущая карточка не была финализирована — финализируем
+      if (currentCardId != null && currentCardId !== cid) {
+        finalizeCurrentCard("switch_card", { flushNow: false });
+      }
 
-      // Можно считать это "impression" — но backend пока его не использует
-      Telemetry.impression(cid, currentPosition);
+      currentCardId = cid;
+      currentPosition = typeof ctx.position === "number" ? ctx.position : null;
+
+      // мета карточки (опционально, для будущей “скорости чтения”)
+      currentCardMeta = null;
+      if (ctx.wordCount != null || ctx.textLen != null || ctx.lang) {
+        currentCardMeta = {
+          word_count: ctx.wordCount != null ? Number(ctx.wordCount) : null,
+          text_len: ctx.textLen != null ? Number(ctx.textLen) : null,
+          lang: ctx.lang ? String(ctx.lang) : null,
+        };
+      }
+
+      accumulatedVisibleMs = 0;
+      lastSentDwellMs = 0;
+      lastVisStartPerf = null;
+
+      if (document.visibilityState === "visible") {
+        isVisible = true;
+        startVisibleWindow();
+      } else {
+        isVisible = false;
+      }
+
+      startHeartbeat();
     },
 
     /**
      * Вызывается при свайпе вперёд (goToNextCard).
-     * Считаем dwell и ВСЕГДА отправляем:
-     *  - view (с фактическим dwell_ms)
-     *
-     * Backend уже сам решает:
-     *  - < 1 сек: быстрый пролист (сильный минус по тегам)
-     *  - 1–4 сек: прочитал заголовок, но не зацепило (лёгкий минус)
-     *  - 4–10 сек: нормальное чтение (плюс)
-     *  - > 10 сек: сильный интерес (сильный плюс)
+     * Финализируем dwell и отправляем финальный view (force).
      */
     onSwipeNext(ctx) {
       ctx = ctx || {};
-      const cardId = ctx.cardId;
-      const position = ctx.position;
       const tgId = ctx.tgId;
+      if (tgId != null) setTgIdInternal(tgId);
 
-      if (tgId != null) {
-        setTgIdInternal(tgId);
-      }
-
-      const cid = normalizeCardId(cardId);
+      const cid = normalizeCardId(ctx.cardId);
       if (cid === null) return;
 
-      let dwell = null;
-      if (currentCardId === cid && typeof currentShownAtMs === "number") {
-        dwell = Date.now() - currentShownAtMs;
-        if (dwell < 0) dwell = 0;
-      }
+      if (currentCardId == null) return;
 
-      const pos = typeof position === "number" ? position : null;
+      finalizeCurrentCard("swipe_next", { flushNow: false });
+    },
 
-      // Отправляем view ВСЕГДА, даже если dwell < 1 сек,
-      // чтобы backend мог учесть быстрый скролл как сильный минус.
-      if (dwell !== null) {
-        Telemetry.view(cid, pos, dwell);
-      }
-
-      // Логика swipe_next пока не используется на backend-е, но оставляем на будущее
-      Telemetry.swipeNext(cid, pos, dwell);
-
-      // Сбрасываем текущее состояние; следующая карточка вызовет onCardShown
-      currentCardId = null;
-      currentPosition = null;
-      currentShownAtMs = null;
+    // опционально на будущее, если добавишь телеметрию назад:
+    onSwipePrev(ctx) {
+      // можешь включить позже (сейчас app.js это не вызывает)
+      // finalizeCurrentCard("swipe_prev", { flushNow: false });
     },
   };
 
-  // Вешаем в глобал
   window.EYYETelemetry = Telemetry;
 })();
