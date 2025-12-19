@@ -39,7 +39,15 @@
     currentIndex: 0,
     loadingFeed: false,
     hasMore: true,
+
+    // ✅ NEW: режим пагинации и курсор
+    cursorMode: "cursor", // "cursor" | "offset"
+    nextCursor: null,     // string | null
+
+    // fallback (если сервер вернёт offset-mode)
     nextOffset: 0,
+
+    // dedup на фронте
     seenIds: {},
 
     // свайпы
@@ -148,7 +156,6 @@
   }
 
   function showOnboardingError(message) {
-    // Простой вывод ошибки как alert, чтобы точно увидеть
     alert(message);
   }
 
@@ -171,7 +178,6 @@
     }
     elTopicsContainer.innerHTML = html;
 
-    // навешиваем обработчики
     var buttons = elTopicsContainer.querySelectorAll(".topic-chip");
     for (var j = 0; j < buttons.length; j++) {
       (function (btn) {
@@ -234,7 +240,6 @@
         if (!resp.ok) {
           logDebug("Onboarding save HTTP error:", resp.status);
         }
-        // В любом случае после онбординга пробуем открыть фид
         state.onboardingDone = true;
         showScreen("feed");
         loadFeed(true);
@@ -261,7 +266,6 @@
       .then(function (resp) {
         if (!resp.ok) {
           logDebug("GET /api/profile HTTP error:", resp.status);
-          // если ошибка — просто показываем онбординг
           showScreen("onboarding");
           showOnboardingStep("city");
           return null;
@@ -273,7 +277,6 @@
         logDebug("Profile data:", data);
 
         if (data.has_onboarding) {
-          // онбординг уже пройден — сразу в фид
           state.onboardingDone = true;
           showScreen("feed");
           loadFeed(true);
@@ -284,7 +287,6 @@
       })
       .catch(function (err) {
         logDebug("GET /api/profile error:", err);
-        // при ошибке профиля всё равно даём онбординг
         showScreen("onboarding");
         showOnboardingStep("city");
       });
@@ -363,7 +365,6 @@
 
     elFeedCardContainer.innerHTML = html;
 
-    // === ТЕЛЕМЕТРИЯ: карточка показана пользователю ===
     if (
       window.EYYETelemetry &&
       typeof window.EYYETelemetry.onCardShown === "function" &&
@@ -395,59 +396,67 @@
     }
   }
 
+  // ✅ REPLACE THIS FUNCTION COMPLETELY
   function loadFeed(initial, opts) {
     opts = opts || {};
-  
-    var force = opts.force === true; // разрешаем загрузку даже если hasMore=false
-    var forceOffsetZero = opts.forceOffsetZero === true; // refresh с offset=0
+
+    var force = opts.force === true;                 // разрешаем загрузку даже если hasMore=false
+    var resetCursor = opts.resetCursor === true;     // ✅ для cursor-mode: начать заново без курсора
+    var forceOffsetZero = opts.forceOffsetZero === true; // fallback: refresh offset=0
     var onDone = typeof opts.onDone === "function" ? opts.onDone : null;
-  
+
     if (!state.tgId) {
       renderEmptyFeed(
         "Не удалось получить твой Telegram ID. Открой WebApp через кнопку в боте и попробуй снова."
       );
       return;
     }
-  
-    if (state.loadingFeed) {
-      return;
-    }
-  
-    // раньше тут был стоп, из-за которого мы зависали на последней карточке
-    if (!initial && !state.hasMore && !force) {
-      return;
-    }
-  
+
+    if (state.loadingFeed) return;
+
+    if (!initial && !state.hasMore && !force) return;
+
     state.loadingFeed = true;
-  
+
     if (initial) {
       state.feedItems = [];
       state.currentIndex = 0;
       state.hasMore = true;
+
+      // ✅ сбрасываем обе пагинации
       state.nextOffset = 0;
+      state.nextCursor = null;
+
+      // важно: в initial можно сбрасывать dedup, т.к. это новая сессия экрана
       state.seenIds = {};
     }
-  
+
     var limit = 20;
-    var offset = forceOffsetZero ? 0 : state.nextOffset;
-  
-    var url =
-      "/api/feed?tg_id=" +
-      encodeURIComponent(String(state.tgId)) +
-      "&limit=" +
-      String(limit) +
-      "&offset=" +
-      String(offset);
-  
-    logDebug("Loading feed:", url, "opts:", opts);
-  
+
+    // ---- строим URL в зависимости от режима ----
+    var url = "/api/feed?tg_id=" + encodeURIComponent(String(state.tgId)) + "&limit=" + String(limit);
+
+    // cursor-mode (по умолчанию)
+    if (state.cursorMode === "cursor") {
+      // offset всё равно передаём как 0, чтобы backend был доволен любым валидатором
+      url += "&offset=0";
+
+      if (!resetCursor && state.nextCursor) {
+        url += "&cursor=" + encodeURIComponent(String(state.nextCursor));
+      }
+    } else {
+      // offset-mode fallback
+      var offset = forceOffsetZero ? 0 : state.nextOffset;
+      url += "&offset=" + String(offset);
+    }
+
+    logDebug("Loading feed:", url, "opts:", opts, "cursorMode:", state.cursorMode, "nextCursor:", state.nextCursor, "nextOffset:", state.nextOffset);
+
     apiFetch(url, { method: "GET" })
       .then(function (resp) {
         if (!resp.ok) {
           logDebug("GET /api/feed HTTP error:", resp.status);
-          renderEmptyFeed(
-            "Не получилось загрузить ленту. Попробуй открыть WebApp чуть позже."
-          );
+          renderEmptyFeed("Не получилось загрузить ленту. Попробуй открыть WebApp чуть позже.");
           state.loadingFeed = false;
           if (onDone) onDone(0, [], null);
           return null;
@@ -456,20 +465,19 @@
       })
       .then(function (data) {
         if (!data) return;
-  
+
         var items = data.items || [];
         var debug = data.debug || {};
         var cursor = data.cursor || {};
-  
-        logDebug("Feed items batch:", items.length, "cursor:", cursor, "debug:", debug);
-  
-        // считаем сколько реально добавили (appendNewItems уже делает dedup по seenIds)
+
+        logDebug("Feed batch:", items.length, "cursor:", cursor, "debug:", debug);
+
         var beforeLen = state.feedItems.length;
         appendNewItems(items);
         var afterLen = state.feedItems.length;
         var addedCount = afterLen - beforeLen;
-  
-        // server pagination (source of truth: cursor; fallback: debug; fallback: heuristic)
+
+        // --- has_more ---
         if (typeof cursor.has_more === "boolean") {
           state.hasMore = cursor.has_more;
         } else if (typeof debug.has_more === "boolean") {
@@ -477,57 +485,75 @@
         } else {
           state.hasMore = items.length >= limit;
         }
-  
-        // nextOffset (важно: если сервер внутри страницы дедупит/диверсифицирует,
-        // items.length может быть меньше limit — сдвиг всё равно должен идти по курсору)
-        if (typeof cursor.next_offset === "number") {
+
+        // --- режим пагинации и "следующая страница" ---
+        // Приоритет: cursor.mode -> наличие next_cursor -> наличие next_offset
+        if (cursor && cursor.mode === "cursor") {
+          state.cursorMode = "cursor";
+          state.nextCursor = cursor.next_cursor ? String(cursor.next_cursor) : null;
+
+          // для отладки/совместимости
+          if (typeof cursor.next_offset === "number") state.nextOffset = cursor.next_offset;
+        } else if (cursor && cursor.mode === "offset") {
+          state.cursorMode = "offset";
+          state.nextCursor = null;
+
+          if (typeof cursor.next_offset === "number") {
+            state.nextOffset = cursor.next_offset;
+          } else if (typeof debug.next_offset === "number") {
+            state.nextOffset = debug.next_offset;
+          } else {
+            // безопаснее чем offset + items.length
+            state.nextOffset = state.nextOffset + limit;
+          }
+        } else if (cursor && cursor.next_cursor) {
+          // если сервер не прислал mode, но прислал next_cursor — считаем это cursor-mode
+          state.cursorMode = "cursor";
+          state.nextCursor = String(cursor.next_cursor);
+        } else if (typeof cursor.next_offset === "number") {
+          state.cursorMode = "offset";
+          state.nextCursor = null;
           state.nextOffset = cursor.next_offset;
         } else if (typeof debug.next_offset === "number") {
+          state.cursorMode = "offset";
+          state.nextCursor = null;
           state.nextOffset = debug.next_offset;
         } else {
-          state.nextOffset = offset + limit; // безопаснее, чем offset + items.length
+          // последний fallback: эвристика
+          if (state.cursorMode === "offset") {
+            state.nextOffset = state.nextOffset + limit;
+          }
         }
-  
+
         if (state.feedItems.length === 0) {
           if (debug.reason === "no_cards") {
-            renderEmptyFeed(
-              "Пока нет новостей по выбранным темам. Я обновлю ленту, как только появятся свежие карточки."
-            );
+            renderEmptyFeed("Пока нет новостей по выбранным темам. Я обновлю ленту, как только появятся свежие карточки.");
           } else {
             renderEmptyFeed();
           }
         } else {
-          // если это initial или мы ещё ничего не рендерили — покажем карточку
           if (initial) {
             renderCurrentCard();
           }
         }
-  
+
         state.loadingFeed = false;
-  
-        if (onDone) {
-          // оставляем сигнатуру (addedCount, rawItems, debug) чтобы не ломать goToNextCard()
-          onDone(addedCount, items, debug);
-        }
+
+        if (onDone) onDone(addedCount, items, debug);
       })
       .catch(function (err) {
         logDebug("GET /api/feed error:", err);
-        renderEmptyFeed(
-          "Не получилось загрузить ленту. Проверь интернет и попробуй ещё раз."
-        );
+        renderEmptyFeed("Не получилось загрузить ленту. Проверь интернет и попробуй ещё раз.");
         state.loadingFeed = false;
         if (onDone) onDone(0, [], null);
       });
   }
-  
-  
 
+  // ✅ REPLACE THIS FUNCTION COMPLETELY
   function goToNextCard() {
-    if (!state.feedItems || state.feedItems.length === 0) {
-      return;
-    }
-  
-    // === ТЕЛЕМЕТРИЯ: свайп вперёд по текущей карточке ===
+    if (!state.feedItems || state.feedItems.length === 0) return;
+
+    // telemetry: swipe next
     var prevItem =
       state.feedItems &&
       state.feedItems.length > 0 &&
@@ -535,7 +561,7 @@
       state.currentIndex < state.feedItems.length
         ? state.feedItems[state.currentIndex]
         : null;
-  
+
     if (
       prevItem &&
       prevItem.id != null &&
@@ -548,23 +574,41 @@
         position: state.currentIndex
       });
     }
-  
-    // обычный шаг вперёд, если есть куда
+
+    // обычный шаг вперёд
     if (state.currentIndex < state.feedItems.length - 1) {
       state.currentIndex += 1;
       renderCurrentCard();
-  
+
       // предзагрузка рядом с концом
       if (state.currentIndex >= state.feedItems.length - 3) {
         loadFeed(false);
       }
       return;
     }
-  
-    // === мы на последней карточке ===
-    // 1) если сервер ещё обещает has_more — просто подгружаем и, если пришло новое, перелистываем
+
+    // мы на последней карточке
     if (state.hasMore) {
       loadFeed(false, {
+        onDone: function (addedCount) {
+          if (addedCount > 0) {
+            state.currentIndex += 1;
+            renderCurrentCard();
+          } else {
+            // если сервер сказал has_more=true, но новых не добавили (dedup),
+            // просто ждём следующего свайпа — курсор уже обновлён.
+          }
+        }
+      });
+      return;
+    }
+
+    // has_more=false: пробуем "мягко обновить", НЕ сбрасывая seenIds
+    // cursor-mode: resetCursor=true (без cursor), offset-mode: forceOffsetZero=true
+    if (state.cursorMode === "cursor") {
+      loadFeed(false, {
+        force: true,
+        resetCursor: true,
         onDone: function (addedCount) {
           if (addedCount > 0) {
             state.currentIndex += 1;
@@ -572,31 +616,22 @@
           }
         }
       });
-      return;
-    }
-  
-    // 2) если has_more=false — делаем refresh с offset=0 (ищем новые unseen карточки)
-    // важно: НЕ сбрасываем state.seenIds, иначе в сессии начнутся дубли
-    loadFeed(false, {
-      force: true,
-      forceOffsetZero: true,
-      onDone: function (addedCount) {
-        if (addedCount > 0) {
-          state.currentIndex += 1;
-          renderCurrentCard();
-        } else {
-          // новых карточек нет — остаёмся на последней
-          // (можно потом добавить UI-уведомление, но без alert)
+    } else {
+      loadFeed(false, {
+        force: true,
+        forceOffsetZero: true,
+        onDone: function (addedCount) {
+          if (addedCount > 0) {
+            state.currentIndex += 1;
+            renderCurrentCard();
+          }
         }
-      }
-    });
+      });
+    }
   }
-  
 
   function goToPrevCard() {
-    if (!state.feedItems || state.feedItems.length === 0) {
-      return;
-    }
+    if (!state.feedItems || state.feedItems.length === 0) return;
     if (state.currentIndex > 0) {
       state.currentIndex -= 1;
       renderCurrentCard();
@@ -606,9 +641,8 @@
   function handleWheel(event) {
     event = event || window.event;
     var now = Date.now();
-    if (state.wheelLocked && now - state.lastWheelTime < 250) {
-      return;
-    }
+    if (state.wheelLocked && now - state.lastWheelTime < 250) return;
+
     state.wheelLocked = true;
     state.lastWheelTime = now;
     setTimeout(function () {
@@ -616,15 +650,10 @@
     }, 250);
 
     var deltaY = event.deltaY || event.wheelDeltaY || event.wheelDelta;
-    if (typeof deltaY !== "number") {
-      return;
-    }
+    if (typeof deltaY !== "number") return;
 
-    if (deltaY > 0) {
-      goToNextCard();
-    } else if (deltaY < 0) {
-      goToPrevCard();
-    }
+    if (deltaY > 0) goToNextCard();
+    else if (deltaY < 0) goToPrevCard();
   }
 
   function handleTouchStart(event) {
@@ -640,28 +669,16 @@
     state.touchStartY = null;
 
     var threshold = 40;
-    if (diff > threshold) {
-      // свайп вверх
-      goToNextCard();
-    } else if (diff < -threshold) {
-      // свайп вниз
-      goToPrevCard();
-    }
+    if (diff > threshold) goToNextCard();
+    else if (diff < -threshold) goToPrevCard();
   }
 
   function attachSwipeHandlers() {
     if (!elFeedCardContainer) return;
 
-    elFeedCardContainer.addEventListener("wheel", handleWheel, {
-      passive: true
-    });
-
-    elFeedCardContainer.addEventListener("touchstart", handleTouchStart, {
-      passive: true
-    });
-    elFeedCardContainer.addEventListener("touchend", handleTouchEnd, {
-      passive: true
-    });
+    elFeedCardContainer.addEventListener("wheel", handleWheel, { passive: true });
+    elFeedCardContainer.addEventListener("touchstart", handleTouchStart, { passive: true });
+    elFeedCardContainer.addEventListener("touchend", handleTouchEnd, { passive: true });
   }
 
   // ==== ИНИЦИАЛИЗАЦИЯ ====
@@ -680,15 +697,9 @@
   }
 
   function initEventHandlers() {
-    if (elCityNextBtn) {
-      elCityNextBtn.addEventListener("click", handleCityNext);
-    }
-    if (elCitySkipBtn) {
-      elCitySkipBtn.addEventListener("click", handleCitySkip);
-    }
-    if (elTopicsSubmitBtn) {
-      elTopicsSubmitBtn.addEventListener("click", submitOnboarding);
-    }
+    if (elCityNextBtn) elCityNextBtn.addEventListener("click", handleCityNext);
+    if (elCitySkipBtn) elCitySkipBtn.addEventListener("click", handleCitySkip);
+    if (elTopicsSubmitBtn) elTopicsSubmitBtn.addEventListener("click", submitOnboarding);
     attachSwipeHandlers();
   }
 
@@ -712,7 +723,6 @@
     logDebug("Resolved tgId:", state.tgId);
 
     if (!state.tgId) {
-      // Если мы вообще не знаем user id — показываем ошибку в онбординге
       if (elOnboardingScreen) {
         showScreen("onboarding");
         showOnboardingStep("city");
@@ -723,11 +733,7 @@
       return;
     }
 
-    // === ТЕЛЕМЕТРИЯ: инициализация для этого пользователя ===
-    if (
-      window.EYYETelemetry &&
-      typeof window.EYYETelemetry.init === "function"
-    ) {
+    if (window.EYYETelemetry && typeof window.EYYETelemetry.init === "function") {
       window.EYYETelemetry.init({
         tgId: state.tgId,
         source: "webapp"
@@ -735,7 +741,6 @@
     }
 
     initEventHandlers();
-    // Пытаемся загрузить профиль и решить, показывать ли онбординг
     loadProfileAndMaybeSkipOnboarding();
   }
 

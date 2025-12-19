@@ -1,3 +1,4 @@
+# file: src/webapp_backend/main.py
 import logging
 import os
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ from supabase import Client, create_client
 from .profile_service import get_profile_summary, save_onboarding
 from .telemetry_service import EventsRequest, log_events
 
+# cards_service: всегда стараемся использовать paginated-версию (она умеет cursor)
 try:
     from .cards_service import build_feed_for_user_paginated  # type: ignore
 except Exception:
@@ -60,7 +62,7 @@ INDEX_HTML_PATH = WEBAPP_DIR / "index.html"
 
 # assets can be either:
 # - webapp/static/* (preferred later)
-# - webapp/* (current layout in your message)
+# - webapp/* (current layout)
 WEBAPP_STATIC_DIR = WEBAPP_DIR / "static"
 ASSETS_DIR = WEBAPP_STATIC_DIR if WEBAPP_STATIC_DIR.exists() else WEBAPP_DIR
 
@@ -102,11 +104,22 @@ api = APIRouter(prefix="/api")
 
 @app.on_event("startup")
 async def _startup_log() -> None:
-    logger.info("FastAPI startup OK. ROOT_DIR=%s WEBAPP_DIR=%s ASSETS_DIR=%s", str(ROOT_DIR), str(WEBAPP_DIR), str(ASSETS_DIR))
+    logger.info(
+        "FastAPI startup OK. ROOT_DIR=%s WEBAPP_DIR=%s ASSETS_DIR=%s",
+        str(ROOT_DIR),
+        str(WEBAPP_DIR),
+        str(ASSETS_DIR),
+    )
     if not WEBAPP_DIR.exists():
         logger.warning("WEBAPP_DIR not found: %s", WEBAPP_DIR)
     if not INDEX_HTML_PATH.exists():
         logger.warning("index.html not found at %s", INDEX_HTML_PATH)
+
+    # важный лог: понимаем, включен ли cursor-режим реально
+    if build_feed_for_user_paginated is None:
+        logger.warning("cards_service.build_feed_for_user_paginated NOT available -> feed works in OFFSET fallback mode")
+    else:
+        logger.info("cards_service.build_feed_for_user_paginated available -> feed supports CURSOR mode")
 
 
 # ==========
@@ -128,6 +141,7 @@ async def health() -> Dict[str, Any]:
         "root_dir": str(ROOT_DIR),
         "webapp_dir": str(WEBAPP_DIR),
         "assets_dir": str(ASSETS_DIR),
+        "feed_supports_cursor": build_feed_for_user_paginated is not None,
     }
 
 
@@ -189,19 +203,26 @@ async def api_feed(
     cursor: Optional[str] = Query(None),
 ) -> Dict[str, Any]:
     """
-    Важно:
-    - Ранжирование + дедуп + диверсификация уже сделаны в cards_service.
+    Feed endpoint.
+    ВАЖНО:
+    - если пришёл cursor -> работаем в cursor-режиме (умная бесконечная выдача)
+    - если cursor не пришёл -> работаем как раньше (offset пагинация)
     """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase is not configured")
 
+    # ✅ Новый путь: cursor+offset в одном методе (если функция есть)
     if build_feed_for_user_paginated is not None:
         items, debug, cursor_obj = build_feed_for_user_paginated(
-            supabase, tg_id, limit=limit, offset=offset
+            supabase,
+            tg_id,
+            limit=limit,
+            offset=offset,
+            cursor=cursor,  # ✅ КЛЮЧЕВО: проброс cursor в сервис
         )
         return {"items": items, "debug": debug, "cursor": cursor_obj}
 
-    # fallback: если вдруг нет paginated-версии
+    # fallback: если вдруг нет paginated-версии — работаем по offset
     items, debug = build_feed_for_user(supabase, tg_id, limit=limit, offset=offset)  # type: ignore
     cursor_obj = {
         "mode": "offset",
@@ -227,6 +248,7 @@ async def api_events(payload: EventsRequest) -> Dict[str, Any]:
 
 @api.post("/telemetry")
 async def api_telemetry(payload: EventsRequest) -> Dict[str, Any]:
+    # алиас на /events
     return await api_events(payload)
 
 
