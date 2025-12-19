@@ -1834,18 +1834,14 @@ def build_feed_for_user_paginated(
     offset = max(0, int(offset))
 
     use_cursor_default = (FEED_PAGINATION_MODE == "cursor")
-if cursor is not None or use_cursor_default:
-    items, debug, next_cursor = build_feed_for_user_cursor(
-        supabase=supabase, user_id=user_id, limit=limit, cursor=cursor
-    )
-    cursor_meta = {
-        "mode": "cursor",
-        "cursor": cursor,
-        "next_cursor": next_cursor,
-        "limit": limit,
-        "has_more": True,
-    }
+    if cursor is not None or use_cursor_default:
+        ...
+        return items, debug, cursor_meta
+
+    items, base_debug = build_feed_for_user(...)
+    ...
     return items, debug, cursor_meta
+
 
 
     items, base_debug = build_feed_for_user(
