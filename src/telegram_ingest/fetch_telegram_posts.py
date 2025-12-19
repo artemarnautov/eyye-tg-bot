@@ -17,17 +17,11 @@ from telethon.errors import (
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
-# Подтягиваем .env (локально и на сервере)
+# грузим env НАДЁЖНО (и для systemd, и для ручного запуска)
 load_dotenv("/root/eyye-tg-bot/.env")
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-CURRENT_DIR = Path(__file__).resolve()
-SRC_DIR = CURRENT_DIR.parents[1]
-if str(SRC_DIR) not in sys.path:
-    sys.path.append(str(SRC_DIR))
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
@@ -46,25 +40,21 @@ async def fetch_for_channel(client: TelegramClient, channel_row: Dict[str, Any],
         limit = TELEGRAM_FETCH_LIMIT
 
     channel_id = channel_row["id"]
-    tg_chat_id = channel_row["tg_chat_id"]
+    tg_chat_id = channel_row.get("tg_chat_id")
     username = channel_row.get("username")
     last_fetched_message_id = channel_row.get("last_fetched_message_id")
     title = channel_row.get("title") or str(username) or str(tg_chat_id)
 
     try:
         entity_key = username or tg_chat_id
-        logger.info("Fetching raw for channel %s (@%s, tg_chat_id=%s)", title, username, tg_chat_id)
+        logger.info("Fetching raw posts for %s (@%s, tg_chat_id=%s)", title, username, tg_chat_id)
         entity = await client.get_entity(entity_key)
-    except (UsernameInvalidError, UsernameNotOccupiedError) as e:
-        logger.warning("Channel %s (@%s) invalid username -> disable. %s", title, username, e)
-        supabase.table("telegram_channels").update({"is_active": False}).eq("id", channel_id).execute()
-        return
-    except (ChannelPrivateError, ChannelInvalidError) as e:
-        logger.warning("Channel %s (@%s) private/invalid -> disable. %s", title, username, e)
+    except (UsernameInvalidError, UsernameNotOccupiedError, ChannelPrivateError, ChannelInvalidError) as e:
+        logger.warning("Channel %s (@%s) invalid/private. Disabling. Error: %s", title, username, e)
         supabase.table("telegram_channels").update({"is_active": False}).eq("id", channel_id).execute()
         return
     except Exception as e:
-        logger.exception("Unexpected error resolving %s (@%s). Skip. %s", title, username, e)
+        logger.exception("Failed to resolve channel %s (@%s): %s", title, username, e)
         return
 
     kwargs: Dict[str, Any] = {"limit": limit}
@@ -95,27 +85,22 @@ async def fetch_for_channel(client: TelegramClient, channel_row: Dict[str, Any],
         if published_at.tzinfo is None:
             published_at = published_at.replace(tzinfo=timezone.utc)
 
-        raw_text = msg.message or ""
-
         rows.append(
             {
                 "channel_id": channel_id,
                 "tg_message_id": tg_message_id,
                 "message_url": message_url,
-                "raw_text": raw_text,
+                "raw_text": msg.message or "",
                 "published_at": published_at.isoformat(),
                 "raw_meta": {},
-                # processed_to_card по умолчанию false в БД
             }
         )
 
     if rows:
-        logger.info("[%s] inserting %d rows into telegram_posts (upsert)", title, len(rows))
-        # уникальный индекс (channel_id, tg_message_id) уже есть -> upsert безопасен
+        # upsert по уникальному индексу (channel_id, tg_message_id)
         supabase.table("telegram_posts").upsert(rows, on_conflict="channel_id,tg_message_id").execute()
-
         supabase.table("telegram_channels").update({"last_fetched_message_id": max_message_id}).eq("id", channel_id).execute()
-        logger.info("[%s] updated last_fetched_message_id=%s", title, max_message_id)
+        logger.info("[%s] upserted %d raw telegram_posts, last_fetched_message_id=%s", title, len(rows), max_message_id)
 
 
 async def main() -> None:
@@ -131,7 +116,7 @@ async def main() -> None:
     )
 
     if not channels:
-        logger.info("No active telegram_channels found")
+        logger.info("No active telegram_channels")
         await client.disconnect()
         return
 
