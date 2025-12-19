@@ -1,6 +1,9 @@
 # file: src/telegram_ingest/process_telegram_posts.py
 import os
+import re
+import hashlib
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -31,6 +34,9 @@ TELEGRAM_ALLOW_FALLBACK_RAW_ACTIVE = (
     os.getenv("TELEGRAM_ALLOW_FALLBACK_RAW_ACTIVE", "false").lower() in ("1", "true", "yes")
 )
 
+# Дедуп одинаковых заголовков в окне (лечит “Netflix x4” и т.п.)
+TELEGRAM_TITLE_DEDUP_HOURS = int(os.getenv("TELEGRAM_TITLE_DEDUP_HOURS", "168"))  # 7 дней
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
@@ -40,6 +46,21 @@ def _safe_source_ref(message_url: str, channel_id: Any, tg_message_id: Any) -> s
         return url
     # стабильный fallback, чтобы дедуп работал даже без url
     return f"telegram:{channel_id}:{tg_message_id}"
+
+
+def _normalize_title_for_fp(title: str) -> str:
+    t = (title or "").strip().lower()
+    t = re.sub(r"https?://\S+", "", t)
+    t = re.sub(r"[\s\.\,\!\?\:\;\-–—]+", " ", t)
+    t = " ".join(t.split())
+    return t[:220]
+
+
+def _title_fp(title: str) -> str:
+    nt = _normalize_title_for_fp(title)
+    if not nt:
+        return ""
+    return hashlib.sha1(nt.encode("utf-8")).hexdigest()[:16]
 
 
 def _fetch_existing_card_id_by_source_ref(source_ref: str) -> Optional[int]:
@@ -61,6 +82,35 @@ def _fetch_existing_card_id_by_source_ref(source_ref: str) -> Optional[int]:
             return int(rows[0]["id"])
     except Exception:
         log.exception("Failed to lookup existing card by source_ref=%r", source_ref)
+    return None
+
+
+def _fetch_existing_card_id_by_title_fp(title_fp: str) -> Optional[int]:
+    """
+    Дедуп по “нормализованному заголовку” в окне времени.
+    Реализуем через meta.title_fp (jsonb contains).
+    """
+    if not title_fp:
+        return None
+
+    since = (datetime.now(timezone.utc) - timedelta(hours=TELEGRAM_TITLE_DEDUP_HOURS)).isoformat()
+
+    try:
+        resp = (
+            supabase.table("cards")
+            .select("id")
+            .eq("source_type", "telegram")
+            .gte("created_at", since)
+            .contains("meta", {"title_fp": title_fp})
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if rows:
+            return int(rows[0]["id"])
+    except Exception:
+        log.exception("Failed to lookup existing card by title_fp=%r", title_fp)
+
     return None
 
 
@@ -142,10 +192,16 @@ def _insert_card_from_telegram(
         # не показываем “сырые” карточки в ленте
         is_active = False
 
+    title = (normalized.get("title") or "").strip()
+    body = (normalized.get("body") or "").strip()
+
+    fp = _title_fp(title)
+
     meta = {
         "source_name": source_name,
         "quality": quality,
         "ingest": "telegram",
+        "title_fp": fp,
     }
 
     language = (normalized.get("language") or "").strip() or (channel.get("language") or "ru")
@@ -154,9 +210,6 @@ def _insert_card_from_telegram(
     except Exception:
         importance_score = 0.5
     importance_score = max(0.0, min(1.0, importance_score))
-
-    title = (normalized.get("title") or "").strip()
-    body = (normalized.get("body") or "").strip()
 
     card_payload = {
         "title": title,
@@ -171,13 +224,14 @@ def _insert_card_from_telegram(
     }
 
     log.info(
-        "Inserting card from telegram: active=%s quality=%s title=%r source_name=%r tags=%r source_ref=%r",
+        "Inserting card from telegram: active=%s quality=%s title=%r source_name=%r tags=%r source_ref=%r fp=%s",
         is_active,
         quality,
         title,
         source_name,
         tags,
         source_ref,
+        fp,
     )
 
     resp = supabase.table("cards").insert(card_payload).execute()
@@ -202,6 +256,7 @@ def process_telegram_posts_batch(limit: int = BATCH_SIZE) -> None:
 
     Ключевые фиксы:
     - идемпотентность по source_ref (message_url или telegram:{channel_id}:{tg_message_id})
+    - дедуп одинаковых заголовков по meta.title_fp в окне времени
     - если у поста уже есть card_id — просто отмечаем processed_to_card=true
     - “сырые” fallback карточки НЕ активируем (по умолчанию)
     """
@@ -227,8 +282,6 @@ def process_telegram_posts_batch(limit: int = BATCH_SIZE) -> None:
         if len(raw_text) < TELEGRAM_MIN_TEXT_CHARS:
             log.info("Post id=%s too short (%d chars), skipping", post_id, len(raw_text))
             skipped += 1
-            # можно помечать processed_to_card=true, но я оставляю в очереди —
-            # вдруг позже захочешь другой критерий
             continue
 
         if len(raw_text) > TELEGRAM_MAX_TEXT_CHARS:
@@ -270,7 +323,14 @@ def process_telegram_posts_batch(limit: int = BATCH_SIZE) -> None:
                 language=language,
             )
 
-            # если OpenAI вернул fallback_raw — по умолчанию вставим, но не активируем
+            # дедуп одинаковых заголовков (окно N часов)
+            fp = _title_fp(normalized.get("title") or "")
+            existing_by_title = _fetch_existing_card_id_by_title_fp(fp)
+            if existing_by_title:
+                _mark_post_processed(post_id, existing_by_title)
+                processed += 1
+                continue
+
             card_id = _insert_card_from_telegram(
                 normalized=normalized,
                 channel=channel,

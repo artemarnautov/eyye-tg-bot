@@ -33,12 +33,6 @@ SRC_DIR = CURRENT_DIR.parents[1]
 if str(SRC_DIR) not in sys.path:
     sys.path.append(str(SRC_DIR))
 
-from webapp_backend.openai_client import (
-    normalize_telegram_post,
-    is_configured as openai_is_configured,
-)
-from webapp_backend.cards_service import _insert_cards_into_db
-
 # ==========
 # Конфиг Supabase / Telegram
 # ==========
@@ -53,14 +47,6 @@ SESSION_NAME = os.getenv("TELEGRAM_SESSION_NAME", "eyye_session")
 # Сколько сообщений максимум тащим за один проход по каналу
 TELEGRAM_FETCH_LIMIT = int(os.getenv("TELEGRAM_FETCH_LIMIT", "400"))
 
-# Минимальная длина текста, чтобы пытаться делать из него карточку
-TELEGRAM_MIN_TEXT_LENGTH_FOR_CARD = int(
-    os.getenv("TELEGRAM_MIN_TEXT_LENGTH_FOR_CARD", "40")
-)
-
-# Язык по умолчанию для телеграм-каналов (hint для OpenAI)
-TELEGRAM_DEFAULT_LANGUAGE = os.getenv("TELEGRAM_DEFAULT_LANGUAGE", "ru")
-
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
@@ -70,8 +56,10 @@ async def fetch_for_channel(
     limit: int | None = None,
 ) -> None:
     """
-    Забираем последние сообщения для одного канала,
-    пишем их в telegram_posts и параллельно создаём карточки в cards.
+    Забираем последние сообщения для одного канала и пишем их в telegram_posts.
+
+    ВАЖНО: карточки в cards тут НЕ создаём.
+    Нормализация + дедуп + вставка в cards происходит в telegram_ingest.process_telegram_posts.py
     """
     if limit is None or limit <= 0:
         limit = TELEGRAM_FETCH_LIMIT
@@ -95,9 +83,7 @@ async def fetch_for_channel(
             username,
             e,
         )
-        supabase.table("telegram_channels").update(
-            {"is_active": False}
-        ).eq("id", channel_id).execute()
+        supabase.table("telegram_channels").update({"is_active": False}).eq("id", channel_id).execute()
         return
     except (ChannelPrivateError, ChannelInvalidError) as e:
         logger.warning(
@@ -106,9 +92,7 @@ async def fetch_for_channel(
             username,
             e,
         )
-        supabase.table("telegram_channels").update(
-            {"is_active": False}
-        ).eq("id", channel_id).execute()
+        supabase.table("telegram_channels").update({"is_active": False}).eq("id", channel_id).execute()
         return
     except Exception as e:
         logger.exception(
@@ -121,6 +105,7 @@ async def fetch_for_channel(
 
     kwargs: Dict[str, Any] = {"limit": limit}
     if last_fetched_message_id:
+        # Telethon вернёт сообщения с id > min_id
         kwargs["min_id"] = last_fetched_message_id
 
     messages = await client.get_messages(entity, **kwargs)
@@ -129,7 +114,6 @@ async def fetch_for_channel(
         return
 
     rows: List[Dict[str, Any]] = []
-    cards: List[Dict[str, Any]] = []
     max_message_id = last_fetched_message_id or 0
 
     # идём от старых к новым, чтобы published_at были по возрастанию
@@ -165,34 +149,6 @@ async def fetch_for_channel(
             }
         )
 
-        if (
-            openai_is_configured()
-            and raw_text
-            and len(raw_text.strip()) >= TELEGRAM_MIN_TEXT_LENGTH_FOR_CARD
-        ):
-            try:
-                norm = normalize_telegram_post(
-                    raw_text=raw_text,
-                    channel_title=title,
-                    language=TELEGRAM_DEFAULT_LANGUAGE,
-                )
-                card: Dict[str, Any] = {
-                    "title": norm.get("title"),
-                    "body": norm.get("body"),
-                    "tags": norm.get("tags") or [],
-                    "importance_score": norm.get("importance_score", 0.5),
-                    "language": norm.get("language") or TELEGRAM_DEFAULT_LANGUAGE,
-                    "source_name": norm.get("source_name") or title,
-                    "source_ref": message_url or f"{tg_chat_id}:{tg_message_id}",
-                }
-                cards.append(card)
-            except Exception:
-                logger.exception(
-                    "Failed to normalize telegram message %s from channel %s",
-                    tg_message_id,
-                    title,
-                )
-
     if rows:
         print(f"[{title}] вставляем {len(rows)} сообщений в telegram_posts")
         supabase.table("telegram_posts").insert(rows).execute()
@@ -202,19 +158,6 @@ async def fetch_for_channel(
         ).eq("id", channel_id).execute()
     else:
         print(f"[{title}] сообщений для вставки нет")
-
-    if cards:
-        inserted = _insert_cards_into_db(
-            supabase,
-            cards,
-            language=None,
-            source_type="telegram",
-            fallback_source_name=title,
-            source_ref=None,
-        )
-        print(f"[{title}] создано {len(inserted)} карточек из Telegram-постов")
-    else:
-        print(f"[{title}] нет подходящих постов для карточек")
 
 
 async def main() -> None:

@@ -24,19 +24,28 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--steps",
-        default=os.getenv("EYYE_INGEST_STEPS", "telegram,wikipedia"),
-        help="Comma-separated steps: telegram,wikipedia",
+        default=os.getenv("EYYE_INGEST_STEPS", "telegram,wikipedia,rss"),
+        help="Comma-separated steps: telegram,wikipedia,rss (telegram включает fetch+process)",
     )
     args = parser.parse_args()
 
     steps = [s.strip().lower() for s in str(args.steps).split(",") if s.strip()]
     python_bin = sys.executable
 
-    if "telegram" in steps:
-        run_step("telegram_ingest", f"PYTHONPATH=src {python_bin} -m telegram_ingest.fetch_telegram_posts")
+    # ---- Telegram: fetch raw -> process batch -> cards ----
+    if "telegram" in steps or "telegram_fetch" in steps:
+        run_step("telegram_fetch_posts", f"PYTHONPATH=src {python_bin} -m telegram_ingest.fetch_telegram_posts")
 
+    if "telegram" in steps or "telegram_process" in steps:
+        run_step("telegram_process_posts", f"PYTHONPATH=src {python_bin} -m telegram_ingest.process_telegram_posts")
+
+    # ---- Wikipedia ----
     if "wikipedia" in steps:
         run_step("wikipedia_ingest", f"PYTHONPATH=src {python_bin} -m wikipedia_ingest.fetch_wikipedia_articles")
+
+    # ---- RSS / Google News RSS ----
+    if "rss" in steps:
+        run_step("rss_ingest", f"PYTHONPATH=src {python_bin} -m rss_ingest.fetch_rss_items")
 
 
 if __name__ == "__main__":

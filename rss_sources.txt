@@ -1,0 +1,14 @@
+# Add RSS feed URLs here (one per line). Lines starting with # are ignored.
+
+# Global / Tech / Business (examples)
+# https://www.reuters.com/rssFeed/topNews
+# https://feeds.bbci.co.uk/news/rss.xml
+# https://www.theverge.com/rss/index.xml
+# https://techcrunch.com/feed/
+
+# UAE / MENA (examples)
+# (проверь/замени на реальные RSS этих изданий)
+# https://www.thenationalnews.com/rss
+# https://gulfnews.com/rss
+# https://www.khaleejtimes.com/rss
+# https://www.aljazeera.com/xml/rss/all.xml
