@@ -6,12 +6,11 @@ import time
 import hashlib
 import logging
 import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple, Iterable, Set
-from email.utils import parsedate_to_datetime
+from typing import Any, Dict, List, Optional, Tuple
 
-import httpx
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -25,12 +24,8 @@ from webapp_backend.openai_client import (
 )
 
 load_dotenv()
-
 log = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
@@ -39,33 +34,24 @@ supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 RSS_SOURCES_FILE = os.getenv("RSS_SOURCES_FILE", "rss_sources.txt")
-RSS_FEEDS = os.getenv("RSS_FEEDS", "").strip()  # comma-separated, если не хочешь файл
+RSS_FEEDS = os.getenv("RSS_FEEDS", "").strip()  # comma-separated
 RSS_FETCH_LIMIT_PER_FEED = int(os.getenv("RSS_FETCH_LIMIT_PER_FEED", "30"))
 RSS_DEFAULT_LANGUAGE = os.getenv("RSS_DEFAULT_LANGUAGE", "en")
 
 RSS_TITLE_DEDUP_HOURS = int(os.getenv("RSS_TITLE_DEDUP_HOURS", "168"))  # 7 дней
 RSS_BATCH_SIZE = int(os.getenv("RSS_OPENAI_BATCH_SIZE", "12"))
 
-# Батч-проверки в Supabase (ключевой фикс)
-RSS_SUPABASE_IN_BATCH = int(os.getenv("RSS_SUPABASE_IN_BATCH", "60"))
-RSS_PREFETCH_TITLE_FP_LIMIT = int(os.getenv("RSS_PREFETCH_TITLE_FP_LIMIT", "5000"))
-
-# Сеть
-RSS_HTTP_TIMEOUT = float(os.getenv("RSS_HTTP_TIMEOUT", "15"))
-RSS_HTTP_CONNECT_TIMEOUT = float(os.getenv("RSS_HTTP_CONNECT_TIMEOUT", "5"))
-RSS_HTTP_RETRIES = int(os.getenv("RSS_HTTP_RETRIES", "2"))
-RSS_HTTP_RETRY_SLEEP_SEC = float(os.getenv("RSS_HTTP_RETRY_SLEEP_SEC", "0.6"))
+RSS_OPENAI_ATTEMPTS = int(os.getenv("RSS_OPENAI_ATTEMPTS", "2"))
+RSS_OPENAI_BACKOFF_SECONDS = float(os.getenv("RSS_OPENAI_BACKOFF_SECONDS", "1.5"))
 
 # Google News RSS “как поиск”
 RSS_ENABLE_GOOGLE_NEWS = os.getenv("RSS_ENABLE_GOOGLE_NEWS", "true").lower() in ("1", "true", "yes")
 GOOGLE_NEWS_HL = os.getenv("GOOGLE_NEWS_HL", "en-AE")
 GOOGLE_NEWS_GL = os.getenv("GOOGLE_NEWS_GL", "AE")
 GOOGLE_NEWS_CEID = os.getenv("GOOGLE_NEWS_CEID", "AE:en")
-
-# какие “темы” гоняем как запросы (можешь расширять)
 GOOGLE_NEWS_QUERIES = os.getenv(
     "GOOGLE_NEWS_QUERIES",
-    "UAE, Dubai, Abu Dhabi, Middle East, MENA, AI, startups, business, finance, tech",
+    "UAE, Dubai, Abu Dhabi, Middle East, MENA, AI, startups, business, finance, tech"
 )
 
 ALLOWED_TAGS_CANONICAL = [
@@ -73,11 +59,29 @@ ALLOWED_TAGS_CANONICAL = [
     "entertainment", "gaming", "sports", "lifestyle", "education", "city", "uk_students",
 ]
 
-
-def _chunks(xs: List[str], n: int) -> Iterable[List[str]]:
-    for i in range(0, len(xs), n):
-        yield xs[i:i + n]
-
+def _canonical_url(url: str) -> str:
+    """Срезаем явный мусор (utm_*, oc, etc.) чтобы дедуп по source_ref был стабильнее."""
+    u = (url or "").strip()
+    if not u:
+        return ""
+    try:
+        parts = urllib.parse.urlsplit(u)
+        q = urllib.parse.parse_qsl(parts.query, keep_blank_values=True)
+        drop_prefixes = ("utm_",)
+        drop_keys = {"oc", "fbclid", "gclid", "igshid"}
+        q2 = []
+        for k, v in q:
+            lk = (k or "").lower()
+            if any(lk.startswith(p) for p in drop_prefixes):
+                continue
+            if lk in drop_keys:
+                continue
+            q2.append((k, v))
+        new_query = urllib.parse.urlencode(q2, doseq=True)
+        out = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path, new_query, parts.fragment))
+        return out.strip()
+    except Exception:
+        return u
 
 def _normalize_title_for_fp(title: str) -> str:
     t = (title or "").strip().lower()
@@ -86,13 +90,11 @@ def _normalize_title_for_fp(title: str) -> str:
     t = " ".join(t.split())
     return t[:220]
 
-
 def _title_fp(title: str) -> str:
     nt = _normalize_title_for_fp(title)
     if not nt:
         return ""
     return hashlib.sha1(nt.encode("utf-8")).hexdigest()[:16]
-
 
 def _read_feed_list() -> List[str]:
     if RSS_FEEDS:
@@ -112,7 +114,6 @@ def _read_feed_list() -> List[str]:
             feeds.append(line)
     return feeds
 
-
 def _google_news_rss_url(query: str) -> str:
     q = urllib.parse.quote_plus(query.strip())
     return (
@@ -122,42 +123,13 @@ def _google_news_rss_url(query: str) -> str:
         f"&ceid={urllib.parse.quote_plus(GOOGLE_NEWS_CEID)}"
     )
 
-
-def _fetch_xml(url: str) -> str:
-    """
-    Надёжный фетч: httpx + таймауты + пару ретраев.
-    """
-    headers = {"User-Agent": "EYYE-Ingest/1.0"}
-    timeout = httpx.Timeout(
-        RSS_HTTP_TIMEOUT,
-        connect=RSS_HTTP_CONNECT_TIMEOUT,
-        read=RSS_HTTP_TIMEOUT,
-        write=RSS_HTTP_TIMEOUT,
-        pool=RSS_HTTP_TIMEOUT,
-    )
-
-    last_err: Optional[Exception] = None
-    for attempt in range(RSS_HTTP_RETRIES + 1):
-        try:
-            with httpx.Client(headers=headers, timeout=timeout, follow_redirects=True) as client:
-                r = client.get(url)
-                r.raise_for_status()
-                return r.text
-        except Exception as e:
-            last_err = e
-            if attempt < RSS_HTTP_RETRIES:
-                time.sleep(RSS_HTTP_RETRY_SLEEP_SEC * (attempt + 1))
-                continue
-            break
-
-    raise RuntimeError(f"Failed to fetch RSS url={url!r}: {last_err}")
-
+def _fetch_xml(url: str, timeout: float = 15.0) -> str:
+    req = urllib.request.Request(url, headers={"User-Agent": "EYYE-Ingest/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
 
 def _parse_rss_or_atom(xml_text: str) -> Tuple[str, List[Dict[str, Any]]]:
-    """
-    Возвращает (feed_title, items[])
-    item: {title, url, summary, published_at_raw}
-    """
+    """Возвращает (feed_title, items[]) item: {title,url,summary,published_at_raw}"""
     root = ET.fromstring(xml_text)
 
     # RSS 2.0
@@ -175,9 +147,10 @@ def _parse_rss_or_atom(xml_text: str) -> Tuple[str, List[Dict[str, Any]]]:
 
     # Atom
     ns = {"atom": "http://www.w3.org/2005/Atom"}
-    feed_title = (root.findtext("atom:title", default="", namespaces=ns) or "").strip() or "Atom"
-    items: List[Dict[str, Any]] = []
-    for e in root.findall("atom:entry", ns):
+    feed = root
+    feed_title = (feed.findtext("atom:title", default="", namespaces=ns) or "").strip() or "Atom"
+    items = []
+    for e in feed.findall("atom:entry", ns):
         title = (e.findtext("atom:title", default="", namespaces=ns) or "").strip()
         link_el = e.find("atom:link", ns)
         link = (link_el.get("href") if link_el is not None else "") or ""
@@ -186,88 +159,66 @@ def _parse_rss_or_atom(xml_text: str) -> Tuple[str, List[Dict[str, Any]]]:
         items.append({"title": title, "url": link.strip(), "summary": summ, "published_at_raw": updated})
     return feed_title, items
 
-
-def _parse_datetime_fuzzy(s: str) -> Optional[str]:
-    s = (s or "").strip()
-    if not s:
+def _card_exists_by_source_ref(source_ref: str) -> Optional[int]:
+    ref = _canonical_url(source_ref)
+    if not ref:
         return None
-
-    # RSS pubDate обычно RFC 2822
-    try:
-        dt = parsedate_to_datetime(s)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc).isoformat()
-    except Exception:
-        pass
-
-    # Atom updated часто ISO
-    if "T" in s and ("+" in s or s.endswith("Z")):
-        return s
-
-    return None
-
-
-def _prefetch_existing_source_refs(urls: List[str]) -> Set[str]:
-    """
-    Вместо 1 запроса на 1 url — батчами .in_()
-    """
-    existing: Set[str] = set()
-    if not urls:
-        return existing
-
-    for batch in _chunks(urls, RSS_SUPABASE_IN_BATCH):
-        try:
-            resp = (
-                supabase.table("cards")
-                .select("source_ref")
-                .eq("source_type", "rss")
-                .in_("source_ref", batch)
-                .execute()
-            )
-            for row in (resp.data or []):
-                sr = (row.get("source_ref") or "").strip()
-                if sr:
-                    existing.add(sr)
-        except Exception:
-            log.exception("Failed batch lookup for source_ref (batch size=%d)", len(batch))
-
-    return existing
-
-
-def _prefetch_recent_title_fps() -> Set[str]:
-    """
-    Достаём title_fp за окно дедупа одним проходом.
-    Это грубый, но быстрый MVP-фикс вместо contains(meta, {"title_fp": ...}) на каждый айтем.
-    """
-    since = (datetime.now(timezone.utc) - timedelta(hours=RSS_TITLE_DEDUP_HOURS)).isoformat()
-    fps: Set[str] = set()
-
     try:
         resp = (
             supabase.table("cards")
-            .select("meta")
+            .select("id")
             .eq("source_type", "rss")
-            .gte("created_at", since)
-            .limit(RSS_PREFETCH_TITLE_FP_LIMIT)
+            .eq("source_ref", ref)
+            .limit(1)
             .execute()
         )
-        for row in (resp.data or []):
-            meta = row.get("meta") or {}
-            if isinstance(meta, dict):
-                fp = meta.get("title_fp")
-                if isinstance(fp, str) and fp:
-                    fps.add(fp)
+        rows = resp.data or []
+        if rows:
+            return int(rows[0]["id"])
     except Exception:
-        log.exception("Failed prefetch recent title_fps")
+        log.exception("Failed lookup by source_ref=%r", ref)
+    return None
 
-    return fps
+def _card_exists_by_title_fp(title_fp: str) -> Optional[int]:
+    if not title_fp:
+        return None
+    since = (datetime.now(timezone.utc) - timedelta(hours=RSS_TITLE_DEDUP_HOURS)).isoformat()
+    try:
+        resp = (
+            supabase.table("cards")
+            .select("id")
+            .eq("source_type", "rss")
+            .gte("created_at", since)
+            .contains("meta", {"title_fp": title_fp})
+            .limit(1)
+            .execute()
+        )
+        rows = resp.data or []
+        if rows:
+            return int(rows[0]["id"])
+    except Exception:
+        log.exception("Failed lookup by title_fp=%r", title_fp)
+    return None
 
+def _call_openai_with_retries(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    last_err = None
+    for attempt in range(1, RSS_OPENAI_ATTEMPTS + 1):
+        try:
+            return call_openai_chat(payload)
+        except Exception as e:
+            last_err = e
+            sleep_s = RSS_OPENAI_BACKOFF_SECONDS * attempt
+            log.warning("OpenAI call failed attempt=%d/%d err=%r; sleeping %.1fs",
+                        attempt, RSS_OPENAI_ATTEMPTS, e, sleep_s)
+            time.sleep(sleep_s)
+    if last_err:
+        log.error("OpenAI failed after %d attempts: %r", RSS_OPENAI_ATTEMPTS, last_err)
+    return None
 
 def _openai_normalize_batch(items: List[Dict[str, Any]], language: str) -> List[Dict[str, Any]]:
     """
-    items input: [{id,title,summary,url,source_name}]
-    returns: [{id,title,body,tags,importance_score,language,quality}]
+    items input: [{key,title,summary,url,source_name}]
+    returns: [{key,title,body,tags,importance_score,language,quality}]
     """
     if not items:
         return []
@@ -276,13 +227,14 @@ def _openai_normalize_batch(items: List[Dict[str, Any]], language: str) -> List[
         "Ты нормализуешь новости для ленты EYYE.\n"
         "На вход дается список элементов (title+summary+url+source).\n"
         "Верни валидный JSON {\"items\": [...]}.\n"
+        "КРИТИЧНО: для каждого элемента верни поле key РОВНО тем же значением, что пришло во входе.\n"
         "Правила:\n"
         "1) НЕ выдумывай факты и детали.\n"
         "2) title: одно короткое нейтральное предложение.\n"
         "3) body: 2–4 абзаца по 1–3 предложения, без эмодзи.\n"
         "4) tags: 1–6 тегов только из allowlist.\n"
         "5) importance_score: 0..1\n"
-        "6) language: строго '" + language + "'\n"
+        f"6) language: строго '{language}'\n"
         "Allowlist tags:\n" + ", ".join(ALLOWED_TAGS_CANONICAL)
     )
 
@@ -298,7 +250,7 @@ def _openai_normalize_batch(items: List[Dict[str, Any]], language: str) -> List[
         "response_format": {"type": "json_object"},
     }
 
-    resp = call_openai_chat(payload)
+    resp = _call_openai_with_retries(payload)
     if not resp:
         return []
 
@@ -322,15 +274,18 @@ def _openai_normalize_batch(items: List[Dict[str, Any]], language: str) -> List[
     for it in out:
         if not isinstance(it, dict):
             continue
-        rid = it.get("id")
+
+        key = str(it.get("key") or it.get("url") or it.get("id") or "").strip()
         title = _clean_text(it.get("title"), 220)
         body = _clean_text(it.get("body") or it.get("summary"), 2600)
-        if not rid or not title or not body:
+
+        if not key or not title or not body:
             continue
+
         tags = _normalize_tag_list(it.get("tags"), fallback=[])
         imp = _clamp01(it.get("importance_score", 0.6))
         results.append({
-            "id": rid,
+            "key": key,
             "title": title,
             "body": body,
             "tags": tags,
@@ -340,34 +295,23 @@ def _openai_normalize_batch(items: List[Dict[str, Any]], language: str) -> List[
         })
     return results
 
-
-def _insert_rss_card(
-    norm: Dict[str, Any],
-    raw: Dict[str, Any],
-    recent_title_fps: Set[str],
-    existing_source_refs: Set[str],
-) -> Optional[int]:
-    """
-    Вставка + локальные множества для дедупа, чтобы не долбить Supabase lookup'ами.
-    """
-    source_ref = (raw.get("url") or "").strip()
-    if not source_ref:
-        return None
-
-    # дедуп по source_ref (самый точный)
-    if source_ref in existing_source_refs:
-        return None
-
+def _insert_rss_card(norm: Dict[str, Any], raw: Dict[str, Any]) -> Optional[int]:
     title = norm.get("title") or ""
     fp = _title_fp(title)
     if not fp:
         return None
 
-    # дедуп по title_fp (грубый, но быстрый)
-    if fp in recent_title_fps:
+    url = _canonical_url(raw.get("url") or "")
+    if not url:
         return None
 
-    published_at = _parse_datetime_fuzzy(raw.get("published_at_raw") or "")
+    existing_ref = _card_exists_by_source_ref(url)
+    if existing_ref:
+        return existing_ref
+
+    existing_title = _card_exists_by_title_fp(fp)
+    if existing_title:
+        return existing_title
 
     meta = {
         "source_name": raw.get("source_name"),
@@ -376,7 +320,6 @@ def _insert_rss_card(
         "title_fp": fp,
         "quality": norm.get("quality", "ok"),
         "ingest": "rss",
-        "published_at": published_at,
     }
 
     payload = {
@@ -387,7 +330,7 @@ def _insert_rss_card(
         "language": norm.get("language") or RSS_DEFAULT_LANGUAGE,
         "is_active": True,
         "source_type": "rss",
-        "source_ref": source_ref,
+        "source_ref": url,
         "meta": meta,
     }
 
@@ -395,16 +338,10 @@ def _insert_rss_card(
         resp = supabase.table("cards").insert(payload).execute()
         if not resp.data:
             return None
-
-        new_id = int(resp.data[0]["id"])
-        # обновляем локальные кэши (важно, чтобы не пытаться вставить снова в этом же прогоне)
-        existing_source_refs.add(source_ref)
-        recent_title_fps.add(fp)
-        return new_id
+        return int(resp.data[0]["id"])
     except Exception:
-        log.exception("Insert failed for rss card source_ref=%s", source_ref)
+        log.exception("Failed insert RSS card source_ref=%r title=%r", url, title[:80])
         return None
-
 
 def main() -> None:
     feeds = _read_feed_list()
@@ -417,10 +354,8 @@ def main() -> None:
         log.warning("No RSS feeds configured. Set RSS_FEEDS or create rss_sources.txt")
         return
 
-    # Единоразово префетчим title_fp за окно дедупа (убираем contains(meta,...) на каждый айтем)
-    recent_title_fps = _prefetch_recent_title_fps()
-
     total_new = 0
+
     for feed_url in feeds:
         try:
             xml_text = _fetch_xml(feed_url)
@@ -428,63 +363,54 @@ def main() -> None:
             if not items:
                 continue
 
-            # Сначала соберём ограниченный список items (по RSS_FETCH_LIMIT_PER_FEED)
-            limited = items[:RSS_FETCH_LIMIT_PER_FEED]
-
-            # Батч-проверка существующих source_ref
-            urls = [(it.get("url") or "").strip() for it in limited if (it.get("url") or "").strip()]
-            existing_source_refs = _prefetch_existing_source_refs(urls)
-
-            # Соберем кандидатов (без per-item запросов в Supabase)
             candidates: List[Dict[str, Any]] = []
-            local_raw_title_fps: Set[str] = set()
+            seen_keys = set()
 
-            now_ts = int(time.time())
-            for idx, it in enumerate(limited):
-                url = (it.get("url") or "").strip()
+            for it in items[:RSS_FETCH_LIMIT_PER_FEED]:
+                url = _canonical_url((it.get("url") or "").strip())
                 title = (it.get("title") or "").strip()
                 summary = (it.get("summary") or "").strip()
 
                 if not url or not title:
                     continue
+                if url in seen_keys:
+                    continue
+                seen_keys.add(url)
 
-                # быстрый дедуп: по source_ref
-                if url in existing_source_refs:
+                if _card_exists_by_source_ref(url):
                     continue
 
-                # быстрый локальный дедуп по raw title (чтобы не слать дубли в OpenAI)
-                raw_fp = _title_fp(title)
-                if raw_fp and raw_fp in local_raw_title_fps:
-                    continue
-                if raw_fp:
-                    local_raw_title_fps.add(raw_fp)
-
+                # key = URL (стабильный маппинг)
                 candidates.append({
-                    "id": f"{now_ts}-{idx}",
+                    "key": url,
                     "title": title,
                     "summary": summary,
                     "url": url,
                     "source_name": feed_title,
-                    "published_at_raw": it.get("published_at_raw") or "",
                 })
 
             if not candidates:
                 continue
 
-            # OpenAI нормализация пачками
             lang = RSS_DEFAULT_LANGUAGE
-            inserted_here = 0
-
             for i in range(0, len(candidates), RSS_BATCH_SIZE):
                 batch = candidates[i:i + RSS_BATCH_SIZE]
+                raw_by_key = {x["key"]: x for x in batch}
+
                 normalized = _openai_normalize_batch(batch, language=lang)
                 if not normalized:
+                    log.warning("OpenAI returned 0 normalized items for feed=%s batch=%d..%d", feed_title, i, i+len(batch))
                     continue
 
-                raw_by_id = {x["id"]: x for x in batch}
-
+                inserted_this_batch = 0
                 for n in normalized:
-                    raw = raw_by_id.get(n["id"])
+                    key = str(n.get("key") or "").strip()
+                    raw = raw_by_key.get(key)
+
+                    # fallback: иногда модель может вернуть url вместо key
+                    if raw is None and n.get("url"):
+                        raw = raw_by_key.get(_canonical_url(str(n["url"])))
+
                     if not raw:
                         continue
 
@@ -493,29 +419,21 @@ def main() -> None:
                         "source_name": raw.get("source_name"),
                         "feed_title": feed_title,
                         "feed_url": feed_url,
-                        "published_at_raw": raw.get("published_at_raw") or "",
                     }
 
-                    card_id = _insert_rss_card(
-                        n,
-                        raw2,
-                        recent_title_fps=recent_title_fps,
-                        existing_source_refs=existing_source_refs,
-                    )
+                    card_id = _insert_rss_card(n, raw2)
                     if card_id:
                         total_new += 1
-                        inserted_here += 1
+                        inserted_this_batch += 1
 
-            log.info(
-                "RSS feed processed: %s (%s) candidates=%d inserted=%d",
-                feed_title, feed_url, len(candidates), inserted_here
-            )
+                log.info("RSS batch done: feed=%s inserted=%d/%d", feed_title, inserted_this_batch, len(batch))
+
+            log.info("RSS feed processed: %s (%s) candidates=%d", feed_title, feed_url, len(candidates))
 
         except Exception:
             log.exception("Failed processing RSS feed: %s", feed_url)
 
-    log.info("RSS ingest done. Inserted %d cards", total_new)
-
+    log.info("RSS ingest done. Inserted/linked %d cards", total_new)
 
 if __name__ == "__main__":
     main()
