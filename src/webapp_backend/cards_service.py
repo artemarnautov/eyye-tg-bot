@@ -1363,7 +1363,7 @@ def build_feed_for_user(
 # ===================== Cursor режим (blend: реально бесконечный) =====================
 
 def build_feed_for_user_cursor(
-    supabase: Optional[Client],
+    supabase: Optional["Client"],
     user_id: int,
     limit: Optional[int] = None,
     cursor: Optional[str] = None,
@@ -1373,6 +1373,8 @@ def build_feed_for_user_cursor(
     - не "id < before_id", а "умный микс" по age buckets + персонализация + hot_tags
     - бесконечность достигается за счёт seen-фильтра + постоянного притока новых карточек
     """
+    # ВАЖНО: items/debug всегда определены → никаких UnboundLocalError
+    items: List[Dict[str, Any]] = []
     debug: Dict[str, Any] = {"cursor_in": cursor}
 
     if supabase is None:
@@ -1394,73 +1396,153 @@ def build_feed_for_user_cursor(
     mode = str(cur_obj.get("mode") or "blend")
     debug["cursor_mode"] = mode
 
-    # --- user weights + profile tags ---
-    user_topic_weights, user_topic_rows = _load_user_topic_weights(supabase, user_id)
-    base_tags = get_interest_tags_for_user(supabase, user_id) or DEFAULT_FEED_TAGS
-    debug["base_tags"] = base_tags
+    try:
+        # --- user weights + profile tags ---
+        user_topic_weights, user_topic_rows = _load_user_topic_weights(supabase, user_id)
+        base_tags = get_interest_tags_for_user(supabase, user_id) or DEFAULT_FEED_TAGS
+        debug["base_tags"] = base_tags
 
-    if user_topic_rows:
-        _top_tags, _, user_topics_debug = build_base_tags_from_weights(user_topic_rows)
-    else:
-        if user_topic_weights:
-            sorted_items = sorted(user_topic_weights.items(), key=lambda kv: kv[1], reverse=True)
-            user_topics_debug = {"count": len(user_topic_weights), "top": sorted_items[:20]}
+        if user_topic_rows:
+            _top_tags, _, user_topics_debug = build_base_tags_from_weights(user_topic_rows)
         else:
-            user_topics_debug = {"count": 0, "top": []}
-    debug["user_topic_weights"] = user_topics_debug
+            if user_topic_weights:
+                sorted_items = sorted(user_topic_weights.items(), key=lambda kv: kv[1], reverse=True)
+                user_topics_debug = {"count": len(user_topic_weights), "top": sorted_items[:20]}
+            else:
+                user_topics_debug = {"count": 0, "top": []}
+        debug["user_topic_weights"] = user_topics_debug
 
-    # --- seen ---
-    seen_info = _load_seen_cards_for_user(supabase, user_id)
-    exclude_ids: Set[int] = seen_info.get("exclude_ids") or set()
-    debug["seen_rows"] = int(seen_info.get("rows") or 0)
-    debug["seen_exclude"] = len(exclude_ids)
+        # --- seen ---
+        seen_info = _load_seen_cards_for_user(supabase, user_id)
+        exclude_ids: Set[int] = seen_info.get("exclude_ids") or set()
+        debug["seen_rows"] = int(seen_info.get("rows") or 0)
+        debug["seen_exclude"] = len(exclude_ids)
 
-    # --- hot tags / "история" ---
-    pos = _load_recent_positive_signals(supabase, user_id, limit=60)
-    seed_tags = pos.get("seed_tags") or []
-    hot_tags_list = _expand_with_neighbors(list(seed_tags), depth=1)
-    hot_tags_set = set(hot_tags_list)
-    debug["signals"] = {
-        "events_rows": int(pos.get("events_rows") or 0),
-        "seed_card_ids": pos.get("seed_card_ids") or [],
-        "seed_tags": seed_tags,
-        "hot_tags": hot_tags_list[:12],
-    }
+        # --- hot tags / "история" ---
+        pos = _load_recent_positive_signals(supabase, user_id, limit=60)
+        seed_tags = pos.get("seed_tags") or []
+        hot_tags_list = _expand_with_neighbors(list(seed_tags), depth=1)
+        hot_tags_set = set(hot_tags_list)
+        debug["signals"] = {
+            "events_rows": int(pos.get("events_rows") or 0),
+            "seed_card_ids": pos.get("seed_card_ids") or [],
+            "seed_tags": seed_tags,
+            "hot_tags": hot_tags_list[:12],
+        }
 
-    # --- read-age stats (чтобы "не уходил в прошлое") ---
-    read_stats = _load_recent_read_age_stats(supabase, user_id, limit=30)
-    debug["read_age"] = read_stats
+        # --- read-age stats (чтобы "не уходил в прошлое") ---
+        read_stats = _load_recent_read_age_stats(supabase, user_id, limit=30)
+        debug["read_age"] = read_stats
 
-    # ===== mode=chron (legacy) =====
-    if mode == "chron":
-        before_id = _safe_int_id(cur_obj.get("before_id"))
-        debug["before_id"] = before_id
+        # ================== mode=chron (legacy) ==================
+        if mode == "chron":
+            before_id = _safe_int_id(cur_obj.get("before_id"))
+            debug["before_id"] = before_id
 
-        fetch_limit = min(max(limit * 12, 80), FEED_MAX_FETCH_LIMIT)
-        mixed_tags = sorted({*base_tags, *DEFAULT_FEED_TAGS})
+            fetch_limit = min(max(limit * 12, 80), FEED_MAX_FETCH_LIMIT)
+            mixed_tags = sorted({*base_tags, *DEFAULT_FEED_TAGS})
 
-        phases_config: List[Dict[str, Any]] = [
-            {"stage": "personal_recent", "tags": base_tags, "age_hours": FEED_MAX_CARD_AGE_HOURS},
-            {"stage": "mixed_recent", "tags": mixed_tags, "age_hours": FEED_MAX_CARD_AGE_HOURS},
-            {"stage": "mixed_wide", "tags": mixed_tags, "age_hours": FEED_WIDE_AGE_HOURS},
-            {"stage": "any_all_time", "tags": [], "age_hours": FEED_DEEP_AGE_HOURS if FEED_DEEP_AGE_HOURS > 0 else 0},
-        ]
+            phases_config: List[Dict[str, Any]] = [
+                {"stage": "personal_recent", "tags": base_tags, "age_hours": FEED_MAX_CARD_AGE_HOURS},
+                {"stage": "mixed_recent", "tags": mixed_tags, "age_hours": FEED_MAX_CARD_AGE_HOURS},
+                {"stage": "mixed_wide", "tags": mixed_tags, "age_hours": FEED_WIDE_AGE_HOURS},
+                {"stage": "any_all_time", "tags": [], "age_hours": FEED_DEEP_AGE_HOURS if FEED_DEEP_AGE_HOURS > 0 else 0},
+            ]
 
-        candidates_by_id: Dict[str, Dict[str, Any]] = {}
-        phases_debug: List[Dict[str, Any]] = []
+            candidates_by_id: Dict[str, Dict[str, Any]] = {}
+            phases_debug: List[Dict[str, Any]] = []
 
-        for phase in phases_config:
-            if len(candidates_by_id) >= fetch_limit:
-                break
-            remaining = fetch_limit - len(candidates_by_id)
-            fetched = _fetch_candidate_cards(
-                supabase=supabase,
-                tags=phase.get("tags") or [],
-                limit=remaining,
-                max_age_hours=int(phase.get("age_hours") or 0),
-                min_age_hours=0,
-                before_id=before_id,
+            for phase in phases_config:
+                if len(candidates_by_id) >= fetch_limit:
+                    break
+                remaining = fetch_limit - len(candidates_by_id)
+                fetched = _fetch_candidate_cards(
+                    supabase=supabase,
+                    tags=phase.get("tags") or [],
+                    limit=remaining,
+                    max_age_hours=int(phase.get("age_hours") or 0),
+                    min_age_hours=0,
+                    before_id=before_id,
+                )
+                for card in fetched:
+                    cid = card.get("id")
+                    if cid is None:
+                        continue
+                    key = str(cid)
+                    if key not in candidates_by_id:
+                        candidates_by_id[key] = card
+
+                phases_debug.append({"stage": phase.get("stage"), "fetched": len(fetched), "unique": len(candidates_by_id)})
+
+            candidates_all = list(candidates_by_id.values())
+            debug["phases"] = phases_debug
+            debug["total_candidates_raw"] = len(candidates_all)
+
+            # seen filter
+            if exclude_ids:
+                unseen = []
+                for c in candidates_all:
+                    cid = _safe_int_id(c.get("id"))
+                    if cid is None or cid not in exclude_ids:
+                        unseen.append(c)
+            else:
+                unseen = candidates_all
+
+            candidates = unseen if len(unseen) >= limit else candidates_all
+            debug["seen_relaxed"] = len(unseen) < limit
+
+            ranked_raw = _score_cards_for_user(
+                candidates,
+                base_tags,
+                user_id=user_id,
+                user_topic_weights=user_topic_weights,
+                hot_tags=hot_tags_set,
             )
+            ranked, postprocess_debug = _apply_dedup_and_diversity(ranked_raw, base_tags)
+            debug["postprocess"] = postprocess_debug
+
+            page = ranked[:limit]
+            debug["returned"] = len(page)
+
+            next_before = None
+            if page:
+                ids = [(_safe_int_id(x.get("id")) or 0) for x in page]
+                next_before = min(ids) if ids else None
+
+            next_cursor = _encode_cursor_obj({"mode": "chron", "before_id": next_before}) if next_before else None
+            debug["seen_marked"] = int(_mark_cards_as_seen(supabase, user_id, page))
+            return page, debug, next_cursor
+
+        # ================== mode=blend (NEW DEFAULT) ==================
+        seq = _safe_int_id(cur_obj.get("seq")) or 0
+        seed = str(cur_obj.get("seed") or datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        debug["seq"] = seq
+        debug["seed"] = seed
+
+        # 1) строим "план" по возрастным бакетам
+        plan, plan_dbg = _build_age_bucket_plan(limit=limit, read_avg_age_hours=read_stats.get("avg_age_hours"))
+        debug["age_plan"] = plan_dbg
+
+        # 2) какие теги используем для retrieval
+        tags_personal = _unique_keep_order(base_tags)
+        tags_hot = _unique_keep_order(hot_tags_list)
+        tags_mixed = _unique_keep_order(tags_personal + tags_hot + DEFAULT_FEED_TAGS)
+        tags_query = _expand_with_neighbors(tags_mixed, depth=1)
+
+        debug["tags_query"] = {
+            "personal": tags_personal[:10],
+            "hot": tags_hot[:12],
+            "mixed_count": len(tags_mixed),
+            "query_count": len(tags_query),
+        }
+
+        # 3) набираем кандидатов из бакетов (и запасаем)
+        candidates_by_id: Dict[str, Dict[str, Any]] = {}
+        stages: List[Dict[str, Any]] = []
+        fetch_cap = min(max(limit * 25, 250), FEED_MAX_FETCH_LIMIT)
+
+        def _add_fetched(stage: str, fetched: List[Dict[str, Any]]) -> None:
+            before = len(candidates_by_id)
             for card in fetched:
                 cid = card.get("id")
                 if cid is None:
@@ -1468,25 +1550,112 @@ def build_feed_for_user_cursor(
                 key = str(cid)
                 if key not in candidates_by_id:
                     candidates_by_id[key] = card
+            stages.append(
+                {
+                    "stage": stage,
+                    "fetched": len(fetched),
+                    "unique_after": len(candidates_by_id),
+                    "added": len(candidates_by_id) - before,
+                }
+            )
 
-            phases_debug.append({"stage": phase.get("stage"), "fetched": len(fetched), "unique": len(candidates_by_id)})
+        # 3.1) бакеты
+        for b in plan:
+            if len(candidates_by_id) >= fetch_cap:
+                break
+            need = int(b.get("count") or 0)
+            if need <= 0:
+                continue
+            remaining = fetch_cap - len(candidates_by_id)
+            take = min(remaining, max(need * 18, 60))
+
+            fetched = _fetch_candidate_cards(
+                supabase=supabase,
+                tags=tags_query,
+                limit=take,
+                max_age_hours=int(b["max_age"]),
+                min_age_hours=int(b["min_age"]),
+                before_id=None,
+            )
+            _add_fetched(f"bucket:{b['name']}", fetched)
+
+        # 3.2) wide fallback
+        if len(candidates_by_id) < max(limit * 6, 120) and len(candidates_by_id) < fetch_cap:
+            remaining = fetch_cap - len(candidates_by_id)
+            take = min(remaining, max(limit * 20, 160))
+            fetched = _fetch_candidate_cards(
+                supabase=supabase,
+                tags=tags_query,
+                limit=take,
+                max_age_hours=FEED_WIDE_AGE_HOURS,
+                min_age_hours=0,
+                before_id=None,
+            )
+            _add_fetched("fallback:wide", fetched)
 
         candidates_all = list(candidates_by_id.values())
-        debug["phases"] = phases_debug
-        debug["total_candidates_raw"] = len(candidates_all)
+        debug["retrieval"] = {
+            "fetch_cap": fetch_cap,
+            "unique_candidates": len(candidates_all),
+            "stages": stages,
+        }
 
+        # 4) жёсткий фильтр "news не старше 7 дней"
+        now = datetime.now(timezone.utc)
+        news_cutoff = now - timedelta(hours=FEED_MAX_CARD_AGE_HOURS)
+
+        filtered_time: List[Dict[str, Any]] = []
+        dropped_old_news = 0
+        for c in candidates_all:
+            if _is_time_sensitive_news(c):
+                ca = c.get("created_at")
+                dt = None
+                if isinstance(ca, str):
+                    try:
+                        dt = datetime.fromisoformat(ca.replace("Z", "+00:00"))
+                    except Exception:
+                        dt = None
+                if dt is not None and dt < news_cutoff:
+                    dropped_old_news += 1
+                    continue
+            filtered_time.append(c)
+        debug["dropped_old_news"] = dropped_old_news
+
+        # 5) seen filter
         if exclude_ids:
-            unseen = []
-            for c in candidates_all:
+            unseen: List[Dict[str, Any]] = []
+            for c in filtered_time:
                 cid = _safe_int_id(c.get("id"))
                 if cid is None or cid not in exclude_ids:
                     unseen.append(c)
         else:
-            unseen = candidates_all
+            unseen = list(filtered_time)
 
-        candidates = unseen if len(unseen) >= limit else candidates_all
+        candidates = unseen if len(unseen) >= limit else filtered_time
         debug["seen_relaxed"] = len(unseen) < limit
+        debug["candidates_after_seen"] = len(candidates)
 
+        # 6) если совсем пусто — OpenAI (как крайний спасатель)
+        if not candidates:
+            if LLM_CARD_GENERATION_ENABLED and openai_is_configured():
+                need_count = max(limit * 3, 20)
+                logger.info("No candidates for user_id=%s. Generating ~%d cards via OpenAI.", user_id, need_count)
+                generated = generate_cards_for_tags(tags=base_tags, language="ru", count=need_count)
+                if generated:
+                    inserted = _insert_cards_into_db(supabase, generated, language="ru", source_type="llm")
+                    candidates = inserted or []
+                    debug["reason"] = "generated_via_openai"
+                    debug["generated"] = len(candidates)
+                else:
+                    debug["reason"] = "no_cards"
+                    return [], debug, _encode_cursor_obj({"mode": "blend", "seq": seq + 1, "seed": seed})
+            else:
+                debug["reason"] = "no_cards"
+                return [], debug, _encode_cursor_obj({"mode": "blend", "seq": seq + 1, "seed": seed})
+        else:
+            debug["reason"] = "blend_from_db"
+
+        # 7) rank + postprocess
         ranked_raw = _score_cards_for_user(
             candidates,
             base_tags,
@@ -1494,379 +1663,280 @@ def build_feed_for_user_cursor(
             user_topic_weights=user_topic_weights,
             hot_tags=hot_tags_set,
         )
-        ranked, postprocess_debug = _apply_dedup_and_diversity(ranked_raw, base_tags)
+        ranked, postprocess_debug = _apply_dedup_and_diversity(
+            ranked_raw,
+            base_tags,
+            max_consecutive_source=2,
+            max_consecutive_tag=2,
+        )
         debug["postprocess"] = postprocess_debug
+        debug["ranked_total"] = len(ranked)
 
-        page = ranked[:limit]
-        debug["returned"] = len(page)
+        # ====== Storyline/Related injection (дозировано) ======
+        seed_ids: Set[int] = set(pos.get("seed_card_ids") or [])
+        seed_title_sets: List[Set[str]] = []
+        seed_tags_set: Set[str] = set(str(x).strip() for x in (seed_tags or []) if str(x).strip())
 
-        next_before = None
-        if page:
-            ids = [(_safe_int_id(x.get("id")) or 0) for x in page]
-            next_before = min(ids) if ids else None
+        if seed_ids:
+            try:
+                resp_seed = (
+                    supabase.table("cards")
+                    .select("id,title,created_at")
+                    .in_("id", sorted(seed_ids))
+                    .execute()
+                )
+                data_seed = getattr(resp_seed, "data", None) or getattr(resp_seed, "model", None) or []
+                for r in data_seed:
+                    ttl = str(r.get("title") or "")
+                    s = _title_token_set(ttl)
+                    if s:
+                        seed_title_sets.append(s)
+            except Exception:
+                logger.exception("Failed to load seed titles for tg_id=%s", user_id)
 
-        next_cursor = _encode_cursor_obj({"mode": "chron", "before_id": next_before}) if next_before else None
-        debug["seen_marked"] = int(_mark_cards_as_seen(supabase, user_id, page))
-        return page, debug, next_cursor
+        def _is_followup_candidate(card: Dict[str, Any]) -> bool:
+            cid = _safe_int_id(card.get("id"))
+            if cid is None or cid in seed_ids:
+                return False
 
-    # ===== mode=blend (NEW DEFAULT) =====
-    seq = _safe_int_id(cur_obj.get("seq")) or 0
-    seed = str(cur_obj.get("seed") or datetime.now(timezone.utc).strftime("%Y-%m-%d"))
-    debug["seq"] = seq
-    debug["seed"] = seed
-
-    # 1) строим "план" по возрастным бакетам
-    plan, plan_dbg = _build_age_bucket_plan(limit=limit, read_avg_age_hours=read_stats.get("avg_age_hours"))
-    debug["age_plan"] = plan_dbg
-
-    # 2) какие теги используем для retrieval
-    #    - персональные (профиль)
-    #    - hot (продолжения/смежные)
-    #    - дефолтные (чтобы лента не пустела)
-    tags_personal = _unique_keep_order(base_tags)
-    tags_hot = _unique_keep_order(hot_tags_list)
-    tags_mixed = _unique_keep_order(tags_personal + tags_hot + DEFAULT_FEED_TAGS)
-    tags_query = _expand_with_neighbors(tags_mixed, depth=1)
-
-    debug["tags_query"] = {
-        "personal": tags_personal[:10],
-        "hot": tags_hot[:12],
-        "mixed_count": len(tags_mixed),
-        "query_count": len(tags_query),
-    }
-
-    # 3) набираем кандидатов из бакетов (и чуть запасаем, чтобы дедуп/диверсификация не убили страницу)
-    candidates_by_id: Dict[str, Dict[str, Any]] = {}
-    stages: List[Dict[str, Any]] = []
-    fetch_cap = min(max(limit * 25, 250), FEED_MAX_FETCH_LIMIT)
-
-    def _add_fetched(stage: str, fetched: List[Dict[str, Any]]) -> None:
-        before = len(candidates_by_id)
-        for card in fetched:
-            cid = card.get("id")
-            if cid is None:
-                continue
-            key = str(cid)
-            if key not in candidates_by_id:
-                candidates_by_id[key] = card
-        stages.append({"stage": stage, "fetched": len(fetched), "unique_after": len(candidates_by_id), "added": len(candidates_by_id) - before})
-
-    # 3.1) бакеты в пределах 7 дней (news cap)
-    for b in plan:
-        if len(candidates_by_id) >= fetch_cap:
-            break
-        need = int(b.get("count") or 0)
-        if need <= 0:
-            continue
-        remaining = fetch_cap - len(candidates_by_id)
-        take = min(remaining, max(need * 18, 60))
-
-        fetched = _fetch_candidate_cards(
-            supabase=supabase,
-            tags=tags_query,
-            limit=take,
-            max_age_hours=int(b["max_age"]),
-            min_age_hours=int(b["min_age"]),
-            before_id=None,
-        )
-        _add_fetched(f"bucket:{b['name']}", fetched)
-
-    # 3.2) fallback если всё равно мало (в пределах wide, но потом мы всё равно отфильтруем старые news)
-    if len(candidates_by_id) < max(limit * 6, 120) and len(candidates_by_id) < fetch_cap:
-        remaining = fetch_cap - len(candidates_by_id)
-        take = min(remaining, max(limit * 20, 160))
-        fetched = _fetch_candidate_cards(
-            supabase=supabase,
-            tags=tags_query,
-            limit=take,
-            max_age_hours=FEED_WIDE_AGE_HOURS,
-            min_age_hours=0,
-            before_id=None,
-        )
-        _add_fetched("fallback:wide", fetched)
-
-    candidates_all = list(candidates_by_id.values())
-    debug["retrieval"] = {
-        "fetch_cap": fetch_cap,
-        "unique_candidates": len(candidates_all),
-        "stages": stages,
-    }
-
-    # 4) жёсткий фильтр "news не старше 7 дней"
-    #    wikipedia оставляем, даже если старее (но обычно она и так свежая по created_at)
-    now = datetime.now(timezone.utc)
-    news_cutoff = now - timedelta(hours=FEED_MAX_CARD_AGE_HOURS)
-
-    filtered_time: List[Dict[str, Any]] = []
-    dropped_old_news = 0
-    for c in candidates_all:
-        if _is_time_sensitive_news(c):
-            ca = c.get("created_at")
-            dt = None
+            # ограничиваем по времени
+            ca = card.get("created_at")
             if isinstance(ca, str):
                 try:
                     dt = datetime.fromisoformat(ca.replace("Z", "+00:00"))
+                    age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+                    if age_h > float(FEED_STORY_LOOKBACK_HOURS):
+                        return False
                 except Exception:
-                    dt = None
-            if dt is not None and dt < news_cutoff:
-                dropped_old_news += 1
-                continue
-        filtered_time.append(c)
-    debug["dropped_old_news"] = dropped_old_news
+                    pass
 
-    # 5) seen filter
-    if exclude_ids:
-        unseen: List[Dict[str, Any]] = []
-        for c in filtered_time:
-            cid = _safe_int_id(c.get("id"))
-            if cid is None or cid not in exclude_ids:
-                unseen.append(c)
-    else:
-        unseen = list(filtered_time)
-
-    candidates = unseen if len(unseen) >= limit else filtered_time
-    debug["seen_relaxed"] = len(unseen) < limit
-    debug["candidates_after_seen"] = len(candidates)
-
-    # 6) если совсем пусто — OpenAI (как крайний спасатель)
-    if not candidates:
-        if LLM_CARD_GENERATION_ENABLED and openai_is_configured():
-            need_count = max(limit * 3, 20)
-            logger.info("No candidates for user_id=%s. Generating ~%d cards via OpenAI.", user_id, need_count)
-            generated = generate_cards_for_tags(tags=base_tags, language="ru", count=need_count)
-            if generated:
-                inserted = _insert_cards_into_db(supabase, generated, language="ru", source_type="llm")
-                candidates = inserted or []
-                debug["reason"] = "generated_via_openai"
-                debug["generated"] = len(candidates)
-            else:
-                debug["reason"] = "no_cards"
-                return [], debug, _encode_cursor_obj({"mode": "blend", "seq": seq + 1, "seed": seed})
-        else:
-            debug["reason"] = "no_cards"
-            return [], debug, _encode_cursor_obj({"mode": "blend", "seq": seq + 1, "seed": seed})
-    else:
-        debug["reason"] = "blend_from_db"
-
-    # 7) rank + postprocess (важно: hot_tags влияет на "продолжения/смежность")
-    ranked_raw = _score_cards_for_user(
-        candidates,
-        base_tags,
-        user_id=user_id,
-        user_topic_weights=user_topic_weights,
-        hot_tags=hot_tags_set,
-    )
-    ranked, postprocess_debug = _apply_dedup_and_diversity(ranked_raw, base_tags, max_consecutive_source=2, max_consecutive_tag=2)
-    debug["postprocess"] = postprocess_debug
-    debug["ranked_total"] = len(ranked)
-
-        # ====== Storyline/Related injection (дозировано) ======
-
-    seed_ids: Set[int] = set(pos.get("seed_card_ids") or [])
-    seed_title_sets: List[Set[str]] = []
-    seed_tags_set: Set[str] = set(str(x).strip() for x in (seed_tags or []) if str(x).strip())
-
-    if seed_ids:
-        try:
-            resp_seed = (
-                supabase.table("cards")
-                .select("id,title,created_at")
-                .in_("id", sorted(seed_ids))
-                .execute()
-            )
-            data_seed = getattr(resp_seed, "data", None) or getattr(resp_seed, "model", None) or []
-            for r in data_seed:
-                ttl = str(r.get("title") or "")
-                s = _title_token_set(ttl)
-                if s:
-                    seed_title_sets.append(s)
-        except Exception:
-            logger.exception("Failed to load seed titles for tg_id=%s", user_id)
-
-    def _is_followup_candidate(card: Dict[str, Any]) -> bool:
-        cid = _safe_int_id(card.get("id"))
-        if cid is None or cid in seed_ids:
-            return False
-
-        # ограничиваем по времени (в пределах lookback и 7 дней)
-        ca = card.get("created_at")
-        if isinstance(ca, str):
-            try:
-                dt = datetime.fromisoformat(ca.replace("Z", "+00:00"))
-                age_h = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
-                if age_h > float(FEED_STORY_LOOKBACK_HOURS):
+            tags = card.get("tags") or []
+            if not isinstance(tags, list):
+                tags = []
+            if seed_tags_set:
+                if not any(str(t).strip() in seed_tags_set for t in tags):
                     return False
-            except Exception:
-                pass
 
-        tags = card.get("tags") or []
-        if not isinstance(tags, list):
-            tags = []
-        if seed_tags_set:
-            if not any(str(t).strip() in seed_tags_set for t in tags):
+            if not seed_title_sets:
+                return True
+
+            cand_set = _title_token_set(str(card.get("title") or ""))
+            if not cand_set:
                 return False
 
-        if not seed_title_sets:
-            # если нет seed titles — fallback: просто tag overlap с seed_tags
-            return True
-
-        cand_set = _title_token_set(str(card.get("title") or ""))
-        if not cand_set:
+            for s in seed_title_sets:
+                if _jaccard(cand_set, s) >= float(FEED_STORY_SIM_THRESHOLD):
+                    return True
             return False
 
-        best = 0.0
-        for s in seed_title_sets:
-            best = max(best, _jaccard(cand_set, s))
-            if best >= float(FEED_STORY_SIM_THRESHOLD):
-                return True
-        return False
+        def _is_related_candidate(card: Dict[str, Any]) -> bool:
+            if _is_followup_candidate(card):
+                return False
+            tags = card.get("tags") or []
+            if not isinstance(tags, list):
+                tags = []
+            return any(str(t).strip() in hot_tags_set for t in tags)
 
-    def _is_related_candidate(card: Dict[str, Any]) -> bool:
-        # related = пересечение с hot_tags, но не followup
-        if _is_followup_candidate(card):
-            return False
-        tags = card.get("tags") or []
-        if not isinstance(tags, list):
-            tags = []
-        return any(str(t).strip() in hot_tags_set for t in tags)
+        followup_pool = [c for c in ranked if _is_followup_candidate(c)]
+        related_pool = [c for c in ranked if _is_related_candidate(c)]
 
-    followup_pool = [c for c in ranked if _is_followup_candidate(c)]
-    related_pool = [c for c in ranked if _is_related_candidate(c)]
+        followup_take = followup_pool[: int(FEED_FOLLOWUP_MAX_PER_PAGE)]
+        related_take = related_pool[: int(FEED_RELATED_MAX_PER_PAGE)]
 
-    followup_take = followup_pool[: int(FEED_FOLLOWUP_MAX_PER_PAGE)]
-    related_take = related_pool[: int(FEED_RELATED_MAX_PER_PAGE)]
-
-    used_ids: Set[int] = set()
-    for x in followup_take + related_take:
-        cid = _safe_int_id(x.get("id"))
-        if cid is not None:
-            used_ids.add(cid)
-
-    # позиции вставки (чуть варьируем от seq, чтобы лента не выглядела "по шаблону")
-    def _shift(pos_list: List[int], shift: int) -> List[int]:
-        out = []
-        for p in pos_list:
-            out.append(max(0, min(limit - 1, p + shift)))
-        # уникализируем сохраняя порядок
-        seenp = set()
-        uniq = []
-        for p in out:
-            if p not in seenp:
-                seenp.add(p)
-                uniq.append(p)
-        return uniq
-
-    followup_positions = _shift([3], shift=(seq % 2))          # 3 или 4
-    related_positions = _shift([1, 6], shift=(seq % 3) - 1)    # чуть гуляем
-
-    slots: List[Optional[Dict[str, Any]]] = [None] * limit
-
-    # ставим followup
-    for i, card in enumerate(followup_take):
-        if i >= len(followup_positions):
-            break
-        p = followup_positions[i]
-        slots[p] = card
-
-    # ставим related
-    r_i = 0
-    for p in related_positions:
-        if r_i >= len(related_take):
-            break
-        if slots[p] is not None:
-            continue
-        slots[p] = related_take[r_i]
-        r_i += 1
-
-    # добиваем остальным ranked
-    fill_iter = iter(ranked)
-    for i in range(limit):
-        if slots[i] is not None:
-            continue
-        while True:
-            try:
-                c = next(fill_iter)
-            except StopIteration:
-                c = None
-            if c is None:
-                break
-            cid = _safe_int_id(c.get("id"))
-            if cid is not None and cid in used_ids:
-                continue
-            slots[i] = c
+        used_ids: Set[int] = set()
+        for x in followup_take + related_take:
+            cid = _safe_int_id(x.get("id"))
             if cid is not None:
                 used_ids.add(cid)
-            break
 
-    page = [c for c in slots if c is not None][:limit]
-    debug["injections"] = {
-        "followup_max": int(FEED_FOLLOWUP_MAX_PER_PAGE),
-        "related_max": int(FEED_RELATED_MAX_PER_PAGE),
-        "followup_taken": len(followup_take),
-        "related_taken": len(related_take),
-        "seed_ids": list(seed_ids)[:8],
-        "story_sim_threshold": float(FEED_STORY_SIM_THRESHOLD),
-        "story_lookback_hours": int(FEED_STORY_LOOKBACK_HOURS),
-    }
+        def _shift(pos_list: List[int], shift: int) -> List[int]:
+            out: List[int] = []
+            for p in pos_list:
+                out.append(max(0, min(limit - 1, p + shift)))
+            seenp: Set[int] = set()
+            uniq: List[int] = []
+            for p in out:
+                if p not in seenp:
+                    seenp.add(p)
+                    uniq.append(p)
+            return uniq
 
-    debug["returned"] = len(page)
+        followup_positions = _shift([3], shift=(seq % 2))          # 3 или 4
+        related_positions = _shift([1, 6], shift=(seq % 3) - 1)    # чуть гуляем
 
-    # 8) next cursor: всегда отдаём следующий seq (blend бесконечный)
-    next_cursor = _encode_cursor_obj({"mode": "blend", "seq": seq + 1, "seed": seed})
+        slots: List[Optional[Dict[str, Any]]] = [None] * limit
 
-    debug["seen_marked"] = int(_mark_cards_as_seen(supabase, user_id, page))
-    return page, debug, next_cursor
+        for i, card in enumerate(followup_take):
+            if i >= len(followup_positions):
+                break
+            p = followup_positions[i]
+            slots[p] = card
 
+        r_i = 0
+        for p in related_positions:
+            if r_i >= len(related_take):
+                break
+            if slots[p] is not None:
+                continue
+            slots[p] = related_take[r_i]
+            r_i += 1
+
+        fill_iter = iter(ranked)
+        for i in range(limit):
+            if slots[i] is not None:
+                continue
+            while True:
+                try:
+                    c = next(fill_iter)
+                except StopIteration:
+                    c = None
+                if c is None:
+                    break
+                cid = _safe_int_id(c.get("id"))
+                if cid is not None and cid in used_ids:
+                    continue
+                slots[i] = c
+                if cid is not None:
+                    used_ids.add(cid)
+                break
+
+        page = [c for c in slots if c is not None][:limit]
+        debug["injections"] = {
+            "followup_max": int(FEED_FOLLOWUP_MAX_PER_PAGE),
+            "related_max": int(FEED_RELATED_MAX_PER_PAGE),
+            "followup_taken": len(followup_take),
+            "related_taken": len(related_take),
+            "seed_ids": list(seed_ids)[:8],
+            "story_sim_threshold": float(FEED_STORY_SIM_THRESHOLD),
+            "story_lookback_hours": int(FEED_STORY_LOOKBACK_HOURS),
+        }
+
+        debug["returned"] = len(page)
+
+        # 8) next cursor: всегда отдаём следующий seq (blend бесконечный)
+        next_cursor = _encode_cursor_obj({"mode": "blend", "seq": seq + 1, "seed": seed})
+
+        debug["seen_marked"] = int(_mark_cards_as_seen(supabase, user_id, page))
+        return page, debug, next_cursor
+
+    except Exception as e:
+        # НИКОГДА не отдаём 500 вверх по стеку — иначе Telegram WebApp показывает "недоступен"
+        logger.exception("build_feed_for_user_cursor failed for user_id=%s", user_id)
+        debug["error"] = str(e)
+        # двигаем seq, чтобы клиент не зациклился на одном и том же курсоре
+        safe_next = _encode_cursor_obj({"mode": "blend", "seq": (_safe_int_id(cur_obj.get("seq")) or 0) + 1, "seed": str(cur_obj.get("seed") or "")})
+        return [], debug, safe_next
 
 
 # ===================== Public wrapper =====================
 
 def build_feed_for_user_paginated(
-    supabase: Optional[Client],
+    supabase: Optional["Client"],
     user_id: int,
     limit: Optional[int] = None,
     offset: int = 0,
     cursor: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
+    """
+    Возвращает: items, debug, cursor_meta
+    cursor_meta — всегда dict (никогда не "не определён")
+    """
+    # ВАЖНО: эти переменные всегда определены (фикс UnboundLocalError)
+    items: List[Dict[str, Any]] = []
+    debug: Dict[str, Any] = {}
+    cursor_meta: Dict[str, Any] = {}
+
     if limit is None or limit <= 0:
         limit = FEED_CARDS_LIMIT_DEFAULT
-    limit = min(max(limit, 1), 50)
+    limit = min(max(int(limit), 1), 50)
     offset = max(0, int(offset))
 
     use_cursor_default = (FEED_PAGINATION_MODE == "cursor")
-    if cursor is not None or use_cursor_default:
-        ...
+    try_cursor = (cursor is not None) or use_cursor_default
+
+    if try_cursor:
+        try:
+            items, base_debug, next_cursor = build_feed_for_user_cursor(
+                supabase=supabase,
+                user_id=user_id,
+                limit=limit,
+                cursor=cursor,
+            )
+
+            cursor_meta = {
+                "mode": "cursor",
+                "limit": limit,
+                "cursor_in": cursor,
+                "cursor_out": next_cursor,
+            }
+
+            debug = {
+                **(base_debug or {}),
+                "pagination_mode": "cursor",
+                "limit": limit,
+            }
+            return items, debug, cursor_meta
+
+        except Exception as e:
+            logger.exception("build_feed_for_user_paginated(cursor) failed for user_id=%s", user_id)
+            debug = {
+                "pagination_mode": "cursor",
+                "limit": limit,
+                "cursor_in": cursor,
+                "error": str(e),
+            }
+            cursor_meta = {
+                "mode": "cursor",
+                "limit": limit,
+                "cursor_in": cursor,
+                "cursor_out": _encode_cursor_obj({"mode": "blend", "seq": 1, "seed": datetime.now(timezone.utc).strftime("%Y-%m-%d")}),
+            }
+            return [], debug, cursor_meta
+
+    # ===== offset mode (legacy) =====
+    try:
+        items, base_debug = build_feed_for_user(
+            supabase=supabase,
+            user_id=user_id,
+            limit=limit,
+            offset=offset,
+        )
+
+        has_more = bool((base_debug or {}).get("has_more"))
+        next_offset = (base_debug or {}).get("next_offset")
+
+        cursor_meta = {
+            "mode": "offset",
+            "limit": limit,
+            "offset": offset,
+            "next_offset": next_offset,
+            "has_more": has_more,
+        }
+
+        debug = {
+            **(base_debug or {}),
+            "pagination_mode": "offset",
+            "offset": offset,
+            "limit": limit,
+            "has_more": has_more,
+        }
+
         return items, debug, cursor_meta
 
-    items, base_debug = build_feed_for_user(...)
-    ...
-    return items, debug, cursor_meta
-
-
-
-    items, base_debug = build_feed_for_user(
-        supabase=supabase,
-        user_id=user_id,
-        limit=limit,
-        offset=offset,
-    )
-
-    has_more = bool(base_debug.get("has_more"))
-    next_offset = base_debug.get("next_offset")
-
-    cursor_meta = {
-        "mode": "offset",
-        "limit": limit,
-        "offset": offset,
-        "next_offset": next_offset,
-        "has_more": has_more,
-    }
-
-    debug: Dict[str, Any] = {
-        **(base_debug or {}),
-        "offset": offset,
-        "limit": limit,
-        "has_more": has_more,
-    }
-
-    return items, debug, cursor_meta
+    except Exception as e:
+        logger.exception("build_feed_for_user_paginated(offset) failed for user_id=%s", user_id)
+        debug = {
+            "pagination_mode": "offset",
+            "offset": offset,
+            "limit": limit,
+            "has_more": False,
+            "error": str(e),
+        }
+        cursor_meta = {
+            "mode": "offset",
+            "limit": limit,
+            "offset": offset,
+            "next_offset": None,
+            "has_more": False,
+        }
+        return [], debug, cursor_meta
