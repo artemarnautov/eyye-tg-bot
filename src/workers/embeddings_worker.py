@@ -7,7 +7,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from supabase import create_client
 
@@ -97,7 +97,7 @@ def rpc_claim_cards_for_embedding(
     max_attempts: int,
 ) -> List[Dict[str, Any]]:
     """
-    Канонический вызов под сигнатуру:
+    Под твою текущую сигнатуру:
       claim_cards_for_embedding(n integer, claim_seconds integer, max_attempts integer)
     """
     args = {"n": int(claim_batch), "claim_seconds": int(claim_seconds), "max_attempts": int(max_attempts)}
@@ -107,74 +107,40 @@ def rpc_claim_cards_for_embedding(
 
 
 # =====================
-# store embedding: RPC if exists -> fallback to direct UPDATE
+# Store embedding via UPDATE (robust)
 # =====================
-def _apierr_payload(e: Exception) -> Optional[Dict[str, Any]]:
-    # postgrest.exceptions.APIError обычно кладёт dict в args[0]
-    try:
-        if getattr(e, "args", None) and isinstance(e.args[0], dict):
-            return e.args[0]
-    except Exception:
-        pass
-    return None
-
-
-def _looks_like_missing_rpc(e: Exception, fn: str) -> bool:
-    p = _apierr_payload(e) or {}
-    msg = str(p.get("message") or "").lower()
-    code = str(p.get("code") or "")
-    s = str(e).lower()
-
-    if fn.lower() in msg and "does not exist" in msg:
-        return True
-    if code == "42883" and fn.lower() in msg:
-        return True
-    # иногда 404 прячется в строке исключения
-    if "404" in s and fn.lower() in s:
-        return True
-    return False
-
-
 def _vec_to_str(emb: List[float]) -> str:
-    # формат как pgvector принимает через PostgREST: "[-0.1,0.2,...]"
+    # pgvector через PostgREST у тебя хранится строкой вида "[...]"
     return "[" + ",".join(f"{float(x):.9g}" for x in emb) + "]"
 
 
-def _store_embedding_via_rpc(
-    supabase,
-    *,
-    card_id: int,
-    embedding_str: str,
-    embedding_model: str,
-    error_text: Optional[str],
-) -> bool:
+def _try_update_cards(supabase, card_id: int, upd: Dict[str, Any]) -> None:
     """
-    Пытаемся вызвать RPC store_card_embedding (если он существует).
-    Возвращаем True если удалось; False если RPC отсутствует (тогда перейдём на UPDATE).
+    Пытаемся обновить cards.
+    Если какие-то колонки отсутствуют (редко, но бывает) — повторяем с минимальным набором.
     """
-    fn = "store_card_embedding"
-
-    variants = [
-        {"p_card_id": card_id, "p_embedding": embedding_str, "p_embedding_model": embedding_model, "p_error_text": error_text},
-        {"card_id": card_id, "embedding": embedding_str, "embedding_model": embedding_model, "error_text": error_text},
-        {"id": card_id, "embedding": embedding_str, "model": embedding_model, "error": error_text},
-    ]
-
-    last_err: Optional[Exception] = None
-    for payload in variants:
+    try:
+        supabase.table("cards").update(upd).eq("id", int(card_id)).execute()
+        return
+    except Exception as e:
+        s = str(e).lower()
+        # минимальный безопасный апдейт
+        minimal = {
+            "embedding": upd.get("embedding"),
+            "embedding_model": upd.get("embedding_model"),
+            "embedding_updated_at": upd.get("embedding_updated_at"),
+            "embedding_last_error": upd.get("embedding_last_error"),
+        }
+        # если ошибка не про колонку — тоже попробуем minimal, но потом пробросим
         try:
-            supabase.rpc(fn, payload).execute()
-            return True
-        except Exception as e:
-            last_err = e
-            if _looks_like_missing_rpc(e, fn):
-                return False
-
-    # RPC есть, но мы не попали в сигнатуру/внутреннюю ошибку — логируем как ошибка
-    raise RuntimeError(f"{fn} call failed (last_err={_apierr_payload(last_err) or last_err})")
+            supabase.table("cards").update(minimal).eq("id", int(card_id)).execute()
+            logger.warning("cards update used MINIMAL columns for card_id=%s due to error=%s", card_id, s[:200])
+            return
+        except Exception:
+            raise
 
 
-def _store_embedding_via_update(
+def store_embedding(
     supabase,
     *,
     card_id: int,
@@ -190,13 +156,13 @@ def _store_embedding_via_update(
         "embedding_model": embedding_model,
         "embedding_updated_at": now_iso,
         "embedding_last_error": (error_text[:900] if error_text else None),
-        "embedding_claimed_until": None,  # освобождаем lease
+        # освобождаем lease, если колонки есть (в minimal уйдёт только нужное)
+        "embedding_claimed_until": None,
     }
-    # если в таблице есть embedding_attempts, можно установить значение
     if attempts_value is not None:
         upd["embedding_attempts"] = int(attempts_value)
 
-    supabase.table("cards").update(upd).eq("id", int(card_id)).execute()
+    _try_update_cards(supabase, int(card_id), upd)
 
 
 # =====================
@@ -217,7 +183,6 @@ def _age_hours_from_row(row: Dict[str, Any]) -> Optional[float]:
     if not v:
         return None
     try:
-        # created_at приходит как ISO string
         dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
@@ -242,7 +207,6 @@ def main() -> int:
     args = ap.parse_args()
 
     supabase_url = _require_env("SUPABASE_URL")
-    # ВАЖНО: для воркера лучше service role key (если есть)
     supabase_key = (
         _env("SUPABASE_SERVICE_KEY")
         or _env("SUPABASE_SERVICE_ROLE_KEY")
@@ -279,7 +243,7 @@ def main() -> int:
             time.sleep(max(1.0, float(args.idle_sleep)))
             continue
 
-        # фильтр по возрасту (4 дня)
+        # фильтр по возрасту
         filtered: List[Dict[str, Any]] = []
         for r in claimed:
             age_h = _age_hours_from_row(r)
@@ -287,7 +251,7 @@ def main() -> int:
                 filtered.append(r)
 
         if not filtered:
-            logger.info("Claimed=%d but all are older than max_age_hours=%s. Sleep.", len(claimed), int(args.max_age_hours))
+            logger.info("Claimed=%d but all are older than max_age_hours=%s", len(claimed), int(args.max_age_hours))
             if args.once:
                 return 0
             time.sleep(max(1.0, float(args.idle_sleep)))
@@ -295,18 +259,19 @@ def main() -> int:
 
         logger.info("Claimed %d cards (filtered %d)", len(claimed), len(filtered))
 
-        rows: List[Dict[str, Any]] = list(filtered)
+        rows = filtered
         i = 0
         while i < len(rows):
             batch = rows[i : i + max(1, int(args.embed_batch))]
             i += len(batch)
 
             texts = [_build_embed_text(r) for r in batch]
+
             ids: List[int] = []
             attempts: List[Optional[int]] = []
-
             for r in batch:
-                ids.append(int(r.get("id")))
+                cid = int(r.get("id"))
+                ids.append(cid)
                 try:
                     attempts.append(int(r.get("embedding_attempts") or 0) + 1)
                 except Exception:
@@ -318,27 +283,15 @@ def main() -> int:
                     raise RuntimeError(f"embeddings size mismatch: got={len(embs)} expected={len(batch)}")
 
                 for cid, emb, att in zip(ids, embs, attempts):
-                    emb_str = _vec_to_str(emb)
-
                     try:
-                        # 1) пробуем RPC (если существует)
-                        ok_rpc = _store_embedding_via_rpc(
+                        store_embedding(
                             supabase,
                             card_id=cid,
-                            embedding_str=emb_str,
+                            embedding_str=_vec_to_str(emb),
                             embedding_model=model,
                             error_text=None,
+                            attempts_value=att,
                         )
-                        if not ok_rpc:
-                            # 2) fallback: прямой UPDATE
-                            _store_embedding_via_update(
-                                supabase,
-                                card_id=cid,
-                                embedding_str=emb_str,
-                                embedding_model=model,
-                                error_text=None,
-                                attempts_value=att,
-                            )
                     except Exception as e:
                         logger.exception("store embedding failed for card_id=%s: %s", cid, e)
 
@@ -347,22 +300,14 @@ def main() -> int:
                 logger.exception("OpenAI embeddings failed for batch: %s", err)
                 for cid, att in zip(ids, attempts):
                     try:
-                        ok_rpc = _store_embedding_via_rpc(
+                        store_embedding(
                             supabase,
                             card_id=cid,
-                            embedding_str="[]",
+                            embedding_str=None,
                             embedding_model=model,
                             error_text=err[:900],
+                            attempts_value=att,
                         )
-                        if not ok_rpc:
-                            _store_embedding_via_update(
-                                supabase,
-                                card_id=cid,
-                                embedding_str=None,
-                                embedding_model=model,
-                                error_text=err[:900],
-                                attempts_value=att,
-                            )
                     except Exception:
                         logger.exception("failed to record error for card_id=%s", cid)
 
