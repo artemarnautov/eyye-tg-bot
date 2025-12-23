@@ -123,57 +123,30 @@ def rpc_claim_cards_for_embedding(
     raise RuntimeError(f"claim_cards_for_embedding failed for all arg variants: {last_err}")
 
 
-def rpc_store_card_embedding(
+def rpc_claim_cards_for_embedding(
     supabase,
     *,
-    card_id: int,
-    embedding: List[float],
-    embedding_model: str,
-    now_iso: str,
-    error_text: Optional[str],
-) -> None:
+    claim_batch: int,
+    claim_seconds: int,
+    max_attempts: int,
+) -> List[Dict[str, Any]]:
     """
-    Пишем embedding через RPC store_card_embedding.
-    RPC в БД ожидает:
-      - store_card_embedding(id bigint, embedding jsonb, model text)
-      - или store_card_embedding(payload jsonb)
+    Канонический вызов под сигнатуру:
+      claim_cards_for_embedding(n integer, claim_seconds integer, max_attempts integer)
     """
-    # Если эмбеддинга нет или есть ошибка — НЕ зовём store_card_embedding,
-    # просто обновляем служебные поля.
-    if not embedding or error_text:
-        patch: Dict[str, Any] = {
-            "embedding_last_error": error_text,
-            "embedding_updated_at": now_iso,
-            "embedding_model": embedding_model,
-        }
-        supabase.table("cards").update(patch).eq("id", card_id).execute()
-        return
-
-    # 1) try RPC (правильные имена аргументов!)
-    rpc_variants: List[Dict[str, Any]] = [
-        {"id": card_id, "embedding": embedding, "model": embedding_model},
-        {"payload": {"id": card_id, "embedding": embedding, "model": embedding_model}},
-    ]
-    last_err: Optional[Exception] = None
-    for args in rpc_variants:
-        try:
-            supabase.rpc("store_card_embedding", args).execute()
-            return
-        except Exception as e:
-            last_err = e
-
-    # 2) fallback update: pgvector чаще всего нормально кастится из строки "[...]"
-    vec_literal = "[" + ",".join(str(float(x)) for x in embedding) + "]"
-    patch2: Dict[str, Any] = {
-        "embedding": vec_literal,
-        "embedding_model": embedding_model,
-        "embedding_updated_at": now_iso,
-        "embedding_last_error": None,
+    args = {
+        "n": int(claim_batch),
+        "claim_seconds": int(claim_seconds),
+        "max_attempts": int(max_attempts),
     }
+
     try:
-        supabase.table("cards").update(patch2).eq("id", card_id).execute()
+        res = supabase.rpc("claim_cards_for_embedding", args).execute()
+        data = getattr(res, "data", None) or getattr(res, "model", None) or []
+        return list(data or [])
     except Exception as e:
-        raise RuntimeError(f"store embedding failed (rpc_error={last_err}, update_error={e})")
+        raise RuntimeError(f"claim_cards_for_embedding failed (args={args}): {e}")
+
 
 
 
