@@ -125,44 +125,42 @@ def rpc_claim_cards_for_embedding(
 
 def rpc_store_card_embedding(
     supabase,
-    *,
     card_id: int,
-    embedding: List[float],
-    embedding_model: str,
-    now_iso: str,
-    error_text: Optional[str],
-) -> None:
+    embedding,  # list[float]
+    model: str,
+):
     """
-    Сначала пытаемся RPC store_card_embedding (если существует),
-    иначе — прямой update в таблицу cards.
+    Пытаемся вызвать store_card_embedding с разными вариантами аргументов,
+    потому что PostgREST матчится по ИМЕНАМ параметров и может вернуть 404
+    при несовпадении ключей/перегрузках.
     """
-    # 1) try RPC
-    rpc_variants: List[Dict[str, Any]] = [
-        {"p_card_id": card_id, "p_embedding": embedding, "p_embedding_model": embedding_model, "p_error": error_text},
-        {"card_id": card_id, "embedding": embedding, "embedding_model": embedding_model, "error": error_text},
-        {"id": card_id, "embedding": embedding, "embedding_model": embedding_model, "error": error_text},
+    # Вариант 1: прямая 3-арг сигнатура (id, embedding, model)
+    variants = [
+        {"id": card_id, "embedding": embedding, "model": model},
+        # Вариант 2: перегрузка (payload jsonb)
+        {"payload": {"id": card_id, "embedding": embedding, "model": model}},
+        # Частые альтернативы имён (на всякий)
+        {"card_id": card_id, "embedding": embedding, "model": model},
+        {"payload": {"card_id": card_id, "embedding": embedding, "model": model}},
+        {"payload": {"id": card_id, "embedding": embedding, "embedding_model": model}},
+        {"payload": {"card_id": card_id, "embedding": embedding, "embedding_model": model}},
     ]
-    last_err: Optional[Exception] = None
-    for args in rpc_variants:
+
+    last_err = None
+    for i, args in enumerate(variants, start=1):
         try:
-            supabase.rpc("store_card_embedding", args).execute()
-            return
+            res = supabase.rpc("store_card_embedding", args).execute()
+            return getattr(res, "data", None)
         except Exception as e:
             last_err = e
+            s = str(e)
+            # 404/Not Found -> пробуем следующий вариант
+            if ("404" in s) or ("Not Found" in s) or ("Could not find the function" in s):
+                continue
+            # Любая другая ошибка = функция нашлась, но упала внутри (например, размерность vector)
+            raise
 
-    # 2) fallback update
-    # важно: vector тип в PostgREST обычно принимает массив float, но если у тебя будет ошибка —
-    # тогда в БД сделаем store_card_embedding RPC и перестанем делать прямой update.
-    patch: Dict[str, Any] = {
-        "embedding": embedding,
-        "embedding_model": embedding_model,
-        "embedding_updated_at": now_iso,
-        "embedding_last_error": error_text,
-    }
-    try:
-        supabase.table("cards").update(patch).eq("id", card_id).execute()
-    except Exception as e:
-        raise RuntimeError(f"store embedding failed (rpc_error={last_err}, update_error={e})")
+    raise RuntimeError(f"store_card_embedding failed for all arg variants: {last_err}")
 
 
 # =====================
