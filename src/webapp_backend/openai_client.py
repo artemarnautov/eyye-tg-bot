@@ -7,7 +7,7 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +40,8 @@ TAG_ALIASES = {
     "cryptocurrency": "finance",
     "ai": "tech",
     "startup": "business",
-    "startups": "business",          # ✅ часто встречается
-    "startup_funding": "business",   # ✅ часто встречается
+    "startups": "business",
+    "startup_funding": "business",
     "movies": "entertainment",
     "movie": "entertainment",
     "cinema": "entertainment",
@@ -50,19 +50,17 @@ TAG_ALIASES = {
     "education_career": "education",
 }
 
+
 def get_canonical_topics() -> List[str]:
-    """
-    Единственный источник правды для топиков/тем EYYE.
-    RSS ingest должен строить queries только из этого списка.
-    """
+    """Единственный источник правды для топиков/тем EYYE."""
     return list(ALLOWED_TAGS_CANONICAL)
 
 
 # ==========
-# ДИНАМИЧЕСКИЙ конфиг (важно: env читается во время вызова)
+# ДИНАМИЧЕСКИЙ конфиг (env читается во время вызова)
 # ==========
 
-def _env(name: str, default: str | None = None) -> str:
+def _env(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name)
     if v is None:
         return default or ""
@@ -91,9 +89,18 @@ def _get_output_language() -> str:
     lang = (_env("EYYE_OUTPUT_LANGUAGE", "ru") or "ru").strip().lower()
     return "ru" if lang not in ("ru", "en") else lang
 
+# ✅ Backward-compatible aliases (чтобы твой код ниже не падал)
+def _openai_model() -> str:
+    return _get_openai_model()
+
+def _openai_wikipedia_model() -> str:
+    return _get_openai_wikipedia_model()
+
+def _output_language() -> str:
+    return _get_output_language()
+
 def is_configured() -> bool:
     return bool(_get_openai_api_key())
-
 
 
 def _clamp01(x: float) -> float:
@@ -113,7 +120,7 @@ def _clean_text(s: Any, max_len: int) -> str:
     return text[:max_len].strip()
 
 
-def _normalize_tag_list(tags: Any, fallback: List[str] | None = None) -> List[str]:
+def _normalize_tag_list(tags: Any, fallback: Optional[List[str]] = None) -> List[str]:
     fallback = fallback or []
     if not tags:
         tags_list: List[str] = []
@@ -158,6 +165,10 @@ def _normalize_tag_list(tags: Any, fallback: List[str] | None = None) -> List[st
     return deduped
 
 
+# ==========
+# OpenAI: chat.completions
+# ==========
+
 def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
     api_key = _get_openai_api_key()
     if not api_key:
@@ -171,10 +182,6 @@ def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     model = payload.get("model") or _get_openai_model()
-    # ...
-    # дальше код как у тебя, НО timeout бери так:
-    # with urllib.request.urlopen(req, timeout=_get_openai_timeout()) as resp:
-
 
     messages = payload.get("messages")
     if not messages:
@@ -225,12 +232,7 @@ def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
             error_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             error_body = "<no body>"
-        logger.error(
-            "OpenAI HTTPError in chat.completions (%.2fs), code=%s, body=%s",
-            elapsed,
-            e.code,
-            error_body[:1000],
-        )
+        logger.error("OpenAI HTTPError in chat.completions (%.2fs), code=%s, body=%s", elapsed, e.code, error_body[:1000])
         return {}
     except Exception as e:
         elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
@@ -269,7 +271,7 @@ def _extract_message_content(resp_json: Dict[str, Any]) -> str:
     return str(content or "")
 
 
-def _try_loose_json_parse(content: str) -> Dict[str, Any] | None:
+def _try_loose_json_parse(content: str) -> Optional[Dict[str, Any]]:
     if not content:
         return None
     text = content.strip()
@@ -288,7 +290,65 @@ def _try_loose_json_parse(content: str) -> Dict[str, Any] | None:
 
 
 # ==========
-# Генерация карточек “с нуля” (всегда RU)
+# OpenAI: embeddings (для pgvector)
+# ==========
+
+def _get_openai_embedding_model() -> str:
+    return _env("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip() or "text-embedding-3-small"
+
+def call_openai_embeddings(texts: List[str], model: Optional[str] = None) -> List[List[float]]:
+    api_key = _get_openai_api_key()
+    if not api_key:
+        logger.warning("OPENAI_API_KEY is not set, skipping embeddings call")
+        return []
+
+    texts = [str(t or "") for t in texts]
+    if not texts:
+        return []
+
+    url = _get_openai_base_url().rstrip("/") + "/embeddings"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    body: Dict[str, Any] = {
+        "model": model or _get_openai_embedding_model(),
+        "input": texts,
+    }
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+
+    started_at = datetime.now(timezone.utc)
+    try:
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=_get_openai_timeout()) as resp:
+            raw = resp.read().decode("utf-8")
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        logger.info("OpenAI embeddings call OK (%.2fs), n=%d", elapsed, len(texts))
+        obj = json.loads(raw)
+        data_list = obj.get("data") or []
+        out: List[List[float]] = []
+        for row in data_list:
+            emb = row.get("embedding")
+            if isinstance(emb, list):
+                out.append([float(x) for x in emb])
+        return out
+    except urllib.error.HTTPError as e:
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        try:
+            error_body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            error_body = "<no body>"
+        logger.error("OpenAI HTTPError in embeddings (%.2fs), code=%s, body=%s", elapsed, e.code, error_body[:1000])
+        return []
+    except Exception as e:
+        elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
+        logger.exception("Error calling OpenAI embeddings (%.2fs): %s", elapsed, e)
+        return []
+
+
+# ==========
+# Генерация карточек “с нуля” (вывод всегда RU)
 # ==========
 
 def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[Dict[str, Any]]:
@@ -296,7 +356,7 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
         logger.warning("OPENAI_API_KEY is not set, skip OpenAI card generation")
         return []
 
-    # принудительно выводим на русском
+    # принудительно выводим на языке проекта
     language = _output_language()
 
     if not tags:
@@ -310,7 +370,7 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
         "Ты – движок новостной ленты EYYE.\n"
         "Сгенерируй короткие новостные карточки.\n"
         "Каждая карточка: заголовок + 2–4 абзаца текста.\n"
-        "ВАЖНО: пиши ТОЛЬКО на русском языке.\n"
+        f"ВАЖНО: пиши ТОЛЬКО на языке '{language}'.\n"
         "Отвечай строго валидным JSON без лишнего текста.\n\n"
         "Теги можно использовать ТОЛЬКО из этого списка:\n"
         + ", ".join(ALLOWED_TAGS_CANONICAL)
@@ -323,14 +383,14 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
         '      \"body\": \"...\",\n'
         '      \"tags\": [\"world_news\"],\n'
         '      \"importance_score\": 0.7,\n'
-        '      \"language\": \"ru\"\n'
+        f'      \"language\": \"{language}\"\n'
         "    }\n"
         "  ]\n"
         "}\n"
     )
 
     user_payload = {
-        "output_language": "ru",
+        "output_language": language,
         "count": count,
         "tags": tags,
         "requirements": [
@@ -410,7 +470,7 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
                 "body": body,
                 "tags": tags_out,
                 "importance_score": importance,
-                "language": "ru",
+                "language": language,
                 "quality": "ok",
             }
         )
@@ -421,12 +481,12 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
 
 
 # ==========
-# Нормализация Telegram → карточка (вывод всегда RU)
+# Нормализация Wikipedia → карточка (вывод всегда на языке проекта)
 # ==========
 
 def normalize_wikipedia_article(*, title_hint: str, raw_text: str, language: str, why_now: str) -> Dict[str, Any]:
     input_lang_hint = (language or "ru").strip().lower()
-    out_lang = _output_language()  # берет из EYYE_OUTPUT_LANGUAGE (обычно "ru")
+    out_lang = _output_language()
 
     def _fallback() -> Dict[str, Any]:
         first = (title_hint or "").strip() or "Статья"
@@ -455,8 +515,7 @@ def normalize_wikipedia_article(*, title_hint: str, raw_text: str, language: str
         "- НЕ выдумывай факты.\n"
         "- Пиши как короткая новостная заметка: нейтрально, компактно.\n"
         "- tags: только из списка:\n"
-        "  world_news, business, finance, tech, science, history, politics, society,\n"
-        "  entertainment, gaming, sports, lifestyle, education, city, uk_students.\n"
+        f"  {', '.join(ALLOWED_TAGS_CANONICAL)}.\n"
         f"- language: всегда '{out_lang}'\n"
         "Верни валидный JSON-объект."
     )
@@ -523,7 +582,6 @@ def normalize_wikipedia_article(*, title_hint: str, raw_text: str, language: str
     else:
         out_source = None
 
-    # ВАЖНО: язык карточки форсим на out_lang независимо от того, что вернула модель
     return {
         "title": out_title,
         "body": out_body,
@@ -535,3 +593,4 @@ def normalize_wikipedia_article(*, title_hint: str, raw_text: str, language: str
         "quality": "ok",
         "input_language_hint": input_lang_hint,
     }
+PY
