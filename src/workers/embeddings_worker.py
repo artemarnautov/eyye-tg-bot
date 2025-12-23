@@ -156,8 +156,6 @@ def store_embedding(
         "embedding_model": embedding_model,
         "embedding_updated_at": now_iso,
         "embedding_last_error": (error_text[:900] if error_text else None),
-        # освобождаем lease, если колонки есть (в minimal уйдёт только нужное)
-        "embedding_claimed_until": None,
     }
     if attempts_value is not None:
         upd["embedding_attempts"] = int(attempts_value)
