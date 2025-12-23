@@ -60,24 +60,30 @@ def get_canonical_topics() -> List[str]:
 # ДИНАМИЧЕСКИЙ конфиг (env читается во время вызова)
 # ==========
 
+
 def _env(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name)
     if v is None:
         return default or ""
     return str(v)
 
+
 def _get_openai_api_key() -> str:
     return _env("OPENAI_API_KEY", "").strip()
 
+
 def _get_openai_model() -> str:
     return _env("OPENAI_MODEL", "gpt-4.1-mini").strip() or "gpt-4.1-mini"
+
 
 def _get_openai_wikipedia_model() -> str:
     base = _get_openai_model()
     return _env("OPENAI_WIKIPEDIA_MODEL", base).strip() or base
 
+
 def _get_openai_base_url() -> str:
     return (_env("OPENAI_BASE_URL", "https://api.openai.com/v1") or "https://api.openai.com/v1").rstrip("/")
+
 
 def _get_openai_timeout() -> float:
     try:
@@ -85,19 +91,24 @@ def _get_openai_timeout() -> float:
     except Exception:
         return 30.0
 
+
 def _get_output_language() -> str:
     lang = (_env("EYYE_OUTPUT_LANGUAGE", "ru") or "ru").strip().lower()
     return "ru" if lang not in ("ru", "en") else lang
+
 
 # ✅ Backward-compatible aliases (чтобы твой код ниже не падал)
 def _openai_model() -> str:
     return _get_openai_model()
 
+
 def _openai_wikipedia_model() -> str:
     return _get_openai_wikipedia_model()
 
+
 def _output_language() -> str:
     return _get_output_language()
+
 
 def is_configured() -> bool:
     return bool(_get_openai_api_key())
@@ -169,6 +180,7 @@ def _normalize_tag_list(tags: Any, fallback: Optional[List[str]] = None) -> List
 # OpenAI: chat.completions
 # ==========
 
+
 def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
     api_key = _get_openai_api_key()
     if not api_key:
@@ -232,7 +244,12 @@ def call_openai_chat(payload: Dict[str, Any]) -> Dict[str, Any]:
             error_body = e.read().decode("utf-8", errors="replace")
         except Exception:
             error_body = "<no body>"
-        logger.error("OpenAI HTTPError in chat.completions (%.2fs), code=%s, body=%s", elapsed, e.code, error_body[:1000])
+        logger.error(
+            "OpenAI HTTPError in chat.completions (%.2fs), code=%s, body=%s",
+            elapsed,
+            e.code,
+            error_body[:1000],
+        )
         return {}
     except Exception as e:
         elapsed = (datetime.now(timezone.utc) - started_at).total_seconds()
@@ -293,8 +310,10 @@ def _try_loose_json_parse(content: str) -> Optional[Dict[str, Any]]:
 # OpenAI: embeddings (для pgvector)
 # ==========
 
+
 def _get_openai_embedding_model() -> str:
     return _env("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small").strip() or "text-embedding-3-small"
+
 
 def call_openai_embeddings(texts: List[str], model: Optional[str] = None) -> List[List[float]]:
     api_key = _get_openai_api_key()
@@ -351,6 +370,7 @@ def call_openai_embeddings(texts: List[str], model: Optional[str] = None) -> Lis
 # Генерация карточек “с нуля” (вывод всегда RU)
 # ==========
 
+
 def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[Dict[str, Any]]:
     if not is_configured():
         logger.warning("OPENAI_API_KEY is not set, skip OpenAI card generation")
@@ -377,13 +397,13 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
         + "\n\n"
         "JSON-структура:\n"
         "{\n"
-        '  \"cards\": [\n'
+        '  "cards": [\n'
         "    {\n"
-        '      \"title\": \"...\",\n'
-        '      \"body\": \"...\",\n'
-        '      \"tags\": [\"world_news\"],\n'
-        '      \"importance_score\": 0.7,\n'
-        f'      \"language\": \"{language}\"\n'
+        '      "title": "...",\n'
+        '      "body": "...",\n'
+        '      "tags": ["world_news"],\n'
+        '      "importance_score": 0.7,\n'
+        f'      "language": "{language}"\n'
         "    }\n"
         "  ]\n"
         "}\n"
@@ -483,6 +503,7 @@ def generate_cards_for_tags(tags: List[str], language: str, count: int) -> List[
 # ==========
 # Нормализация Wikipedia → карточка (вывод всегда на языке проекта)
 # ==========
+
 
 def normalize_wikipedia_article(*, title_hint: str, raw_text: str, language: str, why_now: str) -> Dict[str, Any]:
     input_lang_hint = (language or "ru").strip().lower()
@@ -593,4 +614,3 @@ def normalize_wikipedia_article(*, title_hint: str, raw_text: str, language: str
         "quality": "ok",
         "input_language_hint": input_lang_hint,
     }
-PY
