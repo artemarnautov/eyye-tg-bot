@@ -125,42 +125,56 @@ def rpc_claim_cards_for_embedding(
 
 def rpc_store_card_embedding(
     supabase,
+    *,
     card_id: int,
-    embedding,  # list[float]
-    model: str,
-):
+    embedding: List[float],
+    embedding_model: str,
+    now_iso: str,
+    error_text: Optional[str],
+) -> None:
     """
-    Пытаемся вызвать store_card_embedding с разными вариантами аргументов,
-    потому что PostgREST матчится по ИМЕНАМ параметров и может вернуть 404
-    при несовпадении ключей/перегрузках.
+    Пишем embedding через RPC store_card_embedding.
+    RPC в БД ожидает:
+      - store_card_embedding(id bigint, embedding jsonb, model text)
+      - или store_card_embedding(payload jsonb)
     """
-    # Вариант 1: прямая 3-арг сигнатура (id, embedding, model)
-    variants = [
-        {"id": card_id, "embedding": embedding, "model": model},
-        # Вариант 2: перегрузка (payload jsonb)
-        {"payload": {"id": card_id, "embedding": embedding, "model": model}},
-        # Частые альтернативы имён (на всякий)
-        {"card_id": card_id, "embedding": embedding, "model": model},
-        {"payload": {"card_id": card_id, "embedding": embedding, "model": model}},
-        {"payload": {"id": card_id, "embedding": embedding, "embedding_model": model}},
-        {"payload": {"card_id": card_id, "embedding": embedding, "embedding_model": model}},
-    ]
+    # Если эмбеддинга нет или есть ошибка — НЕ зовём store_card_embedding,
+    # просто обновляем служебные поля.
+    if not embedding or error_text:
+        patch: Dict[str, Any] = {
+            "embedding_last_error": error_text,
+            "embedding_updated_at": now_iso,
+            "embedding_model": embedding_model,
+        }
+        supabase.table("cards").update(patch).eq("id", card_id).execute()
+        return
 
-    last_err = None
-    for i, args in enumerate(variants, start=1):
+    # 1) try RPC (правильные имена аргументов!)
+    rpc_variants: List[Dict[str, Any]] = [
+        {"id": card_id, "embedding": embedding, "model": embedding_model},
+        {"payload": {"id": card_id, "embedding": embedding, "model": embedding_model}},
+    ]
+    last_err: Optional[Exception] = None
+    for args in rpc_variants:
         try:
-            res = supabase.rpc("store_card_embedding", args).execute()
-            return getattr(res, "data", None)
+            supabase.rpc("store_card_embedding", args).execute()
+            return
         except Exception as e:
             last_err = e
-            s = str(e)
-            # 404/Not Found -> пробуем следующий вариант
-            if ("404" in s) or ("Not Found" in s) or ("Could not find the function" in s):
-                continue
-            # Любая другая ошибка = функция нашлась, но упала внутри (например, размерность vector)
-            raise
 
-    raise RuntimeError(f"store_card_embedding failed for all arg variants: {last_err}")
+    # 2) fallback update: pgvector чаще всего нормально кастится из строки "[...]"
+    vec_literal = "[" + ",".join(str(float(x)) for x in embedding) + "]"
+    patch2: Dict[str, Any] = {
+        "embedding": vec_literal,
+        "embedding_model": embedding_model,
+        "embedding_updated_at": now_iso,
+        "embedding_last_error": None,
+    }
+    try:
+        supabase.table("cards").update(patch2).eq("id", card_id).execute()
+    except Exception as e:
+        raise RuntimeError(f"store embedding failed (rpc_error={last_err}, update_error={e})")
+
 
 
 # =====================
