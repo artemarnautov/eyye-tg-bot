@@ -117,6 +117,11 @@ except Exception:
         build_feed_for_user_vector_paginated = _vector_paginated2
     except Exception:
         build_feed_for_user_vector_paginated = None  # type: ignore
+# cards_service_vector: отдельный файл под векторный режим
+try:
+    from .cards_service_vector import build_feed_for_user_vector_paginated  # type: ignore
+except Exception:
+    build_feed_for_user_vector_paginated = None  # type: ignore
 
 
 # ==========
