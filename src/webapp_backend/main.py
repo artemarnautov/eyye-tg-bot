@@ -14,13 +14,6 @@ from supabase import Client, create_client
 from .profile_service import get_profile_summary, save_onboarding
 from .telemetry_service import EventsRequest, log_events
 
-# cards_service: всегда стараемся использовать paginated-версию (она умеет cursor)
-try:
-    from .cards_service import build_feed_for_user_paginated  # type: ignore
-except Exception:
-    build_feed_for_user_paginated = None  # type: ignore
-    from .cards_service import build_feed_for_user  # type: ignore
-
 logger = logging.getLogger("eyye.webapp_backend")
 logging.basicConfig(level=logging.INFO)
 
@@ -60,9 +53,6 @@ ROOT_DIR = _detect_root_dir()
 WEBAPP_DIR = ROOT_DIR / "webapp"
 INDEX_HTML_PATH = WEBAPP_DIR / "index.html"
 
-# assets can be either:
-# - webapp/static/* (preferred later)
-# - webapp/* (current layout)
 WEBAPP_STATIC_DIR = WEBAPP_DIR / "static"
 ASSETS_DIR = WEBAPP_STATIC_DIR if WEBAPP_STATIC_DIR.exists() else WEBAPP_DIR
 
@@ -88,6 +78,43 @@ else:
     logger.warning("Supabase URL/KEY are not set. /api/feed and /api/profile will not work.")
 
 # ==========
+# Feed mode
+# ==========
+# auto | mvp | vector
+DEFAULT_FEED_MODE = (os.getenv("EYYE_FEED_MODE") or "auto").strip().lower()
+
+# ==========
+# cards_service imports
+# ==========
+# MVP/cursor feed (уже есть)
+build_feed_for_user_paginated = None  # type: ignore
+build_feed_for_user = None  # type: ignore
+
+# Vector feed (появится следующим коммитом в cards_service)
+build_feed_for_user_vector_paginated = None  # type: ignore
+
+try:
+    from .cards_service import build_feed_for_user_paginated as _mvp_paginated  # type: ignore
+
+    build_feed_for_user_paginated = _mvp_paginated
+except Exception:
+    build_feed_for_user_paginated = None  # type: ignore
+    try:
+        from .cards_service import build_feed_for_user as _mvp_offset  # type: ignore
+
+        build_feed_for_user = _mvp_offset
+    except Exception:
+        build_feed_for_user = None  # type: ignore
+
+# vector optional import (не ломает сервер, если функции нет)
+try:
+    from .cards_service import build_feed_for_user_vector_paginated as _vector_paginated  # type: ignore
+
+    build_feed_for_user_vector_paginated = _vector_paginated
+except Exception:
+    build_feed_for_user_vector_paginated = None  # type: ignore
+
+# ==========
 # App
 # ==========
 app = FastAPI(title="EYYE WebApp Backend")
@@ -110,16 +137,26 @@ async def _startup_log() -> None:
         str(WEBAPP_DIR),
         str(ASSETS_DIR),
     )
+
     if not WEBAPP_DIR.exists():
         logger.warning("WEBAPP_DIR not found: %s", WEBAPP_DIR)
     if not INDEX_HTML_PATH.exists():
         logger.warning("index.html not found at %s", INDEX_HTML_PATH)
 
-    # важный лог: понимаем, включен ли cursor-режим реально
-    if build_feed_for_user_paginated is None:
-        logger.warning("cards_service.build_feed_for_user_paginated NOT available -> feed works in OFFSET fallback mode")
+    logger.info("EYYE_FEED_MODE=%s", DEFAULT_FEED_MODE)
+
+    if build_feed_for_user_paginated is None and build_feed_for_user is None:
+        logger.error("cards_service: no feed builders imported (paginated or offset). Feed endpoint will fail.")
     else:
-        logger.info("cards_service.build_feed_for_user_paginated available -> feed supports CURSOR mode")
+        if build_feed_for_user_paginated is None:
+            logger.warning("cards_service.build_feed_for_user_paginated NOT available -> feed works in OFFSET fallback mode")
+        else:
+            logger.info("cards_service.build_feed_for_user_paginated available -> feed supports CURSOR mode")
+
+    if build_feed_for_user_vector_paginated is None:
+        logger.info("cards_service.build_feed_for_user_vector_paginated NOT available -> vector mode disabled")
+    else:
+        logger.info("cards_service.build_feed_for_user_vector_paginated available -> vector mode enabled")
 
 
 # ==========
@@ -132,7 +169,6 @@ async def ping() -> Dict[str, Any]:
 
 @app.get("/health")
 async def health() -> Dict[str, Any]:
-    # удобный алиас для curl/монитора (раньше у тебя был только /api/health)
     return {
         "ok": True,
         "service": "eyye-webapp-backend",
@@ -141,7 +177,9 @@ async def health() -> Dict[str, Any]:
         "root_dir": str(ROOT_DIR),
         "webapp_dir": str(WEBAPP_DIR),
         "assets_dir": str(ASSETS_DIR),
+        "feed_mode_default": DEFAULT_FEED_MODE,
         "feed_supports_cursor": build_feed_for_user_paginated is not None,
+        "feed_supports_vector": build_feed_for_user_vector_paginated is not None,
     }
 
 
@@ -152,6 +190,16 @@ async def health() -> Dict[str, Any]:
 @api.get("/healthz")
 async def api_health() -> Dict[str, Any]:
     return await health()
+
+
+@api.get("/feed/status")
+async def api_feed_status() -> Dict[str, Any]:
+    return {
+        "default_mode": DEFAULT_FEED_MODE,
+        "supports_cursor": build_feed_for_user_paginated is not None,
+        "supports_offset": build_feed_for_user is not None,
+        "supports_vector": build_feed_for_user_vector_paginated is not None,
+    }
 
 
 @api.get("/profile")
@@ -201,28 +249,54 @@ async def api_feed(
     limit: int = Query(20, ge=1, le=50),
     offset: int = Query(0, ge=0),
     cursor: Optional[str] = Query(None),
+    mode: str = Query("auto", description="auto|mvp|vector"),
 ) -> Dict[str, Any]:
     """
     Feed endpoint.
-    ВАЖНО:
-    - если пришёл cursor -> работаем в cursor-режиме (умная бесконечная выдача)
-    - если cursor не пришёл -> работаем как раньше (offset пагинация)
+    mode:
+      - auto   -> если доступен vector, используем его, иначе mvp
+      - mvp    -> текущая логика (cursor/offset)
+      - vector -> векторная (если доступна), иначе fallback на mvp
     """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase is not configured")
 
-    # ✅ Новый путь: cursor+offset в одном методе (если функция есть)
+    mode = (mode or "auto").strip().lower()
+    if mode == "auto":
+        mode = DEFAULT_FEED_MODE if DEFAULT_FEED_MODE in ("mvp", "vector") else "auto"
+        if mode == "auto":
+            mode = "vector" if build_feed_for_user_vector_paginated is not None else "mvp"
+
+    # 1) vector path
+    if mode == "vector" and build_feed_for_user_vector_paginated is not None:
+        items, debug, cursor_obj = build_feed_for_user_vector_paginated(
+            supabase,
+            tg_id,
+            limit=limit,
+            offset=offset,
+            cursor=cursor,
+        )
+        debug = debug or {}
+        debug["feed_mode"] = "vector"
+        return {"items": items, "debug": debug, "cursor": cursor_obj}
+
+    # 2) mvp path (cursor preferred)
     if build_feed_for_user_paginated is not None:
         items, debug, cursor_obj = build_feed_for_user_paginated(
             supabase,
             tg_id,
             limit=limit,
             offset=offset,
-            cursor=cursor,  # ✅ КЛЮЧЕВО: проброс cursor в сервис
+            cursor=cursor,
         )
+        debug = debug or {}
+        debug["feed_mode"] = "mvp"
         return {"items": items, "debug": debug, "cursor": cursor_obj}
 
-    # fallback: если вдруг нет paginated-версии — работаем по offset
+    # 3) offset fallback
+    if build_feed_for_user is None:
+        raise HTTPException(status_code=500, detail="Feed builder is not available")
+
     items, debug = build_feed_for_user(supabase, tg_id, limit=limit, offset=offset)  # type: ignore
     cursor_obj = {
         "mode": "offset",
@@ -231,6 +305,8 @@ async def api_feed(
         "next_offset": offset + len(items),
         "has_more": len(items) >= limit,
     }
+    debug = debug or {}
+    debug["feed_mode"] = "mvp_offset"
     return {"items": items, "debug": debug, "cursor": cursor_obj}
 
 
@@ -248,7 +324,6 @@ async def api_events(payload: EventsRequest) -> Dict[str, Any]:
 
 @api.post("/telemetry")
 async def api_telemetry(payload: EventsRequest) -> Dict[str, Any]:
-    # алиас на /events
     return await api_events(payload)
 
 
@@ -264,7 +339,6 @@ async def serve_index() -> Any:
     raise HTTPException(status_code=404, detail="index.html not found")
 
 
-# Ключевой фикс: /static/* теперь берём из ASSETS_DIR (webapp/ или webapp/static/)
 if ASSETS_DIR.exists() and ASSETS_DIR.is_dir():
     app.mount("/static", StaticFiles(directory=str(ASSETS_DIR), html=False), name="static")
 else:
