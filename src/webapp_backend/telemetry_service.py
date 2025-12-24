@@ -7,19 +7,33 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Literal, Tuple
 
 from pydantic import BaseModel, Field
-from supabase import Client
 
 logger = logging.getLogger(__name__)
+
+# ==============================
+# Pydantic base (v2/v1 safe)
+# ==============================
+try:
+    # pydantic v2
+    from pydantic import ConfigDict  # type: ignore
+
+    class _BaseModel(BaseModel):
+        model_config = ConfigDict(extra="ignore")
+except Exception:
+    # pydantic v1 fallback
+    class _BaseModel(BaseModel):
+        class Config:
+            extra = "ignore"
+
 
 # ==============================
 # Pydantic-модели запросов
 # ==============================
 
-# Канонические типы событий, которые используем для модели интересов.
 EventType = Literal["view", "like", "dislike", "open_source"]
 
 
-class Event(BaseModel):
+class Event(_BaseModel):
     """
     Одно событие от фронта.
 
@@ -47,15 +61,8 @@ class Event(BaseModel):
     source: Optional[str] = None
     extra: Optional[Any] = None
 
-    # pydantic v2
-    model_config = {"extra": "ignore"}
 
-    # pydantic v1
-    class Config:
-        extra = "ignore"
-
-
-class EventsRequest(BaseModel):
+class EventsRequest(_BaseModel):
     """
     Тело POST /api/events.
     tg_id: Telegram ID пользователя.
@@ -64,11 +71,6 @@ class EventsRequest(BaseModel):
 
     tg_id: int
     events: List[Event]
-
-    model_config = {"extra": "ignore"}
-
-    class Config:
-        extra = "ignore"
 
 
 # ==============================
@@ -99,12 +101,19 @@ def _env_float(name: str, default: float, min_v: Optional[float] = None, max_v: 
     return v
 
 
+# Минимальный dwell для записи в user_seen_cards (анти-дубли/анти-возвраты)
 TELEMETRY_SEEN_MIN_DWELL_MS = _env_int("TELEMETRY_SEEN_MIN_DWELL_MS", 400, 0, 60000)
+
+# Жёсткий кламп на dwell (защита от багов/табов в фоне)
 TELEMETRY_MAX_DWELL_MS = _env_int("TELEMETRY_MAX_DWELL_MS", 120000, 5000, 600000)
 
+# Базовая скорость чтения (wpm) по умолчанию (если нет персональной)
 DEFAULT_READING_WPM = _env_int("TELEMETRY_DEFAULT_READING_WPM", 210, 80, 450)
+
+# EMA (экспоненциальное сглаживание) для обновления персонального reading_wpm
 READING_WPM_EMA_ALPHA = _env_float("TELEMETRY_READING_WPM_EMA_ALPHA", 0.15, 0.01, 0.50)
 
+# Ограничения обновления reading_wpm (чтобы не портить профиль мусорными событиями)
 READING_WPM_MIN = _env_int("TELEMETRY_READING_WPM_MIN", 90, 60, 200)
 READING_WPM_MAX = _env_int("TELEMETRY_READING_WPM_MAX", 380, 220, 600)
 
@@ -143,13 +152,16 @@ def _estimate_expected_read_ms(
     body: str,
     reading_wpm: float,
 ) -> int:
+    """
+    Оценка ожидаемого времени на карточку под нашу специфику (короткие новости).
+    """
     wpm = float(reading_wpm or DEFAULT_READING_WPM)
     wpm = max(60.0, min(600.0, wpm))
 
     words_total = _count_words(title) + _count_words(body)
     effective_words = min(words_total, 260)
 
-    base_ms = 900
+    base_ms = 900  # "осмотр/контекст"
     expected_ms = base_ms + int((effective_words / wpm) * 60_000)
 
     expected_ms = _clamp_int(expected_ms, 900, 25000)
@@ -157,6 +169,11 @@ def _estimate_expected_read_ms(
 
 
 def _dedupe_events(events: List[Event]) -> List[Event]:
+    """
+    Дедуп батча на случай retry/двойной отправки:
+    - для view берём max(dwell_ms)
+    - для остальных — оставляем последнюю по ts (если есть), иначе последнюю по порядку
+    """
     if not events:
         return []
 
@@ -207,9 +224,15 @@ def _dedupe_events(events: List[Event]) -> List[Event]:
 # ==============================
 
 def _fetch_cards_features(
-    supabase: Client,
+    supabase,
     card_ids: List[int],
 ) -> Dict[int, Dict[str, Any]]:
+    """
+    Забираем фичи карточек для расчёта метрик чтения и интересов:
+      - tags
+      - title/body (для оценки ожидаемого времени чтения)
+      - language (опционально)
+    """
     if not card_ids:
         return {}
 
@@ -261,10 +284,23 @@ def _fetch_cards_features(
 
 
 # ==============================
-# Персональная скорость чтения (best-effort)
+# Персональная скорость чтения (best-effort, без обязательных миграций)
 # ==============================
 
-def _load_user_reading_profile(supabase: Client, tg_id: int) -> Dict[str, Any]:
+def _load_user_reading_profile(supabase, tg_id: int) -> Dict[str, Any]:
+    """
+    Пытаемся прочитать reading_wpm из user_profiles.structured_profile (если есть).
+    НИЧЕГО не ломаем, если схема другая.
+
+    Ожидаемый формат:
+      user_profiles.structured_profile = {
+        ...,
+        "telemetry": {
+          "reading_wpm": 220,
+          "reading_samples": 12
+        }
+      }
+    """
     out = {"wpm": float(DEFAULT_READING_WPM), "samples": 0, "key": None, "raw_profile": None}
 
     for key in ("tg_id", "user_id"):
@@ -316,12 +352,16 @@ def _load_user_reading_profile(supabase: Client, tg_id: int) -> Dict[str, Any]:
 
 
 def _maybe_update_user_reading_profile(
-    supabase: Client,
+    supabase,
     tg_id: int,
     *,
     current_profile: Dict[str, Any],
     observed_wpm: Optional[float],
 ) -> None:
+    """
+    Best-effort: обновляем EMA reading_wpm в structured_profile.telemetry.
+    Если таблицы/колонок нет — молча выходим.
+    """
     if observed_wpm is None:
         return
 
@@ -356,7 +396,7 @@ def _maybe_update_user_reading_profile(
 
 
 # ==============================
-# Скоринг сигналов
+# Скоринг сигналов (TikTok-подобный под нашу специфику)
 # ==============================
 
 def _view_signal_delta(
@@ -405,8 +445,10 @@ def _delta_for_event(
 
     if ev.type == "like":
         return 2.0
+
     if ev.type == "dislike":
         return -2.0
+
     if ev.type == "open_source":
         return 1.5
 
@@ -419,6 +461,9 @@ def _extract_observed_wpm_for_profile_update(
     title: str,
     body: str,
 ) -> Optional[float]:
+    """
+    Обновляем reading_wpm ТОЛЬКО по "качественным" просмотрам.
+    """
     if dwell_ms is None:
         return None
     d = int(dwell_ms)
@@ -434,6 +479,7 @@ def _extract_observed_wpm_for_profile_update(
         return None
 
     obs_wpm = words / minutes
+
     if obs_wpm < float(READING_WPM_MIN) or obs_wpm > float(READING_WPM_MAX):
         return None
 
@@ -445,7 +491,7 @@ def _extract_observed_wpm_for_profile_update(
 # ==============================
 
 def _update_user_topic_weights(
-    supabase: Client,
+    supabase,
     tg_id: int,
     tag_deltas: Dict[str, float],
 ) -> None:
@@ -514,10 +560,17 @@ def _update_user_topic_weights(
 # ==============================
 
 def _insert_user_events(
-    supabase: Client,
+    supabase,
     tg_id: int,
     events: List[Event],
 ) -> None:
+    """
+    Пишем сырые события в таблицу user_events.
+
+    ВАЖНО:
+    - НЕ отправляем event_ts, потому что в твоей таблице user_events может не быть такой колонки.
+    - Полагаемся на created_at в БД.
+    """
     if not events:
         return
 
@@ -550,10 +603,13 @@ def _insert_user_events(
 # ==============================
 
 def _insert_seen_cards_from_events(
-    supabase: Client,
+    supabase,
     tg_id: int,
     events: List[Event],
 ) -> None:
+    """
+    Помечаем карточки как увиденные в user_seen_cards.
+    """
     if not events:
         return
 
@@ -586,7 +642,20 @@ def _insert_seen_cards_from_events(
 # Публичная функция /api/events
 # ==============================
 
-def log_events(supabase: Client, payload: EventsRequest) -> None:
+def log_events(supabase, payload: EventsRequest) -> None:
+    """
+    TikTok-level телеметрия под EYYE:
+
+    1) Сырые события -> user_events (для аналитики/отладки).
+    2) Нормализация сигнала:
+       - view переводим в delta через read_ratio = dwell / expected_read_time
+       - expected_read_time оцениваем по длине карточки и персональной скорости чтения (reading_wpm)
+    3) Обновляем user_topic_weights (вектор интересов).
+    4) Помечаем seen (чтобы не показывать карточки снова).
+    5) Best-effort обновляем reading_wpm пользователя (EMA), если просмотр был "качественным".
+
+    Всё максимально мягко: любые ошибки логируются и не ломают UX.
+    """
     if supabase is None:
         logger.warning("Supabase is None in log_events, skipping")
         return
@@ -597,17 +666,24 @@ def log_events(supabase: Client, payload: EventsRequest) -> None:
         logger.info("log_events called with empty events list (tg_id=%s)", tg_id)
         return
 
+    # 0) дедуп + клампы
     events = _dedupe_events(events_in)
 
+    # 1) пишем сырые события
     _insert_user_events(supabase, tg_id, events)
 
+    # 2) грузим фичи карточек одним запросом
     card_ids = [int(e.card_id) for e in events]
     cards_by_id = _fetch_cards_features(supabase, card_ids)
 
+    # 3) читаем персональную скорость чтения (best-effort)
     reading_profile = _load_user_reading_profile(supabase, tg_id)
     reading_wpm = float(reading_profile.get("wpm") or DEFAULT_READING_WPM)
 
+    # 4) считаем dW по тегам
     tag_deltas: Dict[str, float] = defaultdict(float)
+
+    # для обновления reading_wpm (берём один лучший observed_wpm из батча)
     best_observed_wpm: Optional[float] = None
 
     for ev in events:
@@ -636,11 +712,14 @@ def log_events(supabase: Client, payload: EventsRequest) -> None:
                     if abs(obs - reading_wpm) < abs(best_observed_wpm - reading_wpm):
                         best_observed_wpm = obs
 
+    # 5) применяем веса
     if tag_deltas:
         _update_user_topic_weights(supabase, tg_id, dict(tag_deltas))
 
+    # 6) seen
     _insert_seen_cards_from_events(supabase, tg_id, events)
 
+    # 7) best-effort обновляем reading_wpm
     _maybe_update_user_reading_profile(supabase, tg_id, current_profile=reading_profile, observed_wpm=best_observed_wpm)
 
     logger.info(
