@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, FastAPI, HTTPException, Query
+from fastapi import APIRouter, Body, FastAPI, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -15,8 +15,40 @@ from supabase import Client, create_client
 from .profile_service import get_profile_summary, save_onboarding
 from .telemetry_service import EventsRequest, log_events
 
+# ==========
+# Logging
+# ==========
+LOG_LEVEL = (os.getenv("EYYE_LOG_LEVEL") or "INFO").upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger("eyye.webapp_backend")
-logging.basicConfig(level=logging.INFO)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def _tune_chatty_loggers() -> None:
+    # По умолчанию — тише, чтобы journald не тормозил скролл.
+    if not _env_bool("EYYE_HTTPX_LOG", False):
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+    if not _env_bool("EYYE_SUPABASE_LOG", False):
+        logging.getLogger("postgrest").setLevel(logging.WARNING)
+        logging.getLogger("supabase").setLevel(logging.WARNING)
+        logging.getLogger("realtime").setLevel(logging.WARNING)
+
+    if not _env_bool("EYYE_UVICORN_ACCESS_LOG", False):
+        logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+    if not _env_bool("EYYE_TELEMETRY_LOG", False):
+        logging.getLogger("src.webapp_backend.telemetry_service").setLevel(logging.WARNING)
+
+
+_tune_chatty_loggers()
 
 # ==========
 # Paths
@@ -89,15 +121,16 @@ def _env_int(name: str, default: int, lo: int = 1, hi: int = 16) -> int:
     return max(lo, min(hi, v))
 
 
-TELEMETRY_BG_CONCURRENCY = _env_int("TELEMETRY_BG_CONCURRENCY", 2, 1, 8)
+# Консервативно, чтобы не душить CPU/IO (можно поднять env'ом)
+TELEMETRY_BG_CONCURRENCY = _env_int("TELEMETRY_BG_CONCURRENCY", 1, 1, 8)
 _telemetry_sema = asyncio.Semaphore(TELEMETRY_BG_CONCURRENCY)
 
 
 async def _telemetry_bg_task(payload: EventsRequest) -> None:
     """
     Fire-and-forget обработка /api/events:
-    - отвечает мгновенно, чтобы не блокировать скролл
-    - тяжёлую часть (Supabase calls) выполняем в threadpool
+    - endpoint отвечает сразу (204), чтобы не блокировать скролл
+    - Supabase calls выполняем в threadpool
     - ограничиваем конкуренцию семафором
     """
     if supabase is None:
@@ -349,21 +382,20 @@ async def api_feed(
     return {"items": items, "debug": debug, "cursor": cursor_obj}
 
 
-@api.post("/events")
-async def api_events(payload: EventsRequest) -> Dict[str, Any]:
+@api.post("/events", status_code=204)
+async def api_events(payload: EventsRequest) -> Response:
     """
-    ВАЖНО: не блокируем UI.
-    Обработку пишем в фон, отвечаем сразу.
+    Максимально быстрый ответ (204) — чтобы фронт не ждал.
     """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase is not configured")
 
     asyncio.create_task(_telemetry_bg_task(payload))
-    return {"status": "ok"}
+    return Response(status_code=204)
 
 
-@api.post("/telemetry")
-async def api_telemetry(payload: EventsRequest) -> Dict[str, Any]:
+@api.post("/telemetry", status_code=204)
+async def api_telemetry(payload: EventsRequest) -> Response:
     return await api_events(payload)
 
 
