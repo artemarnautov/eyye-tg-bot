@@ -12,9 +12,11 @@ CARD_FIELDS = (
     "importance_score,created_at,is_active,meta,fingerprint,quality_score,content_type,nsfw"
 )
 
+
 def _b64encode_json(obj: Dict[str, Any]) -> str:
     raw = json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
 
 def _b64decode_json(s: str) -> Optional[Dict[str, Any]]:
     try:
@@ -23,6 +25,7 @@ def _b64decode_json(s: str) -> Optional[Dict[str, Any]]:
         return json.loads(raw.decode("utf-8"))
     except Exception:
         return None
+
 
 def _to_float_list(v: Any) -> Optional[List[float]]:
     if v is None:
@@ -41,8 +44,11 @@ def _to_float_list(v: Any) -> Optional[List[float]]:
             return None
     return None
 
+
 def _vec_to_str(emb: List[float]) -> str:
+    # максимально совместимо с PostgREST+pgvector (vector input как строка "[...]")
     return "[" + ",".join(f"{float(x):.9g}" for x in emb) + "]"
+
 
 def _normalize(vec: List[float]) -> List[float]:
     s = 0.0
@@ -53,6 +59,7 @@ def _normalize(vec: List[float]) -> List[float]:
         return vec
     return [x / n for x in vec]
 
+
 def _fetch_cards_by_ids(supabase: Client, ids: List[int]) -> Dict[int, Dict[str, Any]]:
     if not ids:
         return {}
@@ -60,12 +67,14 @@ def _fetch_cards_by_ids(supabase: Client, ids: List[int]) -> Dict[int, Dict[str,
     rows = resp.data or []
     return {int(r["id"]): r for r in rows if "id" in r}
 
+
 def _mark_seen(supabase: Client, user_id: int, card_ids: List[int]) -> None:
     if not card_ids:
         return
     now = datetime.now(timezone.utc).isoformat()
     rows = [{"user_id": user_id, "card_id": int(cid), "seen_at": now} for cid in card_ids]
     supabase.table("user_seen_cards").upsert(rows, on_conflict="user_id,card_id").execute()
+
 
 def _get_user_profile(supabase: Client, user_id: int) -> Optional[Dict[str, Any]]:
     resp = (
@@ -78,16 +87,18 @@ def _get_user_profile(supabase: Client, user_id: int) -> Optional[Dict[str, Any]
     rows = resp.data or []
     return rows[0] if rows else None
 
+
 def _upsert_user_embedding(supabase: Client, user_id: int, emb: List[float], model: str) -> None:
     now = datetime.now(timezone.utc).isoformat()
     payload = {
         "user_id": user_id,
-        "embedding": _vec_to_str(emb),  # максимально совместимо с PostgREST+pgvector
+        "embedding": _vec_to_str(emb),
         "embedding_model": model,
         "embedding_updated_at": now,
         "updated_at": now,
     }
     supabase.table("user_profiles").upsert(payload, on_conflict="user_id").execute()
+
 
 def _build_user_vector_from_events(
     supabase: Client,
@@ -121,7 +132,6 @@ def _build_user_vector_from_events(
         if acc is None:
             acc = [0.0] * len(emb)
 
-        # weighted sum
         for i, v in enumerate(emb):
             acc[i] += w * float(v)
         w_sum += w
@@ -129,10 +139,9 @@ def _build_user_vector_from_events(
     if acc is None or w_sum <= 0:
         return None
 
-    # mean
     acc = [x / w_sum for x in acc]
-    acc = _normalize(acc)
-    return acc
+    return _normalize(acc)
+
 
 def _diversify_ranked(
     ordered_ids: List[int],
@@ -163,6 +172,7 @@ def _diversify_ranked(
             break
     return out
 
+
 def build_feed_for_user_vector_paginated(
     supabase: Client,
     user_id: int,
@@ -170,7 +180,7 @@ def build_feed_for_user_vector_paginated(
     offset: int = 0,
     cursor: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
-    # Мы делаем "cursor-like" пагинацию через seq.
+    # "cursor-like" пагинация через seq (offset сейчас не используется, но оставляем для совместимости API)
     cur = _b64decode_json(cursor) if cursor else None
     seq = 0
     seed = datetime.now(timezone.utc).date().isoformat()
@@ -181,6 +191,7 @@ def build_feed_for_user_vector_paginated(
     debug: Dict[str, Any] = {
         "cursor_in": cursor,
         "limit": limit,
+        "offset": offset,
         "cursor_bad": False if (cursor is None or cur is not None) else True,
         "cursor_mode": "vector",
         "seq": seq,
@@ -204,18 +215,36 @@ def build_feed_for_user_vector_paginated(
     # -------- кандидаты --------
     vector_ids: List[int] = []
     vector_sim: Dict[int, float] = {}
+
     if user_emb:
-        r = supabase.rpc(
-            "search_cards_for_user",
-            {
-                "p_user_id": user_id,
-                "p_query": user_emb,
-                "p_limit": 250,
-                "p_max_age_hours": 2160,
-                "p_only_active": True,
-            },
-        ).execute()
-        rows = r.data or []
+        # RPC бывает настроен либо на JSON-array, либо на pgvector input string.
+        # Делаем best-effort: пробуем list -> если упало, пробуем строку.
+        rows: List[Dict[str, Any]] = []
+        try:
+            r = supabase.rpc(
+                "search_cards_for_user",
+                {
+                    "p_user_id": user_id,
+                    "p_query": user_emb,  # type: ignore
+                    "p_limit": 250,
+                    "p_max_age_hours": 2160,
+                    "p_only_active": True,
+                },
+            ).execute()
+            rows = r.data or []
+        except Exception:
+            r = supabase.rpc(
+                "search_cards_for_user",
+                {
+                    "p_user_id": user_id,
+                    "p_query": _vec_to_str(user_emb),
+                    "p_limit": 250,
+                    "p_max_age_hours": 2160,
+                    "p_only_active": True,
+                },
+            ).execute()
+            rows = r.data or []
+
         for x in rows:
             cid = int(x["id"])
             vector_ids.append(cid)

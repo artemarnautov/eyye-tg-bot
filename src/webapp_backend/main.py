@@ -80,19 +80,16 @@ else:
 # ==========
 # Feed mode
 # ==========
-# auto | mvp | vector
 DEFAULT_FEED_MODE = (os.getenv("EYYE_FEED_MODE") or "auto").strip().lower()
 
 # ==========
 # cards_service imports
 # ==========
-# MVP/cursor feed (уже есть)
 build_feed_for_user_paginated = None  # type: ignore
 build_feed_for_user = None  # type: ignore
-
-# Vector feed (появится следующим коммитом в cards_service)
 build_feed_for_user_vector_paginated = None  # type: ignore
 
+# MVP feed (cursor preferred)
 try:
     from .cards_service import build_feed_for_user_paginated as _mvp_paginated  # type: ignore
 
@@ -106,22 +103,19 @@ except Exception:
     except Exception:
         build_feed_for_user = None  # type: ignore
 
-# vector optional import (не ломает сервер, если функции нет)
+# Vector feed (first try in cards_service, then fallback to cards_service_vector)
 try:
     from .cards_service import build_feed_for_user_vector_paginated as _vector_paginated  # type: ignore
+
     build_feed_for_user_vector_paginated = _vector_paginated
 except Exception:
     build_feed_for_user_vector_paginated = None  # type: ignore
     try:
         from .cards_service_vector import build_feed_for_user_vector_paginated as _vector_paginated2  # type: ignore
+
         build_feed_for_user_vector_paginated = _vector_paginated2
     except Exception:
         build_feed_for_user_vector_paginated = None  # type: ignore
-# cards_service_vector: отдельный файл под векторный режим
-try:
-    from .cards_service_vector import build_feed_for_user_vector_paginated  # type: ignore
-except Exception:
-    build_feed_for_user_vector_paginated = None  # type: ignore
 
 
 # ==========
@@ -164,9 +158,9 @@ async def _startup_log() -> None:
             logger.info("cards_service.build_feed_for_user_paginated available -> feed supports CURSOR mode")
 
     if build_feed_for_user_vector_paginated is None:
-        logger.info("cards_service.build_feed_for_user_vector_paginated NOT available -> vector mode disabled")
+        logger.info("vector feed NOT available -> vector mode disabled")
     else:
-        logger.info("cards_service.build_feed_for_user_vector_paginated available -> vector mode enabled")
+        logger.info("vector feed available -> vector mode enabled")
 
 
 # ==========
@@ -273,7 +267,8 @@ async def api_feed(
 
     mode = (mode or "auto").strip().lower()
     if mode == "auto":
-        mode = DEFAULT_FEED_MODE if DEFAULT_FEED_MODE in ("mvp", "vector") else "auto"
+        mode2 = DEFAULT_FEED_MODE if DEFAULT_FEED_MODE in ("mvp", "vector") else "auto"
+        mode = mode2
         if mode == "auto":
             mode = "vector" if build_feed_for_user_vector_paginated is not None else "mvp"
 
