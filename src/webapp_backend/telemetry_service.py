@@ -303,7 +303,7 @@ def _load_user_reading_profile(supabase, tg_id: int) -> Dict[str, Any]:
     """
     out = {"wpm": float(DEFAULT_READING_WPM), "samples": 0, "key": None, "raw_profile": None}
 
-    for key in ("tg_id", "user_id"):
+    for key in ("user_id", "tg_id"):
         try:
             resp = (
                 supabase.table("user_profiles")

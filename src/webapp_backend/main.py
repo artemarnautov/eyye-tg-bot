@@ -1,4 +1,5 @@
 # file: src/webapp_backend/main.py
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -76,6 +77,37 @@ if SUPABASE_URL and SUPABASE_KEY:
         supabase = None
 else:
     logger.warning("Supabase URL/KEY are not set. /api/feed and /api/profile will not work.")
+
+# ==========
+# Telemetry background (to remove scroll lag)
+# ==========
+def _env_int(name: str, default: int, lo: int = 1, hi: int = 16) -> int:
+    try:
+        v = int(os.getenv(name, str(default)))
+    except Exception:
+        v = default
+    return max(lo, min(hi, v))
+
+
+TELEMETRY_BG_CONCURRENCY = _env_int("TELEMETRY_BG_CONCURRENCY", 2, 1, 8)
+_telemetry_sema = asyncio.Semaphore(TELEMETRY_BG_CONCURRENCY)
+
+
+async def _telemetry_bg_task(payload: EventsRequest) -> None:
+    """
+    Fire-and-forget обработка /api/events:
+    - отвечает мгновенно, чтобы не блокировать скролл
+    - тяжёлую часть (Supabase calls) выполняем в threadpool
+    - ограничиваем конкуренцию семафором
+    """
+    if supabase is None:
+        return
+    try:
+        async with _telemetry_sema:
+            await asyncio.to_thread(log_events, supabase, payload)
+    except Exception:
+        logger.exception("telemetry background task failed (tg_id=%s)", getattr(payload, "tg_id", None))
+
 
 # ==========
 # Feed mode
@@ -161,6 +193,8 @@ async def _startup_log() -> None:
         logger.info("vector feed NOT available -> vector mode disabled")
     else:
         logger.info("vector feed available -> vector mode enabled")
+
+    logger.info("TELEMETRY_BG_CONCURRENCY=%s", TELEMETRY_BG_CONCURRENCY)
 
 
 # ==========
@@ -317,13 +351,14 @@ async def api_feed(
 
 @api.post("/events")
 async def api_events(payload: EventsRequest) -> Dict[str, Any]:
+    """
+    ВАЖНО: не блокируем UI.
+    Обработку пишем в фон, отвечаем сразу.
+    """
     if supabase is None:
         raise HTTPException(status_code=500, detail="Supabase is not configured")
-    try:
-        log_events(supabase, payload)
-    except Exception:
-        logger.exception("Failed to log events for tg_id=%s", payload.tg_id)
-        raise HTTPException(status_code=500, detail="failed to log events")
+
+    asyncio.create_task(_telemetry_bg_task(payload))
     return {"status": "ok"}
 
 
