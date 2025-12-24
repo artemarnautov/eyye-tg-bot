@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -159,6 +160,38 @@ WIKI_WINDOW_SIZE = int(os.getenv("FEED_WIKI_WINDOW_SIZE", "5"))
 WIKI_MAX_IN_WINDOW = int(os.getenv("FEED_WIKI_MAX_IN_WINDOW", "1"))
 
 # ===================== Cursor helpers (NEW: object cursor) =====================
+# --- title tokenization helper (for lightweight similarity/dedup) ---
+
+_TITLE_TOKEN_RE = re.compile(r"[0-9a-zA-Zа-яА-ЯёЁ]+", re.UNICODE)
+
+# минимальный стоп-лист, чтобы “шум” не ломал пересечения
+_TITLE_STOPWORDS = {
+    "the","a","an","and","or","to","of","in","on","for","with","from","by","at","as","is","are","was","were",
+    "this","that","these","those",
+    "и","или","на","в","во","для","по","из","к","ко","от","до","при","без","над","под","об","про","у","о",
+    "это","эта","эти","тот","та","те","как","что","где","когда","почему","чтобы",
+}
+
+def _title_token_set(title: str) -> set:
+    """
+    Превращает заголовок в множество “смысловых” токенов:
+    - lower
+    - только буквы/цифры
+    - выкидываем короткие (<=2) и стоп-слова
+    """
+    t = (title or "").strip().lower()
+    if not t:
+        return set()
+
+    tokens = _TITLE_TOKEN_RE.findall(t)
+    out = set()
+    for tok in tokens:
+        if len(tok) <= 2:
+            continue
+        if tok in _TITLE_STOPWORDS:
+            continue
+        out.add(tok)
+    return out
 
 def _encode_cursor_obj(obj: Dict[str, Any]) -> str:
     raw = json.dumps(obj, separators=(",", ":")).encode("utf-8")
