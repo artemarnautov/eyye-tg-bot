@@ -109,10 +109,15 @@ except Exception:
 # vector optional import (не ломает сервер, если функции нет)
 try:
     from .cards_service import build_feed_for_user_vector_paginated as _vector_paginated  # type: ignore
-
     build_feed_for_user_vector_paginated = _vector_paginated
 except Exception:
     build_feed_for_user_vector_paginated = None  # type: ignore
+    try:
+        from .cards_service_vector import build_feed_for_user_vector_paginated as _vector_paginated2  # type: ignore
+        build_feed_for_user_vector_paginated = _vector_paginated2
+    except Exception:
+        build_feed_for_user_vector_paginated = None  # type: ignore
+
 
 # ==========
 # App
